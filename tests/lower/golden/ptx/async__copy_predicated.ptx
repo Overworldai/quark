@@ -1,0 +1,25 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.extern .shared .align 16 .b8 _smem_pool[];
+
+.visible .entry f(
+    .param .u64 X
+)
+{
+    .reg .f32 %f0, %f1;
+    .reg .pred %p0;
+    .reg .u32 %r0, %r1;
+    .reg .u64 %rd0, %rd1;
+
+    ld.param.u64 %rd0, [X];
+    mov.u32 %r0, _smem_pool;
+    cvt.u64.u32 %rd1, %r0;
+    mov.u32 %r1, 0;
+    mov.f32 %f0, 0f00000000;
+    mov.f32 %f1, 0f3f800000;
+    setp.lt.f32 %p0, %f0, %f1;
+    @%p0 cp.async.ca.shared.global.L2::256B [%r0], [%rd0], 16;
+    ret;
+}

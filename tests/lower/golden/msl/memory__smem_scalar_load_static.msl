@@ -1,0 +1,4 @@
+    threadgroup float smem_0[128];
+    uint _pc_u32_0 = 2u;
+    uint _pc_u32_1 = 3u;
+    float _pc_f32_0 = smem_0[(_pc_u32_0 * 16u) + _pc_u32_1];

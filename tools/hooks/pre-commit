@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# tools/hooks/pre-commit
+#
+# Popcorn git pre-commit hook. Install via `make install-hooks` (or
+# `make setup`, which also creates the venv). This script is also
+# run by `make ci` for on-demand checking.
+#
+# Per popcorn cleanup proposal §8.2.
+#
+# Design:
+#   - Native git hook, no framework (no husky, no pre-commit Python
+#     package).
+#   - Uses `uvx` to run external tools in ephemeral environments so
+#     contributors don't need to install ruff / ty into their venv.
+#   - Custom checks are plain Python under tools/ci/ (no third-party
+#     deps, just stdlib).
+#   - Performance budget: ≤5 seconds total. If a new check breaks
+#     the budget, move it to GitHub Actions.
+#   - Bypass via `git commit --no-verify` is intentional — there
+#     ARE legitimate emergencies. Convention: any --no-verify commit
+#     owes a follow-up that fixes the issue before EOD.
+#
+# Exit nonzero on any failure.
+
+set -e
+set -u
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+START_TIME=$(date +%s)
+
+# Pinned tool versions. Bumping these is a one-line change here.
+RUFF_PIN="ruff@0.15.10"
+TY_PIN="ty@0.0.31"
+
+# Track files we touch so we can re-stage at the end. We auto-format
+# (and auto-fix import order) instead of just checking, so the
+# contributor never sees a "you forgot to run make fmt" failure —
+# the hook just does it. The list of staged files at hook entry
+# is computed once so we only re-stage what was already in the
+# commit; new files the contributor created but didn't `git add`
+# stay untouched.
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' || true)
+
+# ── 1. ruff format (auto-fix) ──
+# Format src/, tests/, tools/ in place. Re-stage anything that was
+# already in the index so the changes land in the same commit.
+echo "→ ruff format (auto-fix)..."
+uvx "$RUFF_PIN" format src/ tests/ tools/
+
+# ── 2. ruff lint with auto-fix (covers I = isort) ──
+# `--fix` applies safe auto-fixes including import-order rewrites.
+# Anything ruff can't auto-fix still fails the hook so the
+# contributor has to look at it manually.
+echo "→ ruff lint (auto-fix)..."
+uvx "$RUFF_PIN" check --fix src/ tests/ tools/
+
+# Re-stage the files that were already in the index but may have
+# been rewritten by the auto-fix passes above.
+if [ -n "$STAGED_PY" ]; then
+    echo "→ re-staging auto-formatted files..."
+    echo "$STAGED_PY" | xargs -r git add
+fi
+
+# ── 3. ty type check (WARN-ONLY) ──
+#
+# Per cleanup proposal §8.3:
+#   "Start with ty running in warn-only mode, then upgrade to
+#    fail-on-error once the codebase is clean under it."
+#
+# ty currently surfaces ~70 findings in the legacy files
+# (compiler/program/blocks/ops/mma/kernels/*) that pre-date the
+# IR migration and are slated for wholesale rewrite. Until those
+# migrate, the hook reports a count but never blocks the commit.
+# Flip the `set +e` to `set -e` here when the legacy files are
+# gone and ty is clean.
+#
+# We also unset VIRTUAL_ENV before invoking ty because some shell
+# setups (CI containers, devcontainers) ship with a stale
+# VIRTUAL_ENV pointing at a path that doesn't have a pyvenv.cfg,
+# which makes ty's auto-discovery error out before it sees .venv.
+echo "→ ty type check (blocking)..."
+if (unset VIRTUAL_ENV; uvx "$TY_PIN" --help) >/dev/null 2>&1; then
+    if [ -d ".venv" ]; then
+        # Check everything except the isolated megakernel reference
+        (unset VIRTUAL_ENV; uvx "$TY_PIN" check --python .venv \
+            --exclude 'src/popcorn/kernels/row_stationary_megakernel.py' \
+            src/ \
+            2>&1)
+    else
+        echo "  (no .venv — skipping ty; run \`make setup\` to enable)"
+    fi
+else
+    echo "  (ty not available via uvx — skipping)"
+fi
+
+# ── 4. Custom code-cleanliness checks (plain stdlib Python) ──
+# Each script under tools/ci/ is standalone: no imports across them,
+# no third-party deps, exit nonzero on failure.
+#
+# Only the checks that pass on the current codebase are active.
+
+echo "→ file size limits..."
+python tools/ci/file_size.py
+
+# ── 5. Unit tests ──
+# Run the full pytest suite. Tests that need a specific device
+# (CUDA / Metal) are responsible for gating themselves with
+# `pytest.mark.skipif` — the hook does not hand-pick files, so a
+# new test will be exercised here the moment it lands.
+echo "→ pytest..."
+if [ -d ".venv" ]; then
+    .venv/bin/python -m pytest tests/ -q --no-header 2>&1 | tail -3
+else
+    echo "  (no .venv — run \`make setup\` to enable test stage)"
+fi
+
+# ── 6. Budget check ──
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+if [ $ELAPSED -gt 5 ]; then
+    echo "⚠ pre-commit took ${ELAPSED}s (budget: 5s). Consider"
+    echo "  moving a slow check from tools/hooks/pre-commit to"
+    echo "  the GitHub Actions CI tier."
+fi
+
+echo "✓ pre-commit passed (${ELAPSED}s)"

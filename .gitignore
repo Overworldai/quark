@@ -1,0 +1,12 @@
+.pytest_cache/
+__pycache__/
+.venv/
+.ruff_cache/
+proposals/
+.benchmarks
+*.o
+*.so
+configs/
+*.egg-info/
+.DS_Store
+tools/generate_test_cases.py

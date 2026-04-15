@@ -1,0 +1,5 @@
+    uint _pc_u32_0 = 0u;
+    bfloat16_t _pc_bf_0_0 = X[(_pc_u32_0 * 32u) + _pc_u32_0];
+    bfloat16_t _pc_bf_0_1 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 1u];
+    bfloat16_t _pc_bf_0_2 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 2u];
+    bfloat16_t _pc_bf_0_3 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 3u];

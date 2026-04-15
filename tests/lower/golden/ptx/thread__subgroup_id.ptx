@@ -1,0 +1,14 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+
+)
+{
+    .reg .u32 %r0, %r1;
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r0, %r1, 5;
+    ret;
+}

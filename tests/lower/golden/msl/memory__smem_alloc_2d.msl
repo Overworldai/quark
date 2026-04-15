@@ -1,0 +1,1 @@
+    threadgroup float smem_0[128];

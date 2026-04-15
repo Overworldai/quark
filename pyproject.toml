@@ -1,0 +1,140 @@
+[project]
+name = "popcorn"
+version = "0.1.0"
+requires-python = ">=3.11"
+# Backends are platform-specific: torch drives the CUDA path; mlx drives
+# the Metal path. The launcher (popcorn.launcher.Launcher) talks to
+# libcuda directly via ctypes and to Metal via mlx.fast.metal_kernel —
+# no cupy, no pycuda, no triton.
+dependencies = [
+    "torch",
+    "mlx; sys_platform == 'darwin'",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+
+# ── ruff: format + lint config ──
+# Pinned via uvx in tools/hooks/pre-commit (RUFF_PIN). Bumping the
+# pin without updating these knobs is fine; ruff is backward-
+# compatible across minors.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort (import order)
+    "UP",          # pyupgrade
+    "B",           # bugbear
+    "C4",          # comprehensions
+    "SIM",         # simplifications
+    "RUF",         # ruff-specific
+]
+ignore = [
+    "E501",        # line too long — formatter handles it
+    "E731",        # lambda assigned to a variable — explicitly allowed
+    "B008",        # function call in default arg — common in dataclass field=factory()
+    "B904",        # `raise from` — opt in case-by-case
+    "SIM102",      # nested if/if — readability call
+    "SIM103",      # return condition directly — awkward in is_valid chains
+    "SIM108",      # ternary instead of if/else — readability call
+    "SIM117",      # combine `with` statements — readability call
+    "UP007",       # X | Y vs Optional[X] — both fine
+    "UP045",       # X | None — same
+    "C408",        # dict() vs {} — readability call when keys are dynamic
+    # Ambiguous-unicode: we use ×, –, —, ✓, ✗, ✱ in docstrings,
+    # comments, and shell help text on purpose — they're load-bearing
+    # for human-readable output. Ruff's default is paranoid.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # Tuple-concat style: `(a, *b)` vs `a + b`. Both are fine; the
+    # explicit form is often more readable when one side is a single
+    # element being prepended.
+    "RUF005",
+    # Unpacked variable never used — we use _ prefixing where it
+    # matters but a lot of test cases unpack `(a, _)` and ruff
+    # flags it anyway.
+    "RUF059",
+    # match= patterns with metacharacters: we want substring matches,
+    # not regex semantics, but rewriting every test to use re.escape
+    # is noise.
+    "RUF043",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "SIM", "RUF012"]   # tests can be messier
+"tools/ci/**" = ["B"]                  # ci scripts can import freely
+"tools/**" = ["B"]                     # ditto for top-level tools
+"proposals/**" = ["E", "F", "W"]       # markdown-embedded snippets
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+
+# ── ty: type checker config (Astral, Rust-based, mypy successor) ──
+# Pinned via uvx in tools/hooks/pre-commit (TY_PIN). ty is in
+# preview as of early 2026; if the version goes bad, bump TY_PIN
+# or fall back to mypy via the same hook.
+#
+# ty's config schema is `[tool.ty.rules]` (rule severities) and
+# `[[tool.ty.overrides]]` (array of include/exclude tables, NOT a
+# map). The environment (python version, src dirs) is auto-detected
+# from `[project] requires-python` and the venv at `.venv/`. The
+# cleanup proposal §8.3 wanted strict on the IR layer and looser on
+# tests/tools — the override table below pins that, with lambdas
+# and other dynamic patterns explicitly allowed everywhere.
+
+[tool.ty.rules]
+# Tighten what we care about: undefined references, bad assignments,
+# calls to non-callables. These are real bugs, not style.
+possibly-unresolved-reference = "error"
+invalid-assignment = "error"
+call-non-callable = "error"
+# Lambdas, dynamic attribute access, and **kwargs spreading are
+# all common in the test fixtures and the IR builder API. Don't
+# warn on them.
+unresolved-attribute = "warn"
+unresolved-import = "warn"
+# Torch's scaled_dot_product_attention returns `Tensor | tuple[...]`
+# depending on flags. Our callers know which variant they'll get, but
+# ty can't prove it without narrowing every call site — quiet.
+possibly-missing-attribute = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/**", "tools/**"]
+[tool.ty.overrides.rules]
+possibly-unresolved-reference = "warn"
+unresolved-attribute = "ignore"
+unresolved-import = "ignore"
+# Test fixtures and tool scripts routinely build kwargs dicts that
+# flow into dataclass constructors; ty can't narrow per-key types
+# through dict.update() and flags every field. These are real-typed
+# inputs at runtime — silence across tests/tools only.
+invalid-argument-type = "ignore"
+# Test monkey-patches to module globals (for isolation) are
+# intentional, not shadowing bugs.
+invalid-assignment = "ignore"
+
+# flashinfer (cutlass fused MoE baseline) is an optional dep imported
+# inside a try/except ImportError block. Silence the
+# unresolved-import warning there so `make lint` is clean without
+# forcing flashinfer into the venv.
+[[tool.ty.overrides]]
+include = ["src/popcorn/kernels/moe_common.py"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"

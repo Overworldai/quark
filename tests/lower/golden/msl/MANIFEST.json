@@ -1,0 +1,734 @@
+{
+  "backend": "msl",
+  "count": 91,
+  "cases": [
+    {
+      "id": "arith/const_f32",
+      "description": "mov.f32 with hex-encoded constant",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/const_u32",
+      "description": "decimal u32 const",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/const_s32",
+      "description": "negative signed const",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/const_bf16",
+      "description": "bf16 const",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/const_f16",
+      "description": "f16 const",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/const_pred_true",
+      "description": "pred const true",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/const_pred_false",
+      "description": "pred const false",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/add_f32",
+      "description": "f32 add",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/sub_f32",
+      "description": "f32 sub",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/mul_f32",
+      "description": "f32 mul",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/div_f32",
+      "description": "f32 div",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/min_f32",
+      "description": "f32 min",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/max_f32",
+      "description": "f32 max",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/add_u32",
+      "description": "u32 add",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/sub_u32",
+      "description": "u32 sub",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/mul_u32",
+      "description": "u32 mul",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/min_u32",
+      "description": "u32 min",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/max_u32",
+      "description": "u32 max",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/and_u32",
+      "description": "u32 and",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/or_u32",
+      "description": "u32 or",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/xor_u32",
+      "description": "u32 xor",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/shl_u32",
+      "description": "u32 shl",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/shr_u32",
+      "description": "u32 shr",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/fma_f32",
+      "description": "fused multiply-add",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/cmp_lt_f32",
+      "description": "setp.lt.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/cmp_eq_u32",
+      "description": "setp.eq.u32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/cmp_ge_f32",
+      "description": "setp.ge.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/select_f32",
+      "description": "selp.f32 on f32 values",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/and_pred",
+      "description": "and.pred combining two predicates",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "arith/or_pred",
+      "description": "or.pred combining two predicates",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/ex2_approx_f32",
+      "description": "ex2.approx.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/rcp_approx_f32",
+      "description": "rcp.approx.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/rsqrt_approx_f32",
+      "description": "rsqrt.approx.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/sqrt_f32",
+      "description": "sqrt.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/exp2_f32",
+      "description": "exp2.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/log2_f32",
+      "description": "log2.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "math/tanh_f32",
+      "description": "tanh.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/f32_to_bf16",
+      "description": "cvt.rn.bf16.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/bf16_to_f32",
+      "description": "cvt.f32.bf16 (widening, no rounding)",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/f32_to_f16",
+      "description": "cvt.rn.f16.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/f16_to_f32",
+      "description": "cvt.f32.f16 widening",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/f32_to_s32",
+      "description": "cvt.rzi.s32.f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/s32_to_f32",
+      "description": "cvt.rn.f32.s32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/u32_to_f32",
+      "description": "cvt.rn.f32.u32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "convert/bitcast_f32_to_b32",
+      "description": "reinterpret f32 bits as b32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_alloc_1d",
+      "description": "single-row smem alloc, verify pool declaration",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_alloc_2d",
+      "description": "2d tile alloc",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_alloc_multiple",
+      "description": "multiple allocs share the pool",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_alloc_bf16",
+      "description": "bf16 smem alloc",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_scalar_load_static",
+      "description": "static-offset smem load folds to constant offset",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_scalar_store_static",
+      "description": "static-offset smem store",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/smem_scalar_load_dynamic",
+      "description": "dynamic row index widens to u64 offset math",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/gmem_scalar_load",
+      "description": "basic global load",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/gmem_scalar_store",
+      "description": "basic global store",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/gmem_load_dynamic_idx",
+      "description": "dynamic gmem load widens to u64",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "memory/gmem_load_multi_param",
+      "description": "two buffer params, load from each",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "vec_mem/vec2_load_f32",
+      "description": "v2 gmem load",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "vec_mem/vec4_load_f32",
+      "description": "v4 gmem load",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "vec_mem/vec4_load_bf16",
+      "description": "v4 bf16 gmem load (8 bytes)",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "vec_mem/vec4_store_f32",
+      "description": "v4 gmem store (width inferred from vec.shape)",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "vec_mem/vec4_load_dynamic_row",
+      "description": "v4 load with dynamic row",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "pred_mem/gmem_load",
+      "description": "predicated gmem scalar load",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "pred_mem/gmem_store",
+      "description": "predicated gmem scalar store",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "pred_mem/vec4_load",
+      "description": "predicated vec4 gmem load",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/empty_for_loop",
+      "description": "for loop with no body \u2014 label + backedge only",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/for_loop_single_carry_f32",
+      "description": "f32 accumulator carried across iterations",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/for_loop_multi_carry",
+      "description": "two f32 carried slots",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/nested_for_loops",
+      "description": "outer + inner loop, two labels",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/nested_3_deep_for_loops",
+      "description": "triple-nested loop",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/simple_if_else",
+      "description": "if/else with empty arms",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/if_with_carry",
+      "description": "if/else carrying one f32 slot",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/if_in_loop",
+      "description": "if nested inside for",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/loop_in_if",
+      "description": "for nested inside if",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "cf/for_int_bounds_u32",
+      "description": "u32 bounds",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/tid_x",
+      "description": "threadIdx.x read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/tid_y",
+      "description": "threadIdx.y read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/tid_z",
+      "description": "threadIdx.z read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/bid_x",
+      "description": "blockIdx.x read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/ntid_x",
+      "description": "blockDim.x read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/nctaid_x",
+      "description": "gridDim.x read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/lane_id",
+      "description": "laneid read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/subgroup_id",
+      "description": "warpid / simdgroup id read",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "thread/barrier_block",
+      "description": "block-level barrier (bar.sync / threadgroup_barrier)",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/xor",
+      "description": "xor shuffle (MSL-compatible)",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/up",
+      "description": "up shuffle",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/down",
+      "description": "down shuffle",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/idx",
+      "description": "indexed shuffle",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/subgroup_reduce_sum_f32",
+      "description": "subgroup-reduce sum f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/subgroup_reduce_max_f32",
+      "description": "subgroup-reduce max f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/subgroup_reduce_min_f32",
+      "description": "subgroup-reduce min f32",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    },
+    {
+      "id": "shuffle/subgroup_broadcast",
+      "description": "broadcast lane 0",
+      "backends": [
+        "ptx",
+        "msl"
+      ]
+    }
+  ]
+}

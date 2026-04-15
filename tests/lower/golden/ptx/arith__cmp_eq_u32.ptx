@@ -1,0 +1,16 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+
+)
+{
+    .reg .pred %p0;
+    .reg .u32 %r0, %r1;
+
+    mov.u32 %r0, 1;
+    mov.u32 %r1, 2;
+    setp.eq.u32 %p0, %r0, %r1;
+    ret;
+}

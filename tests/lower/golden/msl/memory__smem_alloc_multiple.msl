@@ -1,0 +1,2 @@
+    threadgroup float smem_0[16];
+    threadgroup float smem_1[16];

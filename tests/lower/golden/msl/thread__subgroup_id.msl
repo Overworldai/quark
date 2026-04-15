@@ -1,0 +1,1 @@
+    uint _pc_u32_0 = simdgroup_index_in_threadgroup;
