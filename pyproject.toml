@@ -8,6 +8,7 @@ requires-python = ">=3.11"
 # no cupy, no pycuda, no triton.
 dependencies = [
     "torch",
+    "numpy",
     "mlx; sys_platform == 'darwin'",
 ]
 
