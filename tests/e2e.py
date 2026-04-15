@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import popcorn
 import popcorn.functional as pcf
 
 IS_METAL = platform.system() == "Darwin"
@@ -404,14 +405,19 @@ def time_one(bench: Bench, n_iters: int = 50) -> tuple[float, float]:
 
 def main():
     backend = "metal" if IS_METAL else "cuda"
-    problems = build_problems()
-    print(f"e2e: backend={backend}, {len(problems)} problems")
+    # Force full genetic search on every cache miss during prep + warmup.
+    # Covers the shuffle_b_* helpers (invoked inside build_problems) and
+    # the first call of each pcf.<op>, so timed iterations hit tuned
+    # configs rather than the bounded fast-search winners.
+    with popcorn.max_autotune():
+        problems = build_problems()
+        print(f"e2e: backend={backend}, {len(problems)} problems")
 
-    print("warmup...", flush=True)
-    for b in problems:
-        device_sync()
-        out = b.fn()
-        eval_out(out)
+        print("warmup (full autotune)...", flush=True)
+        for b in problems:
+            device_sync()
+            out = b.fn()
+            eval_out(out)
 
     print(f"{'name':<32} {'median (us)':>12} {'tflops':>10}")
     print("-" * 56)
