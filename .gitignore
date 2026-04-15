@@ -9,4 +9,3 @@ proposals/
 configs/
 *.egg-info/
 .DS_Store
-tools/generate_test_cases.py
