@@ -392,7 +392,7 @@ all threads; don't place inside a divergent `if_`.
 - Perf warnings (bank conflicts, unvectorized stores, unpadded strides)
   emitted via `PerfWarning`
 
-Silence perf warnings with `POPCORN_DISABLE_PERF_WARNINGS=1`.
+Perf warnings are off by default; enable with `POPCORN_ENABLE_PERF_WARNINGS=1`.
 
 ## See also
 

@@ -30,8 +30,9 @@ Runs before any lowerer. Two layers:
   * Vec load/store misalignment vs ``SharedRegion.align_bytes``.
 
 The old ``ir/lint.py`` pass has been folded in here — one pass, one
-entry point. Set ``POPCORN_DISABLE_PERF_WARNINGS=1`` to silence the
-non-fatal emissions (autotune sweeps print them at every compile).
+entry point. Perf warnings are off by default (autotune sweeps print
+them at every compile); set ``POPCORN_ENABLE_PERF_WARNINGS=1`` to
+opt in to the non-fatal emissions.
 
 See POPCORN_IR_PROPOSAL.md §11.
 """
@@ -71,14 +72,14 @@ class ValidationError(Exception):
 class PerfWarning(UserWarning):
     """Non-fatal perf-pattern warning emitted during ``validate_module``.
 
-    Filter / silence via ``warnings.simplefilter`` on this class, or set
-    ``POPCORN_DISABLE_PERF_WARNINGS=1`` in the env to skip emission
-    entirely (autotune / bench runs).
+    Off by default. Set ``POPCORN_ENABLE_PERF_WARNINGS=1`` in the env
+    to opt in; filter further via ``warnings.simplefilter`` on this
+    class.
     """
 
 
-def _perf_warnings_silenced() -> bool:
-    return os.environ.get("POPCORN_DISABLE_PERF_WARNINGS", "").lower() in (
+def _perf_warnings_enabled() -> bool:
+    return os.environ.get("POPCORN_ENABLE_PERF_WARNINGS", "").lower() in (
         "1",
         "true",
         "yes",
@@ -110,7 +111,7 @@ def validate_module(module: Module) -> list[_PerfFinding]:
     findings: list[_PerfFinding] = []
     for fn in module.functions:
         findings.extend(validate_function(fn, module))
-    if not _perf_warnings_silenced():
+    if _perf_warnings_enabled():
         for f in findings:
             warnings.warn(f"{f.where}: {f.message}", PerfWarning, stacklevel=2)
     return findings

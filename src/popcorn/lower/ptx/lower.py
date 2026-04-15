@@ -214,9 +214,10 @@ class PtxLowerer:
         Runs ``validate_module`` first — raises ValidationError on
         correctness issues (OOB, missing shape_ids, SSA dominance
         violations) and emits ``PerfWarning`` for perf patterns (bank
-        conflicts, oversized smem, misaligned cp.async). Silence perf
-        warnings via ``POPCORN_DISABLE_PERF_WARNINGS=1`` or
-        ``warnings.simplefilter(...)`` filters on ``PerfWarning``.
+        conflicts, oversized smem, misaligned cp.async). Perf warnings
+        are off by default; enable via ``POPCORN_ENABLE_PERF_WARNINGS=1``
+        (and filter further with ``warnings.simplefilter(...)`` on
+        ``PerfWarning``).
         """
         from popcorn.ir.validator import validate_module as _validate_module
 

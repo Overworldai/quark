@@ -109,7 +109,7 @@ Run `make fuzz KERNEL=name` with the full sweep. If only certain
 
 | Variable | Effect |
 |---|---|
-| `POPCORN_DISABLE_PERF_WARNINGS=1` | silences validator `PerfWarning` |
+| `POPCORN_ENABLE_PERF_WARNINGS=1` | enables validator `PerfWarning` (off by default) |
 | `POPCORN_DISABLE_CSE=1` | disables Builder CSE (debug only) |
 | `POPCORN_FORCE_DEFAULT_CONFIG=1` | skips tuned JSON lookup in bench/fuzz |
 | `POPCORN_PRINT_FAILED_SOURCE=1` | prints lowered text on compile failure |
