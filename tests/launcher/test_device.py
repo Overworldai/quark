@@ -158,6 +158,7 @@ class TestDetectFamily:
 
 class TestCurrentDevice:
     def test_metal_family_probes_successfully(self, monkeypatch):
+        pytest.importorskip("mlx")
         from popcorn import device
 
         # Metal is now a supported backend (MLX probe).

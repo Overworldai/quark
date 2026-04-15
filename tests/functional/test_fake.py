@@ -17,6 +17,9 @@ if IS_METAL:
 import torch
 import torch.library
 
+if not torch.cuda.is_available():
+    pytest.skip("no CUDA device available", allow_module_level=True)
+
 import popcorn.functional  # noqa: F401 — triggers registrations
 from popcorn.kernels import get
 

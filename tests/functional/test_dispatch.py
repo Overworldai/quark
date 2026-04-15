@@ -14,8 +14,17 @@ rather than the raw Launcher path.
 
 from __future__ import annotations
 
-import popcorn.functional as pcf
+import pytest
+
 from popcorn.backend import IS_METAL
+
+if not IS_METAL:
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("no GPU available (CUDA or Metal)", allow_module_level=True)
+
+import popcorn.functional as pcf
 from popcorn.correctness import check_correctness
 from popcorn.kernels import get
 
