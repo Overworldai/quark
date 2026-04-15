@@ -65,9 +65,10 @@ def shuffle_b_for_gemm(A, B, *, out_dtype=None, compute_dtype=None):
 def shuffle_b_for_moe_inproj(X, W_in, *, n_experts, top_k=2, out_dtype=None, compute_dtype=None):
     """Offline-shuffle ``W_in`` for ``pcf.moe_inproj``.
 
-    Requires the resolved config's ``b_shuffle=True``; callers whose
-    tuned config leaves ``b_shuffle=False`` should store the plain
-    ``W_in`` instead and skip this helper.
+    When the resolved config has ``b_shuffle=False`` (the default until
+    a faster device-side shuffle kernel lands), returns ``W_in``
+    unchanged so callers can store one weight tensor regardless of tune
+    state.
     """
     cls = get("moe_inproj")
     # spec_from_tensors needs token_ids + work_list just for validation,
@@ -89,11 +90,7 @@ def shuffle_b_for_moe_inproj(X, W_in, *, n_experts, top_k=2, out_dtype=None, com
     )
     cfg = launcher()._autotune.lookup_or_search(cls, spec)
     if not cfg.b_shuffle:
-        raise ValueError(
-            "shuffle_b_for_moe_inproj: resolved config has b_shuffle=False. "
-            "Pass the plain W_in to pcf.moe_inproj, or autotune a config "
-            "with b_shuffle=True for this spec first."
-        )
+        return W_in
     mma_k = _mma_k_for(cls, spec, cfg)
     if cfg.b_pad > 0:
         return ShuffledWeight.from_plain(W_in, kchunk=cfg.BK, bpad=cfg.b_pad, mma_k=mma_k).tensor
@@ -103,7 +100,11 @@ def shuffle_b_for_moe_inproj(X, W_in, *, n_experts, top_k=2, out_dtype=None, com
 def shuffle_b_for_moe_outproj(
     h_in, W_out, *, M, n_experts, top_k=2, out_dtype="bf16", compute_dtype=None
 ):
-    """Offline-shuffle ``W_out`` for ``pcf.moe_outproj``."""
+    """Offline-shuffle ``W_out`` for ``pcf.moe_outproj``.
+
+    When the resolved config has ``b_shuffle=False``, returns ``W_out``
+    unchanged — see :func:`shuffle_b_for_moe_inproj`.
+    """
     cls = get("moe_outproj")
     from popcorn.backend import PT
 
@@ -125,7 +126,7 @@ def shuffle_b_for_moe_outproj(
     )
     cfg = launcher()._autotune.lookup_or_search(cls, spec)
     if not cfg.b_shuffle:
-        raise ValueError("shuffle_b_for_moe_outproj: resolved config has b_shuffle=False.")
+        return W_out
     mma_k = _mma_k_for(cls, spec, cfg)
     if cfg.b_pad > 0:
         return ShuffledWeight.from_plain(W_out, kchunk=cfg.BK, bpad=cfg.b_pad, mma_k=mma_k).tensor
