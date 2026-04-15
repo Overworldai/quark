@@ -141,12 +141,25 @@ def _config_from_json_dict(config_cls: type, payload: dict) -> Any:
     return config_cls(**kwargs)
 
 
+_SOURCE_HASH_CACHE: dict[type, str] = {}
+
+
 def _source_hash(kernel_cls: type) -> str:
+    # Process-lifetime memo: source files don't change mid-run, and
+    # ``inspect.getsource`` + SHA256 on a multi-KB kernel class shows
+    # up as ~1ms per call on the hot path (every ``lookup_or_search``
+    # rebuilds the cache key). Kernel classes are identity-stable, so
+    # keying by the class object is safe.
+    cached = _SOURCE_HASH_CACHE.get(kernel_cls)
+    if cached is not None:
+        return cached
     try:
         src = inspect.getsource(kernel_cls)
     except (OSError, TypeError):
         src = kernel_cls.__qualname__
-    return hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+    _SOURCE_HASH_CACHE[kernel_cls] = digest
+    return digest
 
 
 # ---------------------------------------------------------------------------

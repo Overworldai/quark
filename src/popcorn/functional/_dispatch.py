@@ -140,11 +140,18 @@ def call_with_bindings(
     kernel runtime per invocation. Once the root cause is found this
     can be removed.
     """
+    lc = launcher()
     if config is None:
-        config = launcher()._autotune.lookup_or_search(kernel_cls, spec)
+        config = lc._autotune.lookup_or_search(kernel_cls, spec)
 
-    kernel = kernel_cls(spec, config)
-    pspec = kernel.param_spec()
+    # Compile is cached on (cls, spec, config); on the hot path this
+    # is a dict lookup and returns a ``CompiledKernel`` that already
+    # holds the ParamSpec + source Kernel instance. Using those avoids
+    # re-running ``kernel.emit()`` (full IR build, hundreds of μs)
+    # on every call.
+    compiled = lc.compile(kernel_cls, spec, config)
+    kernel = compiled.kernel
+    pspec = compiled.param_spec
 
     # Allocate any auto-alloc tensors by looking up their TensorDecl.
     decls_by_name = {d.name: d for d in kernel_cls.TENSORS}
@@ -165,7 +172,7 @@ def call_with_bindings(
     # launched against a particular set of input addresses, then
     # never again for that combination — instead of every call.
     # Inference loops that reuse input tensors pay the warmup once.
-    result = launch_kernel(kernel_cls, spec, config, buffers=buffers)
+    result = compiled.launch(buffers=buffers)
 
     if IS_METAL:
         # MLX returns one array per non-readonly buffer in pspec order.

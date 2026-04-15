@@ -16,13 +16,12 @@ Usage:
 from __future__ import annotations
 
 import platform
-import statistics
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import popcorn
 import popcorn.functional as pcf
+from popcorn.backend import PT
 
 IS_METAL = platform.system() == "Darwin"
 
@@ -390,17 +389,18 @@ def build_problems():
 # ---- driver -----------------------------------------------------------------
 
 
-def time_one(bench: Bench, n_iters: int = 50) -> tuple[float, float]:
-    samples: list[float] = []
-    for _ in range(n_iters):
-        device_sync()
-        t0 = time.perf_counter()
-        out = bench.fn()
-        eval_out(out)
-        samples.append(time.perf_counter() - t0)
-    med = statistics.median(samples)
-    tflops = bench.flops / med / 1e12 if bench.flops else 0.0
-    return med, tflops
+def time_one(
+    bench: Bench, *, warmup_ms: float = 25.0, bench_ms: float = 100.0
+) -> tuple[float, float]:
+    """Budget-based timer matching the autotune fast-search timer
+    (``PT.time_callable``): a calibration probe, ``warmup_ms`` warmup
+    budget, then a ``bench_ms`` bench window with a single sync at each
+    end. Avoids the per-iter ``synchronize`` overhead that dominated the
+    old per-sample loop."""
+    us = PT.time_callable(bench.fn, warmup_ms=warmup_ms, bench_ms=bench_ms)
+    sec = us * 1e-6
+    tflops = bench.flops / sec / 1e12 if bench.flops else 0.0
+    return sec, tflops
 
 
 def main():

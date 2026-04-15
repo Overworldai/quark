@@ -174,6 +174,12 @@ class CompiledKernel:
     block_fn: Callable[..., tuple[int, int, int]]
     param_spec: ParamSpec
     footprint: ProgramFootprint
+    # The source Kernel instance (same (spec, config) we compiled from).
+    # Held so the functional layer can call hooks like
+    # ``prepare_launch_tensors`` without reconstructing a fresh Kernel
+    # + re-running ``emit()`` on every inference call. Typed Any to
+    # avoid a circular import back to popcorn.kernels.base.
+    kernel: Any = None
     # Captured at compile time so launch() can call grid_fn / block_fn
     # without re-passing the spec/config.
     grid_args: tuple = ()
@@ -418,6 +424,7 @@ class Launcher:
             block_fn=kernel.block,
             param_spec=self._param_spec_for(ir_or_program),
             footprint=ProgramFootprint(smem_bytes=lowered.smem_bytes),
+            kernel=kernel,
         )
         self._kernel_cache[key] = ck
         return ck
