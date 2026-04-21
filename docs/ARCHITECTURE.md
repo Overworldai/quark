@@ -53,7 +53,9 @@ Static-single-assignment, strongly typed, structured control flow.
 - **DType** — `F32` `BF16` `F16` `E4M3` `E5M2` `U32` `S32` `PRED`
   `B16` `B32` `B8`. Unified str + IR + backend bridge:
   `DType("bf16")` from a string, `DType.BF16.backend` gives the
-  `mx.bfloat16` / `torch.bfloat16` matching the active backend.
+  `mx.bfloat16` / `torch.bfloat16` matching the active backend (the
+  torch resolution is baseline-only; the runtime path maps `DType` to
+  the string keys `PopcornTensor` uses — `"bf16"`, `"e4m3"`, etc.).
 - **Fragment primitives**:
   - `FragApplyOp` — per-element transform with a body region.
   - `FragReduceOp` — cross-lane row/col reduction (max/min/add/mul).
@@ -155,8 +157,9 @@ compiled.launch(buffers=[A, B, Out])
 - `Launcher` owns the device handle + autotune cache.
 - `compile()`: `emit()` → `validate_module` → lower → driver. Cached.
 - `ParamSpec` splits IR params into buffers (pointer + dtype + align)
-  and scalars. `.launch(buffers=...)` extracts `data_ptr()` on torch,
-  routes through MLX kernel args on Metal.
+  and scalars. `.launch(buffers=...)` extracts `data_ptr()` on
+  `PopcornTensor` (CUDA) or `torch.Tensor` (baselines), and routes
+  through MLX kernel args on Metal.
 - `prepare_launch_tensors(tensors)` — optional per-kernel hook for
   pre-launch transforms (GEMM uses this to cache weight shuffles).
 
@@ -166,33 +169,46 @@ Cosine similarity only. Threshold from a dtype × accumulator table
 (`popcorn/correctness.py:_THRESHOLD_TABLE`). Override per-kernel by
 setting `CORRECTNESS_THRESHOLD: float` on the class.
 
-`check_correctness(out, ref, out_dtype)` accepts raw torch **or** mlx
-tensors — internally routes through `PT.cosine_sim`. No detach-to-cpu
-ritual at call sites.
+`check_correctness(out, ref, out_dtype)` accepts `PopcornTensor`,
+torch, or mlx tensors — internally routes through `PT.cosine_sim`.
+No detach-to-cpu ritual at call sites.
 
 NaN / Inf in output → hard fail regardless of cos_sim.
 
-## Platform abstraction (PT)
+## Tensors — runtime vs. reference
 
-`popcorn.backend.PT` is the polymorphic tensor surface. All tensor
-creation / arithmetic / reductions / casts / reshapes / FFI go
-through `PT.*`. One file (`backend.py`) holds every
-torch-vs-mlx branch.
+Two tensor types, two audiences:
+
+- **Runtime path** — `PopcornTensor` (`popcorn.runtime.tensor`).
+  Owns a `cuMemAlloc`'d device pointer, supports shape / stride /
+  offset metadata, arithmetic / slicing / reshape / permute via
+  on-device PTX utility kernels (`runtime/kernels.py`). This is
+  what `popcorn.nn.Module` parameters hold and what `pcf.*` calls
+  consume on CUDA. **Zero torch dependency.**
+- **Reference / baseline path** — `popcorn.backend.PT`. Polymorphic
+  wrapper over torch (CUDA) and MLX (Metal). Used exclusively by
+  `reference.py` / `baselines.py` in each kernel folder and by
+  tests that need framework-native semantics (e.g. a
+  `flex_attention` baseline). Torch is pulled in as an optional
+  dev dep for this leg.
 
 ```python
-from popcorn.backend import PT, IS_METAL
+# Runtime
+from popcorn.runtime.tensor import PopcornTensor
+A = PopcornTensor.randn(M, K, dtype="bf16")
+C = pcf.gemm(A, B)                     # PopcornTensor in, PopcornTensor out
 
-A = PT.randn(M, K)                      # mlx on Metal, torch on CUDA
-A = PT.astype(A, PT.bfloat16)
-C = PT.matmul(A, PT.transpose(B))
-cs = PT.cosine_sim(C, ref)              # float in [-1, 1]
-
-@PT.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
-def graph(X, Y): ...                     # torch.compile on CUDA, identity on Metal
+# Baseline / reference (test / autotune correctness gate)
+from popcorn.backend import PT
+A_ref = PT.randn(M, K, dtype=PT.bfloat16)
+C_ref = PT.matmul(A_ref, PT.transpose(B_ref))
 ```
 
-See [BACKEND.md](BACKEND.md) for the full surface + how to add a
-third backend.
+On Metal the two collapse to a single `mx.array` path — MLX is the
+only half-precision device tensor available. See
+[BACKEND.md](BACKEND.md) for the full `PT` surface and
+[WEIGHTS.md](WEIGHTS.md) for how parameters reach device via the
+`PopcornTensor` path.
 
 ## Autotune
 

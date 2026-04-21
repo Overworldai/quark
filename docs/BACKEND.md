@@ -1,7 +1,12 @@
 # Backend (PT polymorphic tensor)
 
 One file — `src/popcorn/backend.py` — owns every torch-vs-mlx branch.
-Everything else in the repo imports `PT` and calls `PT.whatever(...)`.
+The runtime inference path (`popcorn.nn`, `popcorn.models`, most
+`pcf.*` call sites on CUDA) uses `PopcornTensor` directly and never
+touches `PT`. `PT` is the **reference / baseline** surface: kernel
+`reference.py` and `baselines.py` use it to write their correctness
+oracles once and run on either backend, and the autotune correctness
+gate routes through `PT.cosine_sim`.
 
 ```python
 from popcorn.backend import PT, IS_METAL
@@ -18,8 +23,11 @@ baselines that deliberately measure a backend-fast library
 (`torch.compile` + `flex_attention`, `mx.fast.scaled_dot_product_attention`),
 and the lowerer drivers (`drivers/cuda.py`, `drivers/mlx.py`).**
 
-If a caller finds itself reaching for `import torch` or
-`import mlx.core`, the right move is to add the primitive to `PT`.
+If `reference.py` or `baselines.py` finds itself reaching for
+`import torch` or `import mlx.core`, the right move is to add the
+primitive to `PT`. Runtime code (`popcorn.nn`, models,
+`functional/_dispatch.py`) should reach for `PopcornTensor`
+operations and `popcorn.runtime.kernels` utility kernels instead.
 
 ## Dtype constants
 

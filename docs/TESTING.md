@@ -26,8 +26,10 @@ tests/
 
 Tests are CUDA-available-aware. On Apple silicon the `tests/lower/ptx/`
 suite runs fine (it just tests text generation); tests that actually
-allocate on `device="cuda"` skip via `pytest.mark.skipif(not
-torch.cuda.is_available())`.
+allocate on a CUDA device skip via
+`pytest.mark.skipif(not torch.cuda.is_available())`. Torch is a dev
+extra (`pip install .[dev]`), so it's present in the test env even
+though the runtime inference path doesn't need it.
 
 ## Smoke tests (`tests/kernels/test_smoke.py`)
 
@@ -65,7 +67,7 @@ which stage broke.
 **Cosine similarity only.** No `max_abs`, no `torch.allclose`.
 
 `check_correctness(out, ref, out_dtype)`:
-- Accepts raw PT tensors (torch or mlx, any device).
+- Accepts `PopcornTensor`, raw torch, or mlx tensors (any device).
 - `cos_sim = dot(out, ref) / (|out| * |ref|)`.
 - Threshold from a `(out_dtype, accum_dtype)` table
   (`popcorn/correctness.py:_THRESHOLD_TABLE`).

@@ -10,10 +10,14 @@
 
 ---
 
-**Zero hardware-specific runtime deps.** Torch + MLX are the only
-backends. `libcuda` is driven directly via ctypes (`runtime/cuda.py`);
-no cupy, no pycuda, no triton. Kernels are written once and lower to
-both PTX (NVIDIA) and MSL (Apple).
+**Zero hardware-specific runtime deps.** `libcuda` is driven directly
+via ctypes (`runtime/cuda.py`); no torch, no cupy, no pycuda, no triton
+in the inference path. Device tensors live in `PopcornTensor`
+(`runtime/tensor.py`), weights load from `.safetensors` without numpy
+or torch. Kernels are written once and lower to both PTX (NVIDIA) and
+MSL (Apple) — on Metal the driver goes through MLX's
+`mx.fast.metal_kernel`. Torch is an optional dev dep used by reference
+implementations and the autotune correctness gate only.
 
 ## Install
 
@@ -70,18 +74,50 @@ class MyKernel(Kernel):
 Add the folder, the registry picks it up. Zero edits elsewhere. See
 [docs/ADDING_A_KERNEL.md](docs/ADDING_A_KERNEL.md).
 
-## Call a kernel from torch or MLX
+## Call a kernel
 
 ```python
 import popcorn.functional as pcf
+from popcorn.runtime.tensor import PopcornTensor
 
-C = pcf.gemm(A, B)                      # torch.Tensor or mx.array; dispatched by type
+A = PopcornTensor.randn(M, K, dtype="bf16")
+B = PopcornTensor.randn(N, K, dtype="bf16")
+C = pcf.gemm(A, B)                      # PopcornTensor on CUDA, mx.array on Metal
 y = pcf.attention(Q, K, V_t, B=..., n_kv_heads=..., gqa_ratio=..., seq_len=..., kv_len=...)
 ```
 
-Every production kernel is a registered `torch.library.custom_op`
-with a fake fn, so `torch.compile(fullgraph=True)` traces through
-cleanly. Full surface in [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md).
+Input type decides the backend: `PopcornTensor` routes through the
+ctypes CUDA driver, `mx.array` through MLX. Full surface in
+[docs/FUNCTIONAL.md](docs/FUNCTIONAL.md).
+
+## Build a model
+
+`popcorn.nn` is a PyTorch-shaped, inference-only module layer. No
+autograd, no optimizer — just `nn.Module` / `nn.Parameter` holding
+`PopcornTensor`s, with `state_dict()` / `load_state_dict()` and a
+`forward()` convention. Every leaf module lowers to a `pcf.*` kernel.
+
+```python
+import popcorn.nn as nn
+from popcorn.nn.io import load_safetensors, load_from_hub
+
+sd = load_from_hub("Overworld/Waypoint-1.5-1B")   # or load_safetensors("model.safetensors")
+model = MyModel(cfg)
+model.load_state_dict(sd)
+out = model(x)
+```
+
+The safetensors loader is pure Python — mmap + `cuMemHostRegister` →
+pinned DMA straight to device, no host-side numpy / torch staging.
+See [docs/WEIGHTS.md](docs/WEIGHTS.md).
+
+## Waypoint-1.5 reference model
+
+`popcorn.models.waypoint_15` is a 24-layer DiT built entirely from
+`pcf.*` kernels. End-to-end benchmark on a 5090: **14.5 ms / NFE ≈
+55 pixel FPS** at 32×16 = 512 tokens/frame, vs **26.4 ms / NFE** for
+the bf16 torch `world_engine` baseline. See
+[docs/WAYPOINT_15.md](docs/WAYPOINT_15.md).
 
 ## Examples
 
@@ -103,7 +139,9 @@ each building on the previous:
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Pipeline, IR, lowerers, registry, launcher |
 | [docs/ADDING_A_KERNEL.md](docs/ADDING_A_KERNEL.md) | New kernel walkthrough with templates |
-| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `popcorn.functional` torch/MLX entry point |
+| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `popcorn.functional` call surface (PopcornTensor / MLX) |
+| [docs/WEIGHTS.md](docs/WEIGHTS.md) | Safetensors loader, HF Hub path, `nn.Module` state dicts |
+| [docs/WAYPOINT_15.md](docs/WAYPOINT_15.md) | Waypoint-1.5 reference model + 5090 / 4090 benchmarks |
 | [docs/IR.md](docs/IR.md) | Builder API, tensor types, fragment primitives, RegisterTile |
 | [docs/BLOCKS.md](docs/BLOCKS.md) | L0 / L1 / L2 block surface, DSL primitives |
 | [docs/BACKEND.md](docs/BACKEND.md) | Polymorphic tensor (PT), Metal vs CUDA dispatch |

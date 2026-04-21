@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """Generate video with the real waypoint-1.5 weights from HF Hub.
 
-    python scripts/generate.py
-    python scripts/generate.py --n-frames 60 --output demo.mp4
+    python scripts/generate.py --seed-image seed.png --n-frames 60 --output demo.mp4
+    python scripts/generate.py --seed-image clip.mp4 --output clip_extended.mp4
+    python scripts/generate.py --seed-latent seed.npy --output out.npy
     python scripts/generate.py --b-shuffle     # pre-shuffle weights via nn.Linear.prepare()
 
-Downloads model → loads into popcorn nn.Module → optionally captures
-CUDA graphs → replays per frame → decodes with TAEHV AE → saves mp4.
+End-to-end pipeline in one script:
+  1. encode seed image/video through TAEHV → latent seed
+  2. download model → load into popcorn nn.Module → capture CUDA graph
+  3. replay per frame → collect latents
+  4. decode latents through TAEHV → pixel frames
+  5. write HEVC/mp4 with ``hvc1`` tag (Discord-playable)
 
-On CUDA: uses PopcornTensor throughout, no torch dependency in the
-generation loop. torch is only imported for TAEHV AE decode (optional).
+``--output`` extension decides step 5:
+  *.mp4 / *.mov / *.mkv  →  decode + ffmpeg libx265 + hvc1 tag
+  *.npy                    →  save raw [T, C, H, W] f32 latents (skip decode)
+
+On CUDA: uses PopcornTensor throughout the denoise loop, no torch
+dependency in the hot path. torch is pulled in only for the TAEHV
+round-trip (encode seed / decode output).
 
 On Metal: uses the existing MLX backend via PT.
 """
@@ -403,6 +413,36 @@ def remap_state_dict(raw_sd: dict, cfg) -> dict:
 
 _TEMPORAL_COMPRESS = 4  # TAEHV compresses 4× along time axis
 
+# 16:9 input resolution for the AE; internally resizes to 2:1 for
+# encoding. Matches the presets in ``_make_config``.
+_AE_PIXEL_PRESETS: dict[str, tuple[int, int]] = {
+    "360p": (360, 640),   # (H, W)
+    "720p": (720, 1280),
+}
+
+
+def _load_taehv(ae_uri: str):
+    """Import + construct a ``ChunkedStreamingTAEHV``. Returns
+    ``(ae, torch, device)`` or ``(None, None, None)`` if world_engine
+    isn't importable from either of the known locations."""
+    try:
+        sys.path.insert(0, "/workspace/world_engine/src")
+        from ae import ChunkedStreamingTAEHV
+    except ImportError:
+        try:
+            sys.path.insert(0, "/Users/work/world_engine/src")
+            from ae import ChunkedStreamingTAEHV
+        except ImportError:
+            print("warning: world_engine not found; AE path unavailable.")
+            return None, None, None
+
+    import torch
+
+    torch.backends.cudnn.enabled = False
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ae = ChunkedStreamingTAEHV.from_pretrained(ae_uri, device=device)
+    return ae, torch, device
+
 
 def load_taehv_decoder(ae_uri: str = "Overworld-Models/taehv1_5"):
     """Load the streaming TAEHV decoder.
@@ -413,22 +453,9 @@ def load_taehv_decoder(ae_uri: str = "Overworld-Models/taehv1_5"):
     """
     import numpy as np
 
-    try:
-        sys.path.insert(0, "/workspace/world_engine/src")
-        from ae import ChunkedStreamingTAEHV
-    except ImportError:
-        try:
-            sys.path.insert(0, "/Users/work/world_engine/src")
-            from ae import ChunkedStreamingTAEHV
-        except ImportError:
-            print("warning: world_engine not found; latent decode unavailable.")
-            return None
-
-    import torch
-
-    torch.backends.cudnn.enabled = False
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    ae = ChunkedStreamingTAEHV.from_pretrained(ae_uri, device=device)
+    ae, torch, device = _load_taehv(ae_uri)
+    if ae is None:
+        return None
 
     @torch.inference_mode()
     def decode(latent_np: np.ndarray) -> np.ndarray:
@@ -438,6 +465,138 @@ def load_taehv_decoder(ae_uri: str = "Overworld-Models/taehv1_5"):
         return decoded.cpu().numpy()
 
     return decode
+
+
+def encode_seed_from_path(
+    path: str,
+    preset: str,
+    ae_uri: str = "Overworld-Models/taehv1_5",
+    n_frames: int | None = None,
+) -> "object":
+    """Read an image or video, resize to the preset's AE input
+    resolution, tile 4× for the VAE's temporal compression, and
+    encode through streaming TAEHV.
+
+    Returns ``[T, C, H, W]`` f32 numpy — the same layout the legacy
+    ``--seed-latent`` path expects. Tiles a single image 4× so that
+    one pixel input yields one latent frame.
+    """
+    import cv2
+    import numpy as np
+
+    pixel_h, pixel_w = _AE_PIXEL_PRESETS[preset]
+
+    # Single image → 1-element list. Video → up to ``n_frames``.
+    img = cv2.imread(path)
+    if img is not None:
+        raw = [cv2.cvtColor(img, cv2.COLOR_BGR2RGB)]
+    else:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise ValueError(f"cannot open {path}")
+        raw = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            raw.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if n_frames is not None and len(raw) >= n_frames:
+                break
+        cap.release()
+        if not raw:
+            raise ValueError(f"no frames read from {path}")
+
+    # Resize to the AE's 16:9 input, then pad to a multiple of 4 pixel
+    # frames (TAEHV's temporal compression stride) by repeating the
+    # last frame.
+    resized = [cv2.resize(f, (pixel_w, pixel_h), interpolation=cv2.INTER_AREA) for f in raw]
+    n_raw = len(resized)
+    n_padded = _TEMPORAL_COMPRESS * ((n_raw + _TEMPORAL_COMPRESS - 1) // _TEMPORAL_COMPRESS)
+    while len(resized) < n_padded:
+        resized.append(resized[-1])
+    n_latent = n_padded // _TEMPORAL_COMPRESS
+    print(f"  {n_raw} input → {n_padded} tiled (4×) → {n_latent} latent frame(s)")
+
+    pixels = np.stack(resized, axis=0)  # [T, H, W, 3] uint8
+
+    ae, torch, _ = _load_taehv(ae_uri)
+    if ae is None:
+        raise RuntimeError("TAEHV not importable — can't encode seed image/video")
+
+    with torch.inference_mode():
+        latent = ae.encode(torch.from_numpy(pixels))
+
+    return latent.float().cpu().numpy()  # [T, C, H, W] f32
+
+
+def write_video_hevc(
+    pixels,
+    output_path: str,
+    fps: int = _PIXEL_FPS,
+    crf: int = 23,
+) -> None:
+    """Encode ``[T, H, W, 3]`` uint8 RGB frames to an HEVC/mp4 file with
+    the ``hvc1`` codec tag.
+
+    Why ``hvc1`` and not ``hev1``: Discord, QuickTime, Safari, and
+    most consumer video players will play HEVC only when the sample
+    description uses ``hvc1`` (the parameter-sets-in-sample-description
+    variant). ``hev1`` (parameter-sets-in-band) is spec-legal but
+    flatly refused by many consumer decoders, so embedded video won't
+    autoplay on Discord. ``-tag:v hvc1`` tells ffmpeg to rewrite the
+    tag; libx265 does the actual encode.
+
+    Uses ``yuv420p`` pixfmt (not ``yuv420p10le`` or ``yuv444p``) so
+    the Media Foundation / VideoToolbox / web-browser decoders don't
+    reject the track, and ``+faststart`` so the moov atom is at the
+    head of the file (non-streaming web players won't start playback
+    until they see the moov).
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg not on PATH — HEVC encode needs ffmpeg with libx265. "
+            "apt: `apt-get install ffmpeg` / brew: `brew install ffmpeg`."
+        )
+
+    import numpy as np
+
+    if pixels.ndim != 4 or pixels.shape[-1] != 3 or pixels.dtype != np.uint8:
+        raise ValueError(
+            f"write_video_hevc: expected [T,H,W,3] uint8, got shape {pixels.shape} "
+            f"dtype {pixels.dtype}"
+        )
+    t, h, w, _ = pixels.shape
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "warning",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{w}x{h}",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx265",
+        "-preset", "medium",
+        "-crf", str(crf),
+        "-tag:v", "hvc1",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(pixels.tobytes())
+        proc.stdin.close()
+    finally:
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg failed with exit code {rc}")
+    print(f"saved {output_path} ({t} frames @ {fps} fps, HEVC/hvc1)")
 
 
 # ---------------------------------------------------------------
@@ -502,9 +661,33 @@ def main():
     parser.add_argument("--repo", default="Overworld/Waypoint-1.5-1B")
     parser.add_argument("--preset", choices=["360p", "720p"], default="720p")
     parser.add_argument("--n-frames", type=int, default=16)
-    parser.add_argument("--output", default="out.npy", help="output latent .npy path")
-    parser.add_argument("--seed-latent", type=str, default="./seed_latent.npy",
-                        help="seed latent .npy [T, C, H, W] from encode_frame.py")
+    parser.add_argument(
+        "--output",
+        default="out.mp4",
+        help="output path — .mp4/.mov/.mkv writes HEVC (hvc1) via ffmpeg, "
+             ".npy saves the raw [T,C,H,W] f32 latent array",
+    )
+    parser.add_argument(
+        "--seed-image",
+        type=str,
+        default=None,
+        help="image or video to encode as the seed frame(s). Mutually "
+             "exclusive with --seed-latent. Single image is tiled 4× "
+             "for the VAE's temporal compression.",
+    )
+    parser.add_argument(
+        "--seed-latent",
+        type=str,
+        default=None,
+        help="pre-encoded seed latent .npy [T,C,H,W] (from an earlier "
+             "--seed-image run or the legacy scripts/encode_frame.py)",
+    )
+    parser.add_argument("--fps", type=int, default=_PIXEL_FPS,
+                        help="pixel fps of the output video (default 60, matching training data)")
+    parser.add_argument("--crf", type=int, default=23,
+                        help="libx265 quality — lower = better (default 23)")
+    parser.add_argument("--ae-repo", default="Overworld-Models/taehv1_5",
+                        help="HF repo for the TAEHV autoencoder")
     parser.add_argument("--no-graph", action="store_true")
     parser.add_argument("--ctrl", type=str, default=None,
                         help="'demo' or path to JSON controller sequence")
@@ -514,6 +697,9 @@ def main():
     parser.add_argument("--profile", action="store_true",
                         help="Profile one frame's denoise+commit and print module timings.")
     args = parser.parse_args()
+
+    if args.seed_image and args.seed_latent:
+        parser.error("--seed-image and --seed-latent are mutually exclusive")
 
     cfg = _make_config(args.preset)
     import dataclasses as _dc
@@ -565,12 +751,26 @@ def main():
         _sync()
 
     # ── Seed frames ──
+    # Two ways to provide a seed:
+    #   --seed-image PATH: encode an image/video inline through TAEHV,
+    #                      feed the latents into the KV cache.
+    #   --seed-latent NPY: load a pre-encoded latent array (produced by
+    #                      an earlier run, or by the legacy
+    #                      scripts/encode_frame.py helper).
     seed_frame_count = 0
-    if args.seed_latent:
+    seed_np = None
+    if args.seed_image:
+        print(f"encoding seed from {args.seed_image} …")
+        t_enc = time.perf_counter()
+        seed_np = encode_seed_from_path(args.seed_image, args.preset, args.ae_repo)
+        print(f"  encoded {seed_np.shape[0]} latent frame(s) in {time.perf_counter() - t_enc:.1f}s")
+    elif args.seed_latent:
         print(f"seeding from {args.seed_latent} …")
         seed_np = np.load(args.seed_latent)
         if seed_np.ndim == 3:
             seed_np = seed_np[np.newaxis]
+
+    if seed_np is not None:
         seed_frame_count = seed_np.shape[0]
         # Seed frames reuse the ctrl input buffer (already zero-filled).
         seed_ctrl_emb = model.encode_ctrl(ctrl_dev)
@@ -763,11 +963,50 @@ def main():
     print(f"  total: {gen_elapsed:.2f}s")
     print(f"{'='*50}")
 
-    # ── Save latents (decode via scripts/decode_latents.py) ──
+    # ── Output ──
     latent_nps = [_to_numpy_f32(lt).reshape(1, C, H, W) for lt in latent_frames]
     all_latents = np.concatenate(latent_nps, axis=0)  # [T, C, H, W]
-    np.save(args.output, all_latents)
-    print(f"saved {args.output} ({all_latents.shape})")
+
+    out_lower = args.output.lower()
+    is_video = out_lower.endswith((".mp4", ".mov", ".mkv"))
+    is_npy = out_lower.endswith(".npy")
+    if not (is_video or is_npy):
+        print(
+            f"warning: unrecognized --output extension {args.output!r}; "
+            f"treating as video (HEVC/mp4)."
+        )
+        is_video = True
+
+    if is_npy:
+        np.save(args.output, all_latents)
+        print(f"saved {args.output} ({all_latents.shape})")
+    else:
+        print(f"\ndecoding {all_latents.shape[0]} latent frames → pixels …")
+        t_dec = time.perf_counter()
+        decode = load_taehv_decoder(args.ae_repo)
+        if decode is None:
+            # AE not available — fall back to saving latents so the run
+            # isn't wasted. Caller can decode offline once world_engine
+            # is on PATH.
+            fallback = args.output.rsplit(".", 1)[0] + ".npy"
+            np.save(fallback, all_latents)
+            print(f"  AE unavailable; saved latents to {fallback} instead")
+        else:
+            # Stream decode one latent frame at a time — TAEHV maintains
+            # temporal state across calls, and chunked decode keeps peak
+            # VRAM flat for long outputs.
+            pixel_chunks = []
+            for i in range(all_latents.shape[0]):
+                pixel_chunks.append(decode(all_latents[i : i + 1]))
+                if i == 0 or (i + 1) % 10 == 0:
+                    print(f"  decoded {i + 1}/{all_latents.shape[0]}")
+            pixels = np.concatenate(pixel_chunks, axis=0)  # [T*4, H, W, 3] uint8
+            dec_elapsed = time.perf_counter() - t_dec
+            print(
+                f"  {pixels.shape[0]} pixel frames in {dec_elapsed:.1f}s "
+                f"({pixels.shape[0] / dec_elapsed:.1f} fps)"
+            )
+            write_video_hevc(pixels, args.output, fps=args.fps, crf=args.crf)
 
 
 if __name__ == "__main__":

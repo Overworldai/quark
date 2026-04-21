@@ -1,8 +1,10 @@
 # popcorn
 
 GPU kernel compiler. Typed IR → PTX (CUDA) / MSL (Metal) → GPU binary.
-Torch + MLX are the only backends; every other op goes through
-`popcorn.backend.PT`.
+Runtime inference path uses `PopcornTensor` (ctypes → libcuda) on CUDA
+and `mx.array` (MLX) on Metal — no torch dependency in the hot path.
+`popcorn.backend.PT` still exists as the polymorphic wrapper for
+kernel `reference.py` / `baselines.py` (torch optional dev extra).
 
 ## Orientation
 
@@ -48,7 +50,9 @@ n_stages)` replaces the separate `body = PipelineBody(...)` +
 | [docs/BLOCKS.md](docs/BLOCKS.md) | L0 / L1 / L2 block surface, DSL primitives |
 | [docs/BACKEND.md](docs/BACKEND.md) | `PT` polymorphic tensor, Metal vs CUDA dispatch |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | Timing, tags, autotune cache |
-| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `popcorn.functional` torch/MLX entry point |
+| [docs/WEIGHTS.md](docs/WEIGHTS.md) | Safetensors loader, HF Hub, `nn.Module` state dict |
+| [docs/WAYPOINT_15.md](docs/WAYPOINT_15.md) | Waypoint-1.5 model + 5090 / 4090 benchmarks |
+| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `popcorn.functional` call surface (PopcornTensor / MLX) |
 | [docs/TESTING.md](docs/TESTING.md) | Test structure, correctness metric |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | Symptom → recipe |
 | [docs/CONVENTIONS.md](docs/CONVENTIONS.md) | Naming, style, forbidden patterns |
@@ -112,13 +116,18 @@ src/popcorn/
         decorator.py      @kernel(…, problems=, baselines=, reference=)
         registry.py       @register + get / all_kernels / names
         gemm/             attn/ owl_attn/ kv_cache_update/ moe_inproj/ moe_outproj/
-    functional/           popcorn.functional — torch/MLX callables wrapping the
-                          registered kernels (torch.library.custom_op + fake fns
-                          on CUDA; eager dispatch on MLX); offline shuffle_b_for_*
-                          helpers for b_shuffle=True fast paths
+    functional/           popcorn.functional — per-kernel callables; dispatch
+                          by input type (PopcornTensor → CUDA, mx.array → MLX).
+                          Offline shuffle_b_for_* helpers for b_shuffle=True
+                          fast paths
+    nn/                   inference-only Module / Parameter / ModuleList;
+                          io.py = pure-python safetensors loader (mmap + pinned
+                          DMA); layers.py = Linear / MLP / OwlAttn / KVCacheUpdate / …
+    models/               waypoint_15.py — 24-layer DiT reference model
+    runtime/              PopcornTensor (tensor.py), libcuda ctypes binding
+                          (cuda.py), on-device PTX utility kernels (kernels.py)
     launcher/             Launcher, CompiledKernel, ParamSpec
     drivers/              cuda.py (ctypes), mlx.py
-    runtime/              libcuda ctypes binding
     weight_shuffle.py     offline B-preshuffle for fp8+shuffle GEMM fast path
 
 tests/                    ir/ lower/ launcher/ kernels/ (smoke auto-discovers)

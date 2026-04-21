@@ -1,25 +1,30 @@
-# `popcorn.functional` — torch / MLX entry point
+# `popcorn.functional` — call surface
 
-Every popcorn production kernel is exposed as a framework-native
-callable. Pass `torch.Tensor`s (CUDA) or `mx.array`s (Metal); dispatch
-is decided per-call from the input type.
+Every popcorn production kernel is exposed as a callable that accepts
+backend-native tensors. Dispatch is decided per-call from the input
+type:
+
+- `PopcornTensor` (from `popcorn.runtime.tensor`) → CUDA path.
+- `mx.array` (MLX) → Metal path.
+
+No torch runtime dep on either leg. Torch is only pulled in if a test
+baseline or reference implementation reaches for it (optional dev
+extra).
 
 ```python
 import popcorn.functional as pcf
+from popcorn.runtime.tensor import PopcornTensor
 
-C = pcf.gemm(A, B)                                            # matmul
-out = pcf.attention(Q, K, V_t, B=..., n_kv_heads=..., ...)    # flash attention
-out = pcf.owl_attn(Q, K_cache, Vt_cache, cos, sin, segs, ns, B=..., ...)
-K_cache, Vt_cache, segs, ns = pcf.kv_cache_update(
-    K, V, cos, sin, frame_t, Vt_cache, segs, ns, K_cache, ...)
-Y = pcf.moe_inproj(X, W_in, token_ids, work_list, n_experts=...)
-Y = pcf.moe_outproj(h_in, W_out, token_ids, sw, wl, M=..., n_experts=...)
+A = PopcornTensor.randn(M, K, dtype="bf16")
+B = PopcornTensor.randn(N, K, dtype="bf16")
+
+C   = pcf.gemm(A, B)                                           # matmul
+out = pcf.attention(Q, K, V_t, B=..., n_kv_heads=..., ...)     # flash attention
+out = pcf.owl_attn(Q, K_cache, Vt_cache, segments, n_segments, ...)
+pcf.kv_cache_update(K, V, frame_t, frozen, Vt_cache, segs, ns, K_cache, ...)
+Y   = pcf.moe_inproj(X, W_in, token_ids, work_list, n_experts=...)
+Y   = pcf.moe_outproj(h_in, W_out, token_ids, sw, wl, M=..., n_experts=...)
 ```
-
-On CUDA every op is registered via `torch.library.custom_op`, so
-`torch.compile(fullgraph=True)` traces through cleanly. Inside a
-compiled region call the raw op directly — `torch.ops.popcorn.gemm(...)` —
-or keep using `pcf.gemm`; Dynamo will pick it up either way.
 
 ## How tensors become a spec
 
@@ -32,8 +37,8 @@ flat layout (`B`, `n_kv_heads`, `seq_len`, …) come in as kwargs.
 |---|---|---|
 | `gemm(A, B)` | A, B | — (dtype kwargs are optional) |
 | `attention(Q, K, V_t)` | Q, K, V_t | `B`, `n_kv_heads`, `gqa_ratio`, `seq_len`, `kv_len` |
-| `owl_attn(Q, K_cache, Vt_cache, cos, sin, segments, n_segments)` | 7 tensors | `B`, `n_kv_heads`, `gqa_ratio`, `H_spatial`, `W_spatial`, `num_buckets`, `pinned_dilation` |
-| `kv_cache_update(K, V, cos, sin, frame_t, Vt_cache, segments, n_segments, K_cache)` | 9 tensors | `B`, `n_kv_heads`, `H_spatial`, `W_spatial`, `num_buckets`, `pinned_dilation` |
+| `owl_attn(Q, K_cache, Vt_cache, segments, n_segments)` | 5 tensors | `B`, `n_kv_heads`, `gqa_ratio`, `H_spatial`, `W_spatial`, `num_buckets`, `pinned_dilation` |
+| `kv_cache_update(K, V, frame_t, frozen, Vt_cache, segments, n_segments, K_cache)` | 8 tensors | `B`, `n_kv_heads`, `H_spatial`, `W_spatial`, `num_buckets`, `pinned_dilation` |
 | `moe_inproj(X, W_in, token_ids, work_list)` | 4 tensors | `n_experts` |
 | `moe_outproj(h_in, W_out, token_ids, slot_weights, work_list)` | 5 tensors | `M`, `n_experts` |
 
@@ -95,46 +100,53 @@ for shipping pre-tuned configs with the package.
 
 ## Weight shuffle — offline
 
-`b_shuffle=True` kernels read a permuted B layout. Inside
-`torch.compile` we want the shuffle to be constant-folded out of the
-graph, not re-run per call. `popcorn.functional.shuffle` exposes
-offline helpers:
+`b_shuffle=True` kernels read a permuted B layout. The shuffle must
+happen once offline (at model-load time) and the per-step call uses
+the pre-shuffled buffer:
 
 ```python
 from popcorn.functional import shuffle_b_for_gemm
 
 B_shuf = shuffle_b_for_gemm(A, B)                             # call once
-C = pcf.gemm(A, B_shuf, b_shuffled=True)                       # per step
+C      = pcf.gemm(A, B_shuf, b_shuffled=True)                 # per step
 ```
 
 `shuffle_b_for_moe_inproj(X, W_in, n_experts=..., top_k=...)` and
 `shuffle_b_for_moe_outproj(h_in, W_out, M=..., n_experts=...)` work
 the same way. The helpers resolve the same config `pcf.*` would, so
 the shuffle layout always matches the kernel's fragment loader.
+`nn.Linear` exposes the same shuffle via `.prepare(...)` at module
+init — recommended for `nn.Module`-based models.
 
-## Autograd
+## PopcornTensor path (CUDA)
 
-Every op registers an autograd that raises `NotImplementedError` with
-a clear message. The surface is inference-only. Training-mode kernels
-(attention backward, GEMM grad) are tracked as a future proposal.
-
-## Using under `torch.compile`
+Allocations, reductions, slicing, reshape, permute, and arithmetic
+all live on `PopcornTensor` itself — no torch needed:
 
 ```python
-@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
-def step(A, B, token_ids, work_list):
-    Y = pcf.moe_inproj(A, B, token_ids, work_list, n_experts=16)
-    return Y * 2
+from popcorn.runtime.tensor import PopcornTensor
+
+A = PopcornTensor.randn(M, K, dtype="bf16")
+B = PopcornTensor.zeros(N, K, dtype="bf16")
+C = PopcornTensor.zeros(M, N, dtype="bf16")
+pcf.gemm(A, B, out=C)                     # in-place write into C
+C = C.reshape(M // 2, 2, N)
 ```
 
-Verified in `tests/functional/test_compile.py` (CUDA-only). Fake fns
-evaluate the kernel's `TensorDecl.shape(spec, config)` callable at
-trace time, so Dynamo sees correct shapes / dtypes without running
-the kernel.
+All views share storage (refcount on the underlying `cuMemAlloc`
+block). Allocations are pooled / stream-ordered via
+`cuMemAllocAsync` on the default stream; see
+[docs/ARCHITECTURE.md](ARCHITECTURE.md).
 
-`kv_cache_update` is marked `mutates_args=("Vt_cache", "segments",
-"n_segments", "K_cache")` so Dynamo's alias analysis treats it as an
-in-place write. Its fake fn returns aliases of the input buffers.
+Persistent output buffers — the `out=` kwarg on every wrapper —
+avoid the per-call `cuMemAllocAsync` that `auto_alloc` would
+otherwise pay:
+
+```python
+C = PopcornTensor.zeros(M, N, dtype="bf16")
+for batch in loader:
+    pcf.gemm(batch, W, out=C)             # writes into C, no fresh allocation
+```
 
 ## Using under MLX
 
@@ -146,21 +158,16 @@ follow-up.
 
 ## CUDA graph capture
 
-Every launch path is designed to be capture-safe: `data_ptr()`
-extraction, no `.item()` host syncs, no allocator-allocated scratch
-during the launch. The one remaining allocation is per-launch
-scalar-arg packing. CUDA-graph regression
-tests land in `tests/functional/test_cuda_graph.py` when that work lands.
-
-## Schema stability
-
-Registered schemas are a public contract. Adding kwargs with defaults
-is fine; removing or reordering is a breaking change. CI snapshots
-every `popcorn::*` schema in `tests/functional/test_schema.py` (not
-yet landed) and fails on accidental change.
+Every launch path is capture-safe: `data_ptr()` extraction, no
+`.item()` host syncs, no allocator-allocated scratch during the
+launch. `nn.Module` forward passes over `PopcornTensor` inputs
+capture cleanly — see `scripts/generate.py` for the end-to-end
+Waypoint-1.5 capture+replay loop.
 
 ## See also
 
+- [docs/WEIGHTS.md](WEIGHTS.md) — loading safetensors into an `nn.Module`
 - [docs/ADDING_A_KERNEL.md](ADDING_A_KERNEL.md) — how to add a kernel
   and wire up its functional wrapper
 - [docs/BACKEND.md](BACKEND.md) — `PT` polymorphic tensor surface
+  (baseline / reference path, not the runtime)
