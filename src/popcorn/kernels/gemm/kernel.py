@@ -61,6 +61,11 @@ class GemmKernel(Kernel):
             ),
         ),
         TensorDecl(
+            "Bias",
+            dtype=lambda s, c: s.out_dtype,
+            shape=lambda s, c: (s.N,) if s.has_bias else (1,),
+        ),
+        TensorDecl(
             "Out", dtype=lambda s, c: s.out_dtype, shape=lambda s, c: (s.M, s.N), role="out"
         ),
     ]
@@ -80,19 +85,58 @@ class GemmKernel(Kernel):
             mma = self._mma_cfg()
         except KeyError:
             return False
+        # The kernel's build() casts A/B on load to ``compute_dtype_resolved``
+        # and lays out smem as that dtype. The MMA fragment loads then
+        # read smem with the layout of ``mma_cfg.shape``. If the config
+        # picks a ``main_shape`` whose dtype axes disagree with the spec's
+        # compute dtype, the frag load uses the wrong stride / element
+        # size on smem laid out for a different dtype — classic misaligned
+        # address at launch. Reject the mismatch.
+        compute = s.compute_dtype_resolved
+        if mma.shape.a_dtype is not compute or mma.shape.b_dtype is not compute:
+            return False
         if not self._validate_gemm_tile(mma):
+            return False
+        # K must split cleanly into BK-sized chunks. Without this the
+        # kernel silently drops ``K % BK`` elements off the tail of
+        # every row (cos_sim degrades and, because the tail read
+        # straddles the real A/B boundary, some dtype / BK combos end
+        # up dereferencing misaligned addresses at launch time).
+        if s.K % c.BK != 0:
+            return False
+        # cp.async requires 16-byte aligned smem rows.
+        compute_dt = s.compute_dtype_resolved
+        elem_b = compute_dt.bytes
+        if c.a_pad and ((c.BK + c.a_pad) * elem_b) % 16 != 0:
+            return False
+        if c.b_pad and ((c.BK + c.b_pad) * elem_b) % 16 != 0:
             return False
         # n_stages=2 uses a 2× unrolled loop → K-iteration count must be even.
         if c.n_stages == 2 and (s.K // c.BK) % 2 != 0:
             return False
+        # split_k > 1 requires atomic add on the output dtype.
+        # Dtype support is validated by is_valid_for(caps) which checks
+        # AtomicRmwOp dtypes against device.atomic_add_dtypes.
+        if c.split_k > 1:
+            k_iters = s.K // c.BK
+            if k_iters % c.split_k != 0:
+                return False
+            # Fused epilogue runs per-block BEFORE the atomic add, so
+            # with split_k > 1 the bias gets added ``split_k`` times
+            # (``out = sum_z (partial_z + bias)``) and the activation
+            # is applied to each partial instead of the final sum
+            # (``sum_z silu(partial_z) != silu(sum_z partial_z)`` —
+            # silu is nonlinear). Reject the combo; the full-precision
+            # fused path is only correct at split_k=1. A post-split
+            # epilogue kernel would re-enable it but isn't wired up.
+            if s.has_bias or s.activation is not None:
+                return False
         return True
 
     def grid(self) -> tuple[int, int, int]:
-        # Convention: x=N/BN (col_base), y=M/BM (row_base). The @kernel
-        # decorator sets self.n_base = block_base("x", BN) and
-        # self.m_base = block_base("y", BM) to match.
+        # Convention: x=N/BN (col_base), y=M/BM (row_base), z=split_k.
         s, c = self.spec, self.config
-        return (s.N // c.BN, s.M // c.BM, 1)
+        return (s.N // c.BN, s.M // c.BM, c.split_k)
 
     def flops(self) -> int:
         return 2 * self.spec.M * self.spec.N * self.spec.K
@@ -107,8 +151,9 @@ class GemmKernel(Kernel):
         o_dt = spec.out_dtype.backend
         A = PT.astype(PT.randn(spec.M, spec.K), a_dt)
         B = PT.astype(PT.randn(spec.N, spec.K), b_dt)
+        Bias = PT.astype(PT.randn(spec.N), o_dt) if spec.has_bias else PT.zeros(1, dtype=o_dt)
         Out = PT.zeros(spec.M, spec.N, dtype=o_dt)
-        return {"A": A, "B": B, "Out": Out}
+        return {"A": A, "B": B, "Bias": Bias, "Out": Out}
 
     @classmethod
     def spec_from_tensors(
@@ -119,6 +164,8 @@ class GemmKernel(Kernel):
         out_dtype: DType | str | None = None,
         compute_dtype: DType | str | None = None,
         b_shuffled: bool = False,
+        activation: str | None = None,
+        has_bias: bool = False,
     ) -> GemmSpec:
         """Derive a GemmSpec from live A, B tensors + scalar kwargs.
 
@@ -142,6 +189,8 @@ class GemmKernel(Kernel):
             b_dtype=b_dt_str,
             out_dtype=DType.coerce(out_dtype) or a_dt_str,
             compute_dtype=DType.coerce(compute_dtype),
+            activation=activation,
+            has_bias=has_bias,
             b_shuffle=b_shuffled,
         )
 
@@ -155,13 +204,14 @@ class GemmKernel(Kernel):
         # backend — the autotuner just iterates the cartesian product
         # and drops invalid configs.
         return {
-            "BM": [32, 64, 128],
-            "BN": [32, 64, 128, 256],
+            "BM": [16, 32, 64, 128],
+            "BN": [16, 32, 64, 128, 256],
             "BK": [16, 32, 64],
             "n_warps": [2, 4, 8],
             "n_stages": [1, 2],
             "a_pad": [0, 8, 16],
             "b_pad": [0, 8, 16],
+            "split_k": [1, 2, 4, 8],
         }
 
     # ── build() ──
@@ -192,10 +242,22 @@ class GemmKernel(Kernel):
         bk_stride_b = (c.BK + c.b_pad) if (s.b_shuffle and c.b_pad > 0) else c.BK
         K_outer = s.K // c.BK
 
+        # Split-K: each block processes a slice of the K dimension.
+        split_k = c.split_k
+        if split_k > 1:
+            k_iters_per_split = K_outer // split_k
+            k_split_idx = pop.block_idx("z")
+            k_start = k_split_idx * bctx.c(k_iters_per_split, dtype=DType.U32)
+        else:
+            k_iters_per_split = K_outer
+            k_start = bctx.c(0, dtype=DType.U32)
+
         def produce(ictx: IterCtx) -> None:
             plan = ictx.stage
-            k_col_a = ictx.iter_idx * bk_stride_a
-            k_col_b = k_col_a if bk_stride_b == bk_stride_a else ictx.iter_idx * bk_stride_b
+            # Offset the K iteration by the split-K start.
+            k_iter = k_start + ictx.iter_idx
+            k_col_a = k_iter * bk_stride_a
+            k_col_b = k_col_a if bk_stride_b == bk_stride_a else k_iter * bk_stride_b
             plan.a.load_from(g.A, row=m_base, col=k_col_a, cast=a_cast)
             plan.b.load_from(g.B, row=n_base, col=k_col_b, cast=b_cast)
 
@@ -204,7 +266,7 @@ class GemmKernel(Kernel):
             produce=produce,
             consume=mma,
             carry=acc,
-        ).run(n_iters=K_outer, n_stages=c.n_stages)
+        ).run(n_iters=k_iters_per_split, n_stages=c.n_stages)
 
         pop.store_acc(
             g.Out,
@@ -212,4 +274,7 @@ class GemmKernel(Kernel):
             row=m_base,
             col=n_base + bctx.warp_id * BN_per_warp,
             cast=s.out_dtype,
+            activation=s.activation,
+            bias=g.Bias if s.has_bias else None,
+            atomic=split_k > 1,
         )

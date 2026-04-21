@@ -136,7 +136,7 @@ class Builder:
     # Commutative arith kinds whose operand order doesn't matter for CSE
     # — a+b == b+a, so canonicalize operand ids before caching.
     _COMMUTATIVE_ARITH: ClassVar[frozenset] = frozenset(
-        {"add", "mul", "min", "max", "and", "or", "xor"}
+        {"add", "mul", "mul_hi", "min", "max", "and", "or", "xor"}
     )
 
     def _cse_key_for_arith(
@@ -225,6 +225,14 @@ class Builder:
 
     def mul(self, a: Value, b: Value, name: str = "") -> Value:
         return self._binary_arith("mul", a, b, name=name)
+
+    def mul_hi(self, a: Value, b: Value, name: str = "") -> Value:
+        """High 32 bits of a 32×32→64 unsigned multiply.
+
+        Lowers to PTX ``mul.hi.u32``. Used by Philox-family counter-based
+        RNGs (``randn``) — every round needs both halves of the product.
+        """
+        return self._binary_arith("mul_hi", a, b, name=name)
 
     def min(self, a: Value, b: Value, name: str = "") -> Value:
         return self._binary_arith("min", a, b, name=name)
@@ -407,6 +415,28 @@ class Builder:
 
     def log2(self, v: Value, name: str = "") -> Value:
         return self._math("log2", v, name)
+
+    def log2_approx(self, v: Value, name: str = "") -> Value:
+        """Fast SFU-pipe log2 (PTX ``lg2.approx.f32``). ~4-cycle
+        throughput vs ~16 for the precise ``lg2.f32``. Used in the
+        Philox + Box-Muller randn path where ULP-level accuracy is
+        meaningless (the output is a random draw, not a bit-exact
+        math function).
+        """
+        return self._math("log2_approx", v, name)
+
+    def sqrt_approx(self, v: Value, name: str = "") -> Value:
+        """Fast SFU-pipe sqrt (PTX ``sqrt.approx.f32``). Same rationale
+        as :meth:`log2_approx` — used in Box-Muller for the
+        ``r = sqrt(-2 * ln(u))`` magnitude.
+        """
+        return self._math("sqrt_approx", v, name)
+
+    def sin(self, v: Value, name: str = "") -> Value:
+        return self._math("sin", v, name)
+
+    def cos(self, v: Value, name: str = "") -> Value:
+        return self._math("cos", v, name)
 
     def tanh(self, v: Value, name: str = "") -> Value:
         return self._math("tanh", v, name)

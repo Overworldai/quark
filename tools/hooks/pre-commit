@@ -102,7 +102,7 @@ fi
 # Only the checks that pass on the current codebase are active.
 
 echo "→ file size limits..."
-python tools/ci/file_size.py
+.venv/bin/python tools/ci/file_size.py
 
 # ── 5. Unit tests ──
 # Run the full pytest suite. Tests that need a specific device

@@ -76,8 +76,7 @@ jobs:
       - name: Create venv and install package
         run: |
           uv venv .venv --python ${{ env.PYTHON_VERSION }}
-          VIRTUAL_ENV=.venv uv pip install -e .
-          VIRTUAL_ENV=.venv uv pip install pytest
+          VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
 
       - name: pytest
         run: .venv/bin/python -m pytest tests/ -q

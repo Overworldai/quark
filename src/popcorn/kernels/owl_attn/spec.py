@@ -38,6 +38,12 @@ class OwlAttnSpec(KernelSpec):
     # (TileLoad with cast=). Mirrors the GEMM kernel's compute_dtype axis.
     compute_dtype: DType | None = None
     max_segments: int = 3
+    # When True, Q input is packed QKV [B*tpf, qkv_dim] and output is
+    # [B*tpf, n_q_heads*Dh]. The kernel indexes into the packed Q
+    # columns using per-head column offsets rather than head-strided rows.
+    packed_qkv: bool = False
+    # RoPE cos/sin are computed inline from (h, w, frame_t, Dh).
+    # No precomputed tables — frame_t is a runtime device buffer.
 
     def __post_init__(self):
         for field in ("a_dtype", "kv_dtype", "out_dtype"):
@@ -78,3 +84,25 @@ class OwlAttnSpec(KernelSpec):
     @property
     def total_q(self) -> int:
         return self.B * self.n_q_heads * self.seq_len
+
+    @property
+    def qkv_dim(self) -> int:
+        return (self.n_q_heads + 2 * self.n_kv_heads) * self.Dh
+
+    @property
+    def q_rows(self) -> int:
+        """Row count of the Q/QKV input tensor."""
+        return (self.B * self.tpf) if self.packed_qkv else self.total_q
+
+    @property
+    def q_cols(self) -> int:
+        """Col count of the Q/QKV input tensor."""
+        return self.qkv_dim if self.packed_qkv else self.Dh
+
+    @property
+    def out_rows(self) -> int:
+        return (self.B * self.tpf) if self.packed_qkv else self.total_q
+
+    @property
+    def out_cols(self) -> int:
+        return (self.n_q_heads * self.Dh) if self.packed_qkv else self.Dh

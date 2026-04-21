@@ -2,14 +2,21 @@
 name = "popcorn"
 version = "0.1.0"
 requires-python = ">=3.11"
-# Backends are platform-specific: torch drives the CUDA path; mlx drives
-# the Metal path. The launcher (popcorn.launcher.Launcher) talks to
-# libcuda directly via ctypes and to Metal via mlx.fast.metal_kernel —
-# no cupy, no pycuda, no triton.
+# Base deps cover only what the launcher needs at steady state:
+# numpy everywhere, mlx for the Metal driver path. torch is an
+# optional dev dep used by reference implementations and the autotune
+# correctness gate — installs that skip autotune don't need it.
 dependencies = [
-    "torch",
     "numpy",
     "mlx; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+# ``pip install .[dev]`` pulls torch for reference impls + autotune
+# correctness checks plus pytest for the test suite.
+dev = [
+    "torch",
+    "pytest",
 ]
 
 [build-system]

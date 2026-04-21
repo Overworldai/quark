@@ -1,5 +1,7 @@
 """ctypes binding to libcuda — the CUDA driver API.
 
+EXEMPT FROM 500-LINE RULE
+
 Per popcorn launcher proposal §4.1. This is a thin wrapper over the
 native CUDA driver library, with one Python method per `cu*` symbol
 we actually need. **No torch imports** — this layer is the platform
@@ -270,6 +272,131 @@ class CudaRuntime:
         L.cuEventDestroy_v2.argtypes = [ctypes.c_void_p]
         L.cuEventDestroy_v2.restype = ctypes.c_int
 
+        # Memory management (torch-free tensor path).
+        L.cuMemAlloc_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),  # CUdeviceptr*
+            ctypes.c_size_t,
+        ]
+        L.cuMemAlloc_v2.restype = ctypes.c_int
+
+        L.cuMemFree_v2.argtypes = [ctypes.c_uint64]
+        L.cuMemFree_v2.restype = ctypes.c_int
+
+        # Stream-ordered alloc/free (CUDA 11.2+). Works during graph capture.
+        L.cuMemAllocAsync.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),  # CUdeviceptr*
+            ctypes.c_size_t,  # bytesize
+            ctypes.c_void_p,  # CUstream
+        ]
+        L.cuMemAllocAsync.restype = ctypes.c_int
+
+        L.cuMemFreeAsync.argtypes = [
+            ctypes.c_uint64,  # CUdeviceptr
+            ctypes.c_void_p,  # CUstream
+        ]
+        L.cuMemFreeAsync.restype = ctypes.c_int
+
+        L.cuMemcpyHtoD_v2.argtypes = [
+            ctypes.c_uint64,  # CUdeviceptr dst
+            ctypes.c_void_p,  # const void* src
+            ctypes.c_size_t,
+        ]
+        L.cuMemcpyHtoD_v2.restype = ctypes.c_int
+
+        L.cuMemcpyDtoH_v2.argtypes = [
+            ctypes.c_void_p,  # void* dst
+            ctypes.c_uint64,  # CUdeviceptr src
+            ctypes.c_size_t,
+        ]
+        L.cuMemcpyDtoH_v2.restype = ctypes.c_int
+
+        L.cuMemsetD8_v2.argtypes = [
+            ctypes.c_uint64,  # CUdeviceptr dst
+            ctypes.c_ubyte,  # unsigned char value
+            ctypes.c_size_t,
+        ]
+        L.cuMemsetD8_v2.restype = ctypes.c_int
+
+        # Async memory operations (stream-ordered, required for graph capture).
+        L.cuMemcpyDtoDAsync_v2.argtypes = [
+            ctypes.c_uint64,  # dst
+            ctypes.c_uint64,  # src
+            ctypes.c_size_t,  # nbytes
+            ctypes.c_void_p,  # CUstream
+        ]
+        L.cuMemcpyDtoDAsync_v2.restype = ctypes.c_int
+
+        L.cuMemsetD8Async.argtypes = [
+            ctypes.c_uint64,
+            ctypes.c_ubyte,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        L.cuMemsetD8Async.restype = ctypes.c_int
+
+        L.cuMemsetD16Async.argtypes = [
+            ctypes.c_uint64,
+            ctypes.c_ushort,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        L.cuMemsetD16Async.restype = ctypes.c_int
+
+        L.cuMemsetD32Async.argtypes = [
+            ctypes.c_uint64,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        L.cuMemsetD32Async.restype = ctypes.c_int
+
+        # Graph capture API.
+        L.cuStreamBeginCapture_v2.argtypes = [
+            ctypes.c_void_p,  # CUstream
+            ctypes.c_int,  # CUstreamCaptureMode
+        ]
+        L.cuStreamBeginCapture_v2.restype = ctypes.c_int
+
+        L.cuStreamEndCapture.argtypes = [
+            ctypes.c_void_p,  # CUstream
+            ctypes.POINTER(ctypes.c_void_p),  # CUgraph*
+        ]
+        L.cuStreamEndCapture.restype = ctypes.c_int
+
+        L.cuGraphInstantiateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),  # CUgraphExec*
+            ctypes.c_void_p,  # CUgraph
+            ctypes.c_uint64,  # flags
+        ]
+        L.cuGraphInstantiateWithFlags.restype = ctypes.c_int
+
+        L.cuGraphLaunch.argtypes = [
+            ctypes.c_void_p,  # CUgraphExec
+            ctypes.c_void_p,  # CUstream
+        ]
+        L.cuGraphLaunch.restype = ctypes.c_int
+
+        L.cuGraphExecDestroy.argtypes = [ctypes.c_void_p]
+        L.cuGraphExecDestroy.restype = ctypes.c_int
+
+        L.cuGraphDestroy.argtypes = [ctypes.c_void_p]
+        L.cuGraphDestroy.restype = ctypes.c_int
+
+        # Typed memset for fill operations.
+        L.cuMemsetD16_v2.argtypes = [
+            ctypes.c_uint64,  # CUdeviceptr dst
+            ctypes.c_ushort,  # unsigned short value
+            ctypes.c_size_t,  # count (number of u16 elements)
+        ]
+        L.cuMemsetD16_v2.restype = ctypes.c_int
+
+        L.cuMemsetD32_v2.argtypes = [
+            ctypes.c_uint64,  # CUdeviceptr dst
+            ctypes.c_uint,  # unsigned int value
+            ctypes.c_size_t,  # count (number of u32 elements)
+        ]
+        L.cuMemsetD32_v2.restype = ctypes.c_int
+
     # ---- internal: error checking ----
 
     def _check(self, res: int) -> None:
@@ -442,3 +569,187 @@ class CudaRuntime:
 
     def event_destroy(self, ev: int) -> None:
         self._check(self._lib.cuEventDestroy_v2(ctypes.c_void_p(ev)))
+
+    # ---- device memory (torch-free tensor path) ----
+
+    def mem_alloc(self, nbytes: int, stream: int = 0) -> int:
+        """Allocate device memory. Stream-aware: uses cuMemAllocAsync
+        when a stream is active (required during graph capture)."""
+        if stream == 0:
+            from popcorn.graph import active_stream
+
+            stream = active_stream()
+        ptr = ctypes.c_uint64(0)
+        if stream:
+            self._check(
+                self._lib.cuMemAllocAsync(
+                    ctypes.byref(ptr), ctypes.c_size_t(nbytes), ctypes.c_void_p(stream)
+                )
+            )
+        else:
+            self._check(self._lib.cuMemAlloc_v2(ctypes.byref(ptr), ctypes.c_size_t(nbytes)))
+        return int(ptr.value)
+
+    def mem_free(self, ptr: int, stream: int = 0) -> None:
+        """Free device memory. Stream-aware: uses cuMemFreeAsync
+        when a stream is active."""
+        if stream == 0:
+            from popcorn.graph import active_stream
+
+            stream = active_stream()
+        if stream:
+            self._check(self._lib.cuMemFreeAsync(ctypes.c_uint64(ptr), ctypes.c_void_p(stream)))
+        else:
+            self._check(self._lib.cuMemFree_v2(ctypes.c_uint64(ptr)))
+
+    def memcpy_htod(self, dst: int, src: int, nbytes: int) -> None:
+        """Host → device. ``src`` is the host pointer (e.g. ``arr.ctypes.data``).
+
+        Runs at full PCIe bandwidth only if ``src`` is page-locked
+        (``cuMemHostRegister`` or ``cuMemHostAlloc``). Pageable HtoD
+        stages through a small internal pinned buffer at ~1/4 speed
+        and serializes per driver call — hence the register dance in
+        ``popcorn.nn.io.load_safetensors``.
+        """
+        self._check(
+            self._lib.cuMemcpyHtoD_v2(
+                ctypes.c_uint64(dst), ctypes.c_void_p(src), ctypes.c_size_t(nbytes)
+            )
+        )
+
+    # Host-memory flags (CUmemhostregister_flags).
+    _MEMHOSTREGISTER_PORTABLE = 0x01
+    _MEMHOSTREGISTER_DEVICEMAP = 0x02
+    _MEMHOSTREGISTER_READ_ONLY = 0x08
+
+    def memhost_register(
+        self,
+        ptr: int,
+        nbytes: int,
+        *,
+        read_only: bool = False,
+    ) -> None:
+        """Page-lock an existing host allocation so HtoD/DtoH use full
+        PCIe bandwidth. ``ptr`` must be page-aligned — OS-returned mmaps
+        and aligned malloc qualify; arbitrary Python-side buffers do not.
+
+        ``read_only=True`` (CUDA 11.2+) tells the driver it may skip the
+        writable-pages path; useful for weight loading since we only
+        ever copy *out* of the registered region.
+        """
+        flags = self._MEMHOSTREGISTER_PORTABLE
+        if read_only:
+            flags |= self._MEMHOSTREGISTER_READ_ONLY
+        self._check(
+            self._lib.cuMemHostRegister_v2(
+                ctypes.c_void_p(ptr),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_uint(flags),
+            )
+        )
+
+    def memhost_unregister(self, ptr: int) -> None:
+        """Undo a prior :meth:`memhost_register`."""
+        self._check(self._lib.cuMemHostUnregister(ctypes.c_void_p(ptr)))
+
+    def memcpy_dtoh(self, dst: int, src: int, nbytes: int) -> None:
+        """Device → host. ``dst`` is the host pointer."""
+        self._check(
+            self._lib.cuMemcpyDtoH_v2(
+                ctypes.c_void_p(dst), ctypes.c_uint64(src), ctypes.c_size_t(nbytes)
+            )
+        )
+
+    def memcpy_dtod(self, dst: int, src: int, nbytes: int, stream: int = 0) -> None:
+        """Device → device. Always async (cuMemcpyDtoDAsync)."""
+        if stream == 0:
+            from popcorn.graph import active_stream
+
+            stream = active_stream()
+        self._check(
+            self._lib.cuMemcpyDtoDAsync_v2(
+                ctypes.c_uint64(dst),
+                ctypes.c_uint64(src),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_void_p(stream),
+            )
+        )
+
+    def memset_d8(self, ptr: int, value: int, nbytes: int, stream: int = 0) -> None:
+        """Always async (cuMemsetD8Async)."""
+        if stream == 0:
+            from popcorn.graph import active_stream
+
+            stream = active_stream()
+        self._check(
+            self._lib.cuMemsetD8Async(
+                ctypes.c_uint64(ptr),
+                ctypes.c_ubyte(value),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_void_p(stream),
+            )
+        )
+
+    def memset_d16(self, ptr: int, value: int, count: int, stream: int = 0) -> None:
+        """Always async (cuMemsetD16Async)."""
+        if stream == 0:
+            from popcorn.graph import active_stream
+
+            stream = active_stream()
+        self._check(
+            self._lib.cuMemsetD16Async(
+                ctypes.c_uint64(ptr),
+                ctypes.c_ushort(value & 0xFFFF),
+                ctypes.c_size_t(count),
+                ctypes.c_void_p(stream),
+            )
+        )
+
+    def memset_d32(self, ptr: int, value: int, count: int, stream: int = 0) -> None:
+        """Always async (cuMemsetD32Async)."""
+        if stream == 0:
+            from popcorn.graph import active_stream
+
+            stream = active_stream()
+        self._check(
+            self._lib.cuMemsetD32Async(
+                ctypes.c_uint64(ptr),
+                ctypes.c_uint(value & 0xFFFFFFFF),
+                ctypes.c_size_t(count),
+                ctypes.c_void_p(stream),
+            )
+        )
+
+    # ---- graph capture ----
+
+    def graph_begin_capture(
+        self, stream: int, mode: int = CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+    ) -> None:
+        """Begin capturing all kernel launches on ``stream`` into a graph."""
+        self._check(self._lib.cuStreamBeginCapture_v2(ctypes.c_void_p(stream), mode))
+
+    def graph_end_capture(self, stream: int) -> int:
+        """End capture and return the CUgraph handle."""
+        graph = ctypes.c_void_p(0)
+        self._check(self._lib.cuStreamEndCapture(ctypes.c_void_p(stream), ctypes.byref(graph)))
+        return int(graph.value or 0)
+
+    def graph_instantiate(self, graph: int) -> int:
+        """Instantiate a CUgraph into a CUgraphExec for replay."""
+        exec_handle = ctypes.c_void_p(0)
+        self._check(
+            self._lib.cuGraphInstantiateWithFlags(
+                ctypes.byref(exec_handle), ctypes.c_void_p(graph), ctypes.c_uint64(0)
+            )
+        )
+        return int(exec_handle.value or 0)
+
+    def graph_launch(self, exec_handle: int, stream: int) -> None:
+        """Replay a captured graph."""
+        self._check(self._lib.cuGraphLaunch(ctypes.c_void_p(exec_handle), ctypes.c_void_p(stream)))
+
+    def graph_exec_destroy(self, exec_handle: int) -> None:
+        self._check(self._lib.cuGraphExecDestroy(ctypes.c_void_p(exec_handle)))
+
+    def graph_destroy(self, graph: int) -> None:
+        self._check(self._lib.cuGraphDestroy(ctypes.c_void_p(graph)))

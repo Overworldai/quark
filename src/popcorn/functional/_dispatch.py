@@ -74,15 +74,33 @@ def alloc_from_decl(decl, spec, config, *, like=None):
 
     if IS_METAL:
         return PT.zeros(*shape, dtype=backend_dt)
+
+    # CUDA path: use PopcornTensor if the input is a PopcornTensor (no torch),
+    # otherwise fall back to torch for torch.Tensor inputs.
+    from popcorn.runtime.tensor import PopcornTensor
+
+    if like is not None and isinstance(like, PopcornTensor):
+        from popcorn.ir import DType as _DT
+
+        _IR_TO_PC = {
+            _DT.BF16: "bf16",
+            _DT.F16: "f16",
+            _DT.F32: "f32",
+            _DT.S32: "s32",
+            _DT.U8: "u8",
+            _DT.S8: "s8",
+            _DT.E4M3: "e4m3",
+            _DT.E5M2: "e5m2",
+            _DT.B16: "u16",  # bit-typed 16-bit → u16 storage
+            _DT.B32: "u32",
+            _DT.U16: "u16",
+            _DT.U32: "u32",
+        }
+        return PopcornTensor.zeros(*shape, dtype=_IR_TO_PC[dtype_val])
+
     import torch
 
     device = like.device if like is not None else torch.device("cuda")
-    # Zero-init rather than empty: kernels that use atomic scatter-add
-    # into the output (moe_outproj) accumulate onto the starting buffer
-    # contents. Uninitialized memory leaks garbage into the result —
-    # manifests as a data-dependent cosine drop at inference time.
-    # The extra memset is a single pass over the output tensor, cheap
-    # next to the kernel itself.
     return torch.zeros(tuple(shape), dtype=backend_dt, device=device)
 
 
@@ -153,25 +171,54 @@ def call_with_bindings(
     kernel = compiled.kernel
     pspec = compiled.param_spec
 
-    # Allocate any auto-alloc tensors by looking up their TensorDecl.
+    # Allocate auto-alloc tensors. We split on ``TensorDecl.role``:
+    #
+    #   * ``role == "out"``: fresh allocation per call. Caching output
+    #     buffers silently aliased prior calls when the same spec
+    #     repeated (e.g. ada_gate_residual called twice per block, each
+    #     consumer expecting its own output). Callers that want a
+    #     persistent output pass ``out=`` (Linear does this).
+    #
+    #   * Input-role dummies (``has_bias=False`` Bias, elementwise Y
+    #     for unary ops): cached on the CompiledKernel. The kernel
+    #     never writes them — same zeros every call — so reusing the
+    #     same storage is safe AND essential: otherwise every small
+    #     no-bias GEMM eats a ``cuMemAllocAsync`` + ``cuMemsetD8Async``
+    #     per call (~100–500 µs of driver overhead on the default
+    #     stream) that autotune's tight-loop timing never sees.
     decls_by_name = {d.name: d for d in kernel_cls.TENSORS}
     if like is None:
         like = next(iter(provided.values()))
     full: dict = dict(provided)
+    input_dummies: dict = compiled._input_dummies
     for name in auto_alloc:
-        full[name] = alloc_from_decl(decls_by_name[name], spec, config, like=like)
+        decl = decls_by_name[name]
+        is_output = getattr(decl, "role", "in") == "out"
+        if is_output:
+            t = alloc_from_decl(decl, spec, config, like=like)
+        else:
+            t = input_dummies.get(name)
+            if t is None:
+                t = alloc_from_decl(decl, spec, config, like=like)
+                input_dummies[name] = t
+        full[name] = t
 
     full = kernel.prepare_launch_tensors(full)
-    buffers = [full[b.name] for b in pspec.buffers]
 
-    # NOTE: there used to be an unconditional per-invocation warmup
-    # launch here as a workaround for the first-launch-wrong-output
-    # bug. That's been moved DOWN into ``CompiledKernel.launch``,
-    # where it's keyed on ``(this CompiledKernel, hash(input
-    # data_ptrs))``. So the warmup fires the FIRST time a kernel is
-    # launched against a particular set of input addresses, then
-    # never again for that combination — instead of every call.
-    # Inference loops that reuse input tensors pay the warmup once.
+    from popcorn.graph import active_stream
+
+    capturing = bool(active_stream())
+
+    if capturing:
+        from popcorn.graph import log_capture_launch
+
+        log_capture_launch(f"{kernel_cls.__name__}({spec})")
+
+    # Pass caller's buffers directly. During graph capture, the
+    # caller's tensors (weight Parameters, KV caches, auto-alloc
+    # outputs) already have stable addresses — they don't get
+    # reallocated between calls. No stable-buffer indirection needed.
+    buffers = [full[b.name] for b in pspec.buffers]
     result = compiled.launch(buffers=buffers)
 
     if IS_METAL:
@@ -192,64 +239,6 @@ def is_mlx_tensor(x: Any) -> bool:
     return PT._is_mx(x)
 
 
-def torch_op(name: str, *, mutates_args=()):
-    """Decorator that registers a function as a ``torch.library.custom_op``
-    on CUDA, no-op on Metal.
-
-    Use to define ``pcf.<op>(...)`` entry points that work on both
-    backends with no per-call branching:
-
-        @torch_op("popcorn::gemm", mutates_args=())
-        def gemm(A: torch.Tensor, B: torch.Tensor, ...) -> torch.Tensor:
-            return _gemm_impl(A, B, ...)
-
-        @gemm.register_fake
-        def _(A, B, ...): ...
-
-    Calling ``gemm(...)`` with torch tensors goes through the registered
-    custom op (compatible with ``torch.compile`` graph capture). On
-    Metal the decorator is a pass-through and the call is a plain
-    Python function call. The ``register_fake`` / ``register_autograd``
-    attribute hooks are stubbed as no-op decorators on Metal so the
-    body of each functional file doesn't need a Metal vs CUDA branch.
-    """
-    if IS_METAL:
-
-        def _identity(f):
-            return f
-
-        def deco(fn):
-            fn.register_fake = _identity
-            fn.register_autograd = _identity
-            return fn
-
-        return deco
-    import torch
-
-    def deco(fn):
-        # ``torch.library.custom_op`` requires real type objects on the
-        # signature (not string annotations). When the caller uses
-        # ``from __future__ import annotations`` the annotations come
-        # in as strings; resolve them here against the caller's
-        # globals so the user can write idiomatic Python.
-        import typing
-
-        try:
-            globalns = getattr(fn, "__globals__", {})
-            hints = typing.get_type_hints(fn, globalns={**globalns, "torch": torch})
-            # ``get_type_hints`` resolves ``-> None`` to ``type(None)``,
-            # but torch.library.infer_schema only accepts the literal
-            # ``None`` for void returns. Normalize it back.
-            if hints.get("return") is type(None):
-                hints["return"] = None
-            fn.__annotations__ = hints
-        except Exception:
-            pass
-        return torch.library.custom_op(name, mutates_args=mutates_args)(fn)
-
-    return deco
-
-
 def make_autotune(impl_fn, cls_fn, *, doc: str | None = None):
     """Build a ``pcf.<op>.autotune(...)`` wrapper from the kernel's
     ``_<op>_impl`` and ``_cls`` functions.
@@ -261,11 +250,6 @@ def make_autotune(impl_fn, cls_fn, *, doc: str | None = None):
          its impl, so the same args flow straight through.
       3. Runs the full genetic search via ``lookup_or_search`` and
          caches the winner.
-      4. Issues one ``impl_fn(*args, **kwargs)`` call so
-         ``CompiledKernel._warmed_input_keys`` sees the user's input
-         data_ptrs. The first inference call with the same tensors
-         then skips the warmup launch (see
-         ``CompiledKernel.launch`` doc).
 
     Returns the winning ``KernelConfig``.
 
@@ -277,19 +261,16 @@ def make_autotune(impl_fn, cls_fn, *, doc: str | None = None):
     def autotune_fn(*args, **kwargs):
         cls = cls_fn()
         spec = cls.spec_from_tensors(*args, **kwargs)
-        config = launcher()._autotune.lookup_or_search(cls, spec, depth="full")
-        # Pre-warm the per-(CompiledKernel, input-data_ptrs) cache
-        # for the user's actual input tensors.
-        impl_fn(*args, **kwargs)
+        import popcorn
+
+        with popcorn.max_autotune():
+            config = launcher()._autotune.lookup_or_search(cls, spec)
         return config
 
     autotune_fn.__doc__ = doc or (
         "Run full genetic autotune for this kernel's "
         "(shape, dtype, device) triple. Blocks until complete; result "
         "is persisted to disk and to the hot dict so subsequent calls "
-        "are immediate cache hits. Also pre-warms the per-input warmup "
-        "cache for the tensors passed in here, so the first inference "
-        "call that reuses the same input addresses skips the warmup "
-        "launch. Returns the winning ``KernelConfig``."
+        "are immediate cache hits. Returns the winning ``KernelConfig``."
     )
     return autotune_fn

@@ -1,10 +1,6 @@
 """owl_attn — segment-sparse flash attention with ortho-RoPE on Q.
 
-EXEMPT FROM 500-LINE RULE: segment-sparse flash attention fuses RoPE,
-two GEMMs (Q·Kᵀ + P·V), online softmax, epilogue normalization, and
-a cp.async KV pipeline in one build() body. Splitting the body
-re-introduces cross-module parameter plumbing the fused layout
-deliberately avoids.
+EXEMPT FROM 500-LINE RULE
 
 Consumer of the kv_cache_update kernel. Per call:
   Inputs:
@@ -45,7 +41,9 @@ import popcorn.lang as pop
 from popcorn.blocks import (
     Accumulators,
     Carry,
+    IterCtx,
     MmaBody,
+    PipelineBody,
     SmemTile,
     Stage,
     TensorDecl,
@@ -74,7 +72,7 @@ class OwlAttnKernel(Kernel):
     # Parameter manifest — every tensor shape derives from spec only
     # (no config-dependent layouts), so the lambdas ignore config.
     TENSORS: ClassVar[list[TensorDecl]] = [
-        TensorDecl("Q", dtype=lambda s, c: s.a_dtype, shape=lambda s, c: (s.total_q, s.Dh)),
+        TensorDecl("Q", dtype=lambda s, c: s.a_dtype, shape=lambda s, c: (s.q_rows, s.q_cols)),
         TensorDecl(
             "K_cache",
             dtype=lambda s, c: s.kv_dtype,
@@ -85,14 +83,13 @@ class OwlAttnKernel(Kernel):
             dtype=lambda s, c: s.kv_dtype,
             shape=lambda s, c: (s.B * s.n_kv_heads * s.Dh, s.capacity),
         ),
-        TensorDecl("cos", dtype=DType.F32, shape=lambda s, c: (s.tpf, s.Dh // 2)),
-        TensorDecl("sin", dtype=DType.F32, shape=lambda s, c: (s.tpf, s.Dh // 2)),
         TensorDecl("segments", dtype=DType.S32, shape=lambda s, c: (s.B * s.max_segments * 2,)),
         TensorDecl("n_segments", dtype=DType.S32, shape=lambda s, c: (s.B,)),
+        TensorDecl("frame_t", dtype=DType.S32, shape=lambda s, c: (1,)),
         TensorDecl(
             "output",
             dtype=lambda s, c: s.out_dtype,
-            shape=lambda s, c: (s.total_q, s.Dh),
+            shape=lambda s, c: (s.out_rows, s.out_cols),
             role="out",
         ),
     ]
@@ -120,6 +117,12 @@ class OwlAttnKernel(Kernel):
             mma = self._mma_cfg()
         except KeyError:
             return False
+        # k=8 bf16 MMAs (m16n8k8, m8n8k8) are slower than m16n8k16 on
+        # every owl_attn shape and the PTX m16n8k8 path trips NaNs in
+        # the autotune sweep — filter them out so autotune doesn't
+        # waste time on a dominated/broken path.
+        if mma.shape.k == 8:
+            return False
         if s.Dh % mma.shape.m != 0 or s.Dh % mma.shape.n != 0 or s.Dh % 2 != 0:
             return False
         if s.capacity % c.KvTile != 0:
@@ -146,6 +149,8 @@ class OwlAttnKernel(Kernel):
         pad_nonzero = 16 if compute_b == 1 else 8
         if c.KvPad not in (0, pad_nonzero):
             return False
+        # if c.MTiles > 1:
+        #     return False
         # cp.async alignment for K/V smem (when no cast — kv_ir == compute_ir).
         if s.kv_dtype is s.compute_dtype_resolved:
             k_lines = c.KvTile * s.Dh * compute_b // 16
@@ -200,7 +205,6 @@ class OwlAttnKernel(Kernel):
         ``capacity``).
         """
         from popcorn.backend import PT
-        from popcorn.kernels.kv_cache_update.reference import make_ortho_rope_freqs
 
         spec = OwlAttnSpec(**problem)
         a_dt = spec.a_dtype.backend
@@ -209,33 +213,11 @@ class OwlAttnKernel(Kernel):
         B, Hq, Hk, tpf, Dh = (spec.B, spec.n_q_heads, spec.n_kv_heads, spec.tpf, spec.Dh)
         cap = spec.capacity
 
-        # Q (this frame's queries, pre-RoPE).
         Q = PT.astype(PT.randn(B * Hq * tpf, Dh) * 0.3, a_dt)
-
-        # Random K_cache / Vt_cache — post-RoPE values, at matching scale.
         K_cache = PT.astype(PT.randn(B * Hk * cap, Dh) * 0.3, kv_dt)
         Vt_cache = PT.astype(PT.randn(B * Hk * Dh, cap) * 0.3, kv_dt)
 
-        # cos/sin for Q-side RoPE only — one frame slice. Slicing a large
-        # table yields a strided view; force contiguous so the kernel's
-        # raw-byte read matches row-major layout.
-        n_frames_total = max(spec.num_buckets * spec.pinned_dilation + 4, 32)
-        cos_full, sin_full = make_ortho_rope_freqs(
-            spec.H_spatial, spec.W_spatial, n_frames_total, Dh
-        )
-        test_frame_t = spec.num_buckets * spec.pinned_dilation
-        cos = PT.contiguous(cos_full[test_frame_t * tpf : (test_frame_t + 1) * tpf, :])
-        sin = PT.contiguous(sin_full[test_frame_t * tpf : (test_frame_t + 1) * tpf, :])
-
-        # Segments: match steady-state layout produced by
-        # kv_cache_update's ``compute_segments`` — one ring segment
-        # ``[0, L)`` plus one tail segment ``[L, L+tpf)``, padded to
-        # ``max_segments`` with zero-length entries, and ``n_segments=2``.
-        # Using the real layout keeps the kernel's seg loop + the
-        # reference's mask construction exercising the same branches
-        # they hit in production, rather than a degenerate single-
-        # segment cover.
-        L = spec.L  # = num_buckets * tpf
+        L = spec.L
         seg_rows = [[0, L], [L, tpf]] + [[0, 0]] * (spec.max_segments - 2)
         seg_per_batch = [v for row in seg_rows for v in row]
         seg_data = [seg_per_batch] * B
@@ -244,16 +226,17 @@ class OwlAttnKernel(Kernel):
         )
         n_segments = PT.tensor([2] * B, dtype=PT.int32)
 
+        test_frame_t = spec.num_buckets * spec.pinned_dilation
+        frame_t = PT.tensor([test_frame_t], dtype=PT.int32)
         output = PT.zeros(B * Hq * tpf, Dh, dtype=out_dt)
 
         return {
             "Q": Q,
             "K_cache": K_cache,
             "Vt_cache": Vt_cache,
-            "cos": cos,
-            "sin": sin,
             "segments": segments,
             "n_segments": n_segments,
+            "frame_t": frame_t,
             "output": output,
         }
 
@@ -263,8 +246,6 @@ class OwlAttnKernel(Kernel):
         Q,
         K_cache,
         Vt_cache,
-        cos,
-        sin,
         segments,
         n_segments,
         *,
@@ -278,19 +259,18 @@ class OwlAttnKernel(Kernel):
         out_dtype: DType | str | None = None,
         compute_dtype: DType | str | None = None,
         max_segments: int = 3,
+        packed_qkv: bool = False,
     ) -> OwlAttnSpec:
-        """Derive an ``OwlAttnSpec`` from the eight kernel-input tensors.
-
-        Q: ``[B*Hq*tpf, Dh]``; K_cache: ``[B*Hk*capacity, Dh]``;
-        Vt_cache: ``[B*Hk*Dh, capacity]``; cos/sin: ``[tpf, Dh//2]``.
-        ``Dh`` is read from Q; ``tpf = H_spatial*W_spatial`` is supplied
-        by the caller to avoid ambiguity (cos could in principle be
-        sub-sliced).
-        """
+        """Derive an ``OwlAttnSpec`` from the kernel-input tensors."""
 
         if Q.ndim != 2:
             raise ValueError(f"pcf.owl_attn: Q must be rank-2 (flat), got {Q.shape}")
-        Dh = int(Q.shape[1])
+        if packed_qkv:
+            qkv_dim = int(Q.shape[1])
+            n_q_heads = n_kv_heads * gqa_ratio
+            Dh = qkv_dim // (n_q_heads + 2 * n_kv_heads)
+        else:
+            Dh = int(Q.shape[1])
         tpf = H_spatial * W_spatial
         capacity = num_buckets * tpf + tpf
         if tuple(K_cache.shape) != (B * n_kv_heads * capacity, Dh):
@@ -302,11 +282,6 @@ class OwlAttnKernel(Kernel):
             raise ValueError(
                 f"pcf.owl_attn: Vt_cache shape {tuple(Vt_cache.shape)} != "
                 f"({B * n_kv_heads * Dh}, {capacity})"
-            )
-        if tuple(cos.shape) != (tpf, Dh // 2) or tuple(sin.shape) != (tpf, Dh // 2):
-            raise ValueError(
-                f"pcf.owl_attn: cos/sin must be ({tpf}, {Dh // 2}); "
-                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
             )
         if int(segments.shape[0]) != B * max_segments * 2:
             raise ValueError(
@@ -329,6 +304,7 @@ class OwlAttnKernel(Kernel):
             out_dtype=DType.coerce(out_dtype) or a_dt,
             compute_dtype=DType.coerce(compute_dtype),
             max_segments=max_segments,
+            packed_qkv=packed_qkv,
         )
 
     @classmethod
@@ -341,7 +317,11 @@ class OwlAttnKernel(Kernel):
             "KvTile": [8, 16, 32, 64, 128],
             "MTiles": [1, 2, 4],
             "NCW": [1, 2, 4],
-            "KvPad": [0, 8],
+            # Pad granule is 8B for 2-byte compute (bf16/f16) and 16B for
+            # 1-byte compute (e4m3/e5m2); is_valid filters the wrong one
+            # per compute_dtype.
+            "KvPad": [0, 8, 16],
+            "n_stages": [1, 2, 3],
             # mma_k=32 only registered for fp8 compute_dtype in mma_shapes.py;
             # is_valid filters bf16 / fp16 problems away from k=32.
         }
@@ -375,10 +355,9 @@ class OwlAttnKernel(Kernel):
         compute_is_fp8 = compute_ir_dtype in (DType.E4M3, DType.E5M2)
 
         bctx = self.bctx
-        bld = self.bld
         ctx = self.ctx
         g_q, g_kc, g_vtc = g.Q, g.K_cache, g.Vt_cache
-        g_co, g_si = g.cos, g.sin
+        # cos/sin tables removed — computed inline via emit_rope_cos_sin.
         g_sg, g_out = g.segments, g.output
 
         n_threads = NumWarps * 32
@@ -398,18 +377,32 @@ class OwlAttnKernel(Kernel):
         b_idx = bh_idx // s.n_kv_heads
         q_head = kv_h * GQA + gqa_idx
 
-        q_row_warp = (b_idx * s.n_q_heads + q_head) * s.tpf + (
-            q_tile_idx * BlockQRows + m_idx * (MTiles * m_tile)
-        )
+        # Token-row offset within the frame (shared by Q load and output).
+        token_tile_offset = q_tile_idx * BlockQRows + m_idx * (MTiles * m_tile)
+
+        if s.packed_qkv:
+            # Packed QKV: Q input is [B*tpf, qkv_dim].
+            # Row = batch * tpf + token offset (no head multiplier).
+            # Col = q_head * Dh (head's column in the packed buffer).
+            q_row_warp = b_idx * s.tpf + token_tile_offset
+            q_col_base = q_head * Dh
+            # Output is [B*tpf, n_q_heads*Dh].
+            out_row_warp = q_row_warp
+            out_col_base = q_head * Dh
+        else:
+            # Legacy layout: Q is [B*nq*tpf, Dh].
+            q_row_warp = (b_idx * s.n_q_heads + q_head) * s.tpf + token_tile_offset
+            q_col_base = bctx.c(0)
+            out_row_warp = q_row_warp
+            out_col_base = bctx.c(0)
 
         # K/V cache row bases (per (B, head)).
         k_row_base = bh_idx * s.capacity
         vt_row_base = bh_idx * Dh
 
-        out_row_warp = q_row_warp
-
-        # cos/sin row base for this Q tile (= q_tile_idx * BlockQRows).
-        cos_row_base = q_tile_idx * BlockQRows
+        # frame_t for inline RoPE computation.
+        frame_t_val = pop.load(g.frame_t, bctx.c(0, dtype=DType.S32))
+        frame_t_u = pop.convert(frame_t_val, DType.U32)
 
         # ── Smem allocs ──
         # K/V smem live in `compute_ir_dtype` regardless of the gmem cache
@@ -457,10 +450,16 @@ class OwlAttnKernel(Kernel):
             (NumWarps * MTiles * m_tile, Dh),
             pad=c.KvPad,
         )
-        k_tile = SmemTile("K", compute_ir_dtype, (KvTile, Dh), pad=c.KvPad, lane_col_step=lcs)
-        vt_tile = SmemTile("Vt", compute_ir_dtype, (Dh, KvTile), pad=c.KvPad, lane_col_step=lcs)
-        cos_smem = pop.smem_alloc("cos_smem", DType.F32, (BlockQRows, half_Dh))
-        sin_smem = pop.smem_alloc("sin_smem", DType.F32, (BlockQRows, half_Dh))
+        # K/V smem tiles live on a single-stage Stage so PipelineBody.run
+        # handles cp.async commit + wait + barrier for us. Segment-sparse
+        # iteration is Python-unrolled below: one PipelineBody per segment,
+        # carry threaded across.
+        stages = Stage.staged(
+            2,
+            k=SmemTile.spec(compute_ir_dtype, (KvTile, Dh), pad=c.KvPad, lane_col_step=lcs),
+            vt=SmemTile.spec(compute_ir_dtype, (Dh, KvTile), pad=c.KvPad, lane_col_step=lcs),
+        )
+        # cos/sin computed inline via emit_rope_cos_sin (no tables).
 
         # cp.async Q (per-warp slice; QRegisterLoad below handles it AFTER
         # we apply RoPE in smem — so pre-emit just the cp.async + cos/sin
@@ -478,24 +477,12 @@ class OwlAttnKernel(Kernel):
         # Q tile: per-warp cooperative cp.async. Warp-local 32-thread
         # split; one line per lane per iteration.
         warp_smem_in.copy_from(
-            g_q.tile(row=q_row_warp, col=0, shape=(warp_rows, Dh)),
+            g_q.tile(row=q_row_warp, col=q_col_base, shape=(warp_rows, Dh)),
             tid=lane_id,
             n_threads=32,
             async_load=True,
         )
-        # cos / sin (block-shared, all warps cooperate).
-        cos_smem.copy_from(
-            g_co.tile(row=cos_row_base, col=0, shape=(BlockQRows, half_Dh)),
-            tid=tid,
-            n_threads=n_threads,
-            async_load=True,
-        )
-        sin_smem.copy_from(
-            g_si.tile(row=cos_row_base, col=0, shape=(BlockQRows, half_Dh)),
-            tid=tid,
-            n_threads=n_threads,
-            async_load=True,
-        )
+        # (cos/sin computed inline — no table load needed)
         pop.async_commit()
         pop.async_wait(0)
         pop.barrier("block")
@@ -516,18 +503,36 @@ class OwlAttnKernel(Kernel):
         half_Dh_c = bctx.c(half_Dh)
         warp_rows_c = bctx.c(warp_rows)
 
+        # Inline RoPE: compute cos/sin from (h, w, frame_t) per element.
+        from popcorn.lang.rope import emit_rope_cos_sin
+
+        q_tile_base = q_tile_idx * bctx.c(BlockQRows)
+        W_c = bctx.c(s.W_spatial)
+
         def _rope_one(qrow_v, c_idx_v):
             """Compute (y0_f32, y1_f32) for one (qrow, c) pair."""
             warp_of_row = qrow_v // warp_rows_c
             m_idx_w = warp_of_row % NCW
             r_local = qrow_v % warp_rows_c
-            cos_row = m_idx_w * warp_rows_c + r_local
+            local_token = m_idx_w * warp_rows_c + r_local
+            # Absolute spatial index in [0, tpf).
+            spatial_idx = q_tile_base + local_token
+            h_idx = spatial_idx // W_c
+            w_idx = spatial_idx % W_c
             c2 = c_idx_v * 2
             c2p1 = c2 + 1
             x0 = pop.convert(q_in_smem[qrow_v, c2], DType.F32)
             x1 = pop.convert(q_in_smem[qrow_v, c2p1], DType.F32)
-            cv = cos_smem[cos_row, c_idx_v]
-            sv = sin_smem[cos_row, c_idx_v]
+            cv, sv = emit_rope_cos_sin(
+                bctx,
+                h_idx=h_idx,
+                w_idx=w_idx,
+                frame_t=frame_t_u,
+                c_idx=c_idx_v,
+                H=s.H_spatial,
+                W=s.W_spatial,
+                Dh=Dh,
+            )
             y0 = x0 * cv - x1 * sv
             y1 = x1 * cv + x0 * sv
             return y0, y1
@@ -586,12 +591,46 @@ class OwlAttnKernel(Kernel):
         acc_width = mma_cfg.shape.c_regs
         o_acc = Accumulators(MT=MTiles, NT=N_DH, width=acc_width)
         s_acc = Accumulators(MT=MTiles, NT=NK, width=acc_width)
+        # fp8 GEMM2 path: softmax round-trips P through smem because the
+        # PTX ISA fp8 A-fragment layout (4 consecutive k-cols per lane)
+        # doesn't line up same-lane with the f32 accumulator layout
+        # (2 cols per lane across 2 adjacent lanes). Softmax writes
+        # f32→fp8 packed stores into P_smem; the kernel reloads via
+        # load_matrix into the fp8 A-frag layout for GEMM2. One block
+        # barrier per KV iter between the stores and the ldmatrix reads.
+        if compute_is_fp8:
+            p_stride_elems = KvTile + c.KvPad
+            p_warp_rows = MTiles * m_tile
+            p_warp_dyn = warp_id * (p_warp_rows * p_stride_elems)
+            p_lane_off = bctx.gid * p_stride_elems + bctx.tig * mma_cfg.lane_col_step
+            p_row_base = warp_id * p_warp_rows
+            p_smem = pop.smem_alloc(
+                "P_smem",
+                compute_ir_dtype,
+                (NumWarps * p_warp_rows, KvTile),
+                pad=c.KvPad,
+            )
+            p_warp_lane = p_smem.view(
+                dyn_offset=p_warp_dyn + p_lane_off,
+                shape=(p_warp_rows, KvTile),
+                name="P_warp_lane",
+            )
+        else:
+            p_smem = None
+            p_warp_lane = None
+            p_row_base = 0
         # GEMM1: A is the register Q tile, B is K smem.
         # GEMM2: A is the P fragment from online softmax, B is V^T smem.
         # ``shape`` defaults to ``active_bctx().mma_cfg``; ``K_inner``
         # is inferred from ``b.shape[1]`` // mma_k at call time.
         mma1 = MmaBody(acc=s_acc)
-        softmax = OnlineSoftmax(s_acc=s_acc, o_acc=o_acc, scale=1.0 / math.sqrt(Dh))
+        softmax = OnlineSoftmax(
+            s_acc=s_acc,
+            o_acc=o_acc,
+            scale=1.0 / math.sqrt(Dh),
+            p_smem=p_smem,
+            p_row_base=p_row_base,
+        )
         mma2 = MmaBody(acc=o_acc)
 
         # Reuse Q_in_smem as the staging buffer — Q is finished (ldmatrix
@@ -617,67 +656,119 @@ class OwlAttnKernel(Kernel):
             l=(n_ml, 0.0, DType.F32),
         )
 
-        # ── Per-segment KV iteration (runtime outer for_loop) ──
-        # Outer iterates ``seg ∈ [0, max_segments)``; inner loops the
-        # segment's chunks with inlined load + consume (the barrier
-        # ordering is small enough that a raw ``pop.for_range`` is
-        # clearer than wrapping in a PipelineBody + run_pipeline call).
-        # Reuse a single K/V stage pair across all segments — the
-        # inner body is synchronous (load → barrier → compute), so
-        # there's no inter-iter aliasing concern.
+        # ── Flat KV iteration across all segments ──────────────────────
+        # One PipelineBody with a compile-time ``n_iters`` lets us run
+        # at ``n_stages=2`` (double-buffered cp.async), which the
+        # previous per-segment unroll couldn't because each segment's
+        # chunk count is a runtime Value. Total iters is bounded by the
+        # spec's capacity, so ``N_TOTAL = capacity // KvTile`` is a
+        # constant — the double-buffer emitter can place its prologue
+        # + epilogue unroll.
+        #
+        # Runtime segment data lives in smem as ``seg_starts[s]`` +
+        # cumulative chunk thresholds ``cum[s]``; ``produce`` computes
+        # ``kv_offset`` from ``iter_idx`` by picking the segment whose
+        # range brackets it. Iters past the real total load from
+        # ``kv_offset=0`` (always in-bounds) and get their ``S``
+        # masked to ``-inf`` in ``consume`` so exp(S)=0 — softmax's
+        # m/l/o state passes through untouched.
+        N_TOTAL = s.capacity // KvTile
         seg_base = b_idx * (max_segs * 2)
-        stage = Stage(k=k_tile, vt=vt_tile)
 
-        with pop.for_range(
-            0,
-            max_segs,
-            1,
-            iv_name="seg",
-            carried=carry_spec.init(),
-        ) as (seg_iv, outer_carry):
-            seg_off_u32 = seg_iv * 2
-            seg_start = g_sg[seg_base + seg_off_u32]  # s32
-            seg_len = g_sg[seg_base + seg_off_u32 + 1]  # s32
-            seg_start_u = pop.convert(seg_start, DType.U32)
-            n_chunks = pop.convert(seg_len, DType.U32) // pop.const(DType.U32, KvTile)
+        KvTile_u = pop.const(DType.U32, KvTile)
+        zero_u = pop.const(DType.U32, 0)
+        neg_inf_f32 = bctx.c(-1e30, dtype=DType.F32)
 
-            with pop.for_range(
-                0,
-                n_chunks,
-                1,
-                iv_name="k",
-                carried=outer_carry,
-            ) as (k_iv, inner_carry_flat):
-                kv_offset = seg_start_u + k_iv * KvTile
-                # Fused K + V^T load. GEMM1 only reads K, GEMM2 only
-                # reads V — loading both up-front lets the hardware
-                # scheduler overlap V's gmem→smem stores with GEMM1's
-                # simdgroup_multiply_accumulate (different FUs:
-                # LSU vs SIMD ALU). On Metal's synchronous cp.async
-                # fallback this also saves one barrier per KV iter.
-                stage.k.load_from(g_kc, row=k_row_base + kv_offset, cast=kv_cast)
-                stage.vt.load_from(g_vtc, row=vt_row_base, col=kv_offset, cast=kv_cast)
+        # Read all segment metadata up front so produce/consume don't
+        # re-issue gmem loads per iteration.
+        seg_starts_u: list = []
+        cum_u: list = [zero_u]
+        for seg_idx in range(max_segs):
+            seg_off = seg_idx * 2
+            seg_start = g_sg[seg_base + seg_off]
+            seg_len = g_sg[seg_base + seg_off + 1]
+            seg_starts_u.append(pop.convert(seg_start, DType.U32))
+            n_chunks_u = pop.convert(seg_len, DType.U32) // KvTile_u
+            cum_u.append(cum_u[-1] + n_chunks_u)
+        n_real_total = cum_u[max_segs]
+
+        def _map_iter_to_offset(iter_u):
+            """Compile-time chain of selects: pick kv_offset for the
+            segment whose cumulative range includes ``iter_u``. Iters
+            past the last real chunk collapse to ``kv_offset=0`` (the
+            Mask in consume() zeroes their contribution)."""
+            # Seed with segment 0's offset (covers iters 0..cum_u[1]).
+            kv_off = seg_starts_u[0] + (iter_u - cum_u[0]) * KvTile_u
+            for si in range(1, max_segs):
+                take = pop.cmp("ge", iter_u, cum_u[si])
+                alt = seg_starts_u[si] + (iter_u - cum_u[si]) * KvTile_u
+                kv_off = pop.select(take, alt, kv_off)
+            valid = pop.cmp("lt", iter_u, n_real_total)
+            return pop.select(valid, kv_off, zero_u), valid
+
+        def produce(ictx: IterCtx) -> None:
+            stage = ictx.stage
+            kv_offset, _ = _map_iter_to_offset(ictx.iter_idx)
+            stage.k.load_from(g_kc, row=k_row_base + kv_offset, cast=kv_cast)
+            stage.vt.load_from(g_vtc, row=vt_row_base, col=kv_offset, cast=kv_cast)
+
+        mma_shape_id = mma_cfg.shape_id
+
+        GEMM2_K_STEPS = KvTile // mma_cfg.mma_k
+
+        def consume(ictx: IterCtx) -> Carry:
+            stage = ictx.stage
+            carry = ictx.carry
+            valid = pop.cmp("lt", ictx.iter_idx, n_real_total)
+            s_vals = mma1(a=q_frags, b=stage.k, acc=s_acc.init())
+            # Mask invalid iters: force S entries to -inf so exp(S)=0
+            # and the iteration contributes nothing to m/l/o.
+            s_vals_masked = [
+                pop.frag_apply(mma_shape_id, sv, lambda x, _v=valid: pop.select(_v, x, neg_inf_f32))
+                for sv in s_vals
+            ]
+            o_vals, m_vals, l_vals, p_frags = softmax(
+                s_acc_vals=s_vals_masked,
+                o_vals=carry.o,
+                m_vals=carry.m,
+                l_vals=carry.l,
+            )
+            if compute_is_fp8:
+                # Softmax wrote P→smem (packed_convert f32→fp8). Barrier
+                # so every warp's writes are visible, then ldmatrix the
+                # fp8 A-fragment for GEMM2 at its native lane layout.
                 pop.barrier("block")
+                p_frags = []
+                for mt in range(MTiles):
+                    mt_frags = []
+                    for k_step in range(GEMM2_K_STEPS):
+                        kk = k_step * mma_cfg.mma_k
+                        frag = pop.load_matrix(
+                            p_warp_lane,
+                            mma_shape_id,
+                            which="a",
+                            row=mt * m_tile,
+                            col=kk,
+                            reg_offsets=mma_cfg.a_offsets,
+                        )
+                        mt_frags.append(frag)
+                    p_frags.append(mt_frags)
+            carry.o = mma2(a=p_frags, b=stage.vt, acc=o_vals)
+            carry.m = m_vals
+            carry.l = l_vals
+            return carry
 
-                carry = carry_spec.bound_to(inner_carry_flat)
-                s_vals = mma1(a=q_frags, b=stage.k, acc=s_acc.init())
-                o_vals, m_vals, l_vals, p_frags = softmax(
-                    s_acc_vals=s_vals,
-                    o_vals=carry.o,
-                    m_vals=carry.m,
-                    l_vals=carry.l,
-                )
-                carry.o = mma2(a=p_frags, b=stage.vt, acc=o_vals)
-                carry.m = m_vals
-                carry.l = l_vals
-                pop.barrier("block")
-                pop.yield_(carry)
+        current_carry: Carry = PipelineBody(
+            stages=stages,
+            produce=produce,
+            consume=consume,
+            carry=carry_spec,
+        ).run(n_iters=N_TOTAL, n_stages=c.n_stages)
 
-            pop.yield_(*bld.last_results)
-
-        # Rebind carry_spec to the outer loop's final values so the
-        # post-loop epilogue can read ``.o`` / ``.l`` directly.
-        final = carry_spec.bound_to(bld.last_results)
+        # ``current_carry`` is a Carry rebound to the final values across
+        # all segments. ``o_acc.results`` is already populated by the last
+        # PipelineBody.run via _stash_results_on_carry.
+        final = current_carry
 
         # Barrier before the epilogue: the per-warp staged store
         # scatters to ``q_in_smem`` which aliases the (now-dead) Q_in
@@ -695,11 +786,12 @@ class OwlAttnKernel(Kernel):
             g_out,
             o_acc,
             row=out_row_warp,
-            col=0,
+            col=out_col_base,
             cast=s.out_dtype,
             staging_smem=q_in_smem,
             per_warp=True,
             warp_id=warp_id,
             kv_pad=c.KvPad,
             row_scale=final.l,
+            gmem_col_base_full=out_col_base,
         )

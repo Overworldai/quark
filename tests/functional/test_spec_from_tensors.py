@@ -64,13 +64,12 @@ _KWARG_ALIAS: dict[str, dict[str, str]] = {
 _INPUT_TENSOR_NAMES: dict[str, tuple[str, ...]] = {
     "gemm": ("A", "B"),
     "attn": ("Q", "K", "V_t"),
-    "owl_attn": ("Q", "K_cache", "Vt_cache", "cos", "sin", "segments", "n_segments"),
+    "owl_attn": ("Q", "K_cache", "Vt_cache", "segments", "n_segments"),
     "kv_cache_update": (
         "K",
         "V",
-        "cos",
-        "sin",
         "frame_t",
+        "frozen",
         "Vt_cache",
         "segments",
         "n_segments",
@@ -114,6 +113,7 @@ def test_spec_from_tensors_round_trip(kernel_cls):
         tensors = kernel_cls.make_tensors(problem.params)
     except Exception as e:
         pytest.skip(f"{name}: make_tensors failed ({e!s:.60})")
+        return  # unreachable — pytest.skip raises
 
     input_names = _INPUT_TENSOR_NAMES[name]
     inputs = [tensors[n] for n in input_names]

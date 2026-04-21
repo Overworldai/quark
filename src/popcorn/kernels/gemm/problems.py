@@ -80,6 +80,17 @@ def gemm_problems() -> list[Problem]:
             {"M": 4096, "N": 4096, "K": 4096, **bf16_2k},
             tags={"production", "bf16", "large"},
         ),
+        # SiLU-fused regression (MLP fc1 path for waypoint-1.5)
+        Problem(
+            "ffn_up_silu_360p",
+            {"M": 128, "N": 8192, "K": 2048, **bf16_2k, "activation": "silu"},
+            tags={"production", "bf16", "silu", "smoke"},
+        ),
+        Problem(
+            "ffn_up_silu_720p",
+            {"M": 512, "N": 8192, "K": 2048, **bf16_2k, "activation": "silu"},
+            tags={"production", "bf16", "silu"},
+        ),
         # ── Production model workload ────────────────────────────────
         # QKV fused projection (2048 → 4096). Shared across dense + moe.
         _prod("qkv_proj_360p_metal", M=128, N=4096, K=2048, dtype=_METAL, tags=_METAL_SHARED),

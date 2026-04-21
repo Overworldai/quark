@@ -33,6 +33,11 @@ class GemmConfig(KernelConfig):
     # device.caps.matmul_shapes filtered by mma_sites(). Empty string
     # falls back to the kernel's compute-dtype default (k=16).
     main_shape: str = ""
+    # Split-K: partition the K dimension across split_k blocks.
+    # Each block computes K // split_k iterations and atomically
+    # adds its partial sum to the output. Requires out_dtype=F32
+    # (atomic add is only supported for f32).
+    split_k: int = 1
 
     @classmethod
     def default_for(cls, spec) -> GemmConfig:

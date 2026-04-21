@@ -6,16 +6,19 @@
 
 )
 {
-    .reg .pred %p0;
+    .reg .pred %p0, %p1;
     .reg .u32 %r0, %r1, %r2, %r3;
 
     mov.u32 %r0, 0;
     mov.u32 %r1, 4;
     mov.u32 %r2, 1;
     mov.u32 %r3, %r0;
-$L_1:
-    add.u32 %r3, %r3, %r2;
     setp.lt.u32 %p0, %r3, %r1;
-    @%p0 bra $L_1;
+    @!%p0 bra $LEND_1;
+$L_2:
+    add.u32 %r3, %r3, %r2;
+    setp.lt.u32 %p1, %r3, %r1;
+    @%p1 bra $L_2;
+$LEND_1:
     ret;
 }

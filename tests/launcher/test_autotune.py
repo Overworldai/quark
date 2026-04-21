@@ -13,14 +13,22 @@ from pathlib import Path
 
 import pytest
 
-from popcorn.autotune import (
-    AutotuneCache,
-    _autotune_disabled,
-    _cartesian,
-    _default_cache_dir,
-    _format_spec_label,
-    _source_hash,
-    _spec_fingerprint,
+from popcorn.autotune import AutotuneCache
+from popcorn.autotune.cache import _cartesian
+from popcorn.autotune.io import (
+    autotune_disabled as _autotune_disabled,
+)
+from popcorn.autotune.io import (
+    default_cache_dir as _default_cache_dir,
+)
+from popcorn.autotune.io import (
+    format_spec_label as _format_spec_label,
+)
+from popcorn.autotune.io import (
+    source_hash as _source_hash,
+)
+from popcorn.autotune.io import (
+    spec_fingerprint as _spec_fingerprint,
 )
 from popcorn.device import make_test_device
 
@@ -236,10 +244,11 @@ class TestLookupDiskTier:
         # Drop the hot tier; lookup must reload from disk.
         cache.clear_hot()
         # The disk loader needs the registry to know CONFIG_CLS;
-        # mock that out via patching _resolve_config_cls in the cache.
-        from popcorn import autotune as autotune_module
+        # mock that out via patching ``resolve_config_cls`` in the io
+        # module.
+        from popcorn.autotune import io as io_module
 
-        autotune_module._resolve_config_cls = lambda qname: (
+        io_module.resolve_config_cls = lambda qname: (
             _Config if qname and "ToyKernel" in qname else None
         )
         result = cache.lookup(_ToyKernel, spec)
@@ -266,17 +275,15 @@ class TestLookupDiskTier:
         cfg = _Config()
         cache.store(_ToyKernel, spec, cfg)
 
-        # Mutate the source hash by monkey-patching _source_hash for
-        # subsequent reads. The on-disk file's source_hash field no
-        # longer matches the cache's expected key, so the load fails.
-        from popcorn import autotune as autotune_module
+        # Mutate the source hash by monkey-patching ``source_hash`` at
+        # the io module so subsequent reads build a different cache key.
+        # The on-disk file's source_hash field no longer matches, so
+        # the load fails.
+        from popcorn.autotune import io as io_module
 
-        original = autotune_module._source_hash
-        monkeypatch.setattr(autotune_module, "_source_hash", lambda cls: "deadbeef" + ("0" * 8))
+        monkeypatch.setattr(io_module, "source_hash", lambda cls: "deadbeef" + ("0" * 8))
         cache.clear_hot()
         assert cache.lookup(_ToyKernel, spec) is None
-        # Restore.
-        monkeypatch.setattr(autotune_module, "_source_hash", original)
 
 
 class TestLookupBundledTier:

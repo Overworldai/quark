@@ -19,8 +19,12 @@ from dataclasses import dataclass
 from popcorn.ir import DType
 from popcorn.kernels.base import KernelSpec
 
-_VALID_AB = frozenset({DType.BF16, DType.F16, DType.E4M3, DType.E5M2})
+_VALID_AB = frozenset({DType.BF16, DType.F16, DType.F32, DType.E4M3, DType.E5M2})
 _VALID_OUT = frozenset({DType.BF16, DType.F16, DType.F32, DType.E4M3, DType.E5M2})
+_VALID_ACTIVATIONS = frozenset({None, "silu"})
+# Dtypes that can actually drive an MMA fragment (F32 doesn't — it must
+# be downcast on load, the same way bf16×e4m3 works via ``compute_dtype``).
+_VALID_COMPUTE = frozenset({DType.BF16, DType.F16, DType.E4M3, DType.E5M2})
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,13 @@ class GemmSpec(KernelSpec):
     acc_dtype: DType = DType.F32  # always F32 for now
     out_dtype: DType = DType.BF16
     compute_dtype: DType | None = None  # None → same as a_dtype (no cast)
+    # Fused activation applied to the accumulator in the epilogue, before
+    # cast to out_dtype. None (default) is a pure GEMM; "silu" is the
+    # fused SiLU path used by MLP fc1. Routed through
+    # ``pop.store_acc(activation=...)`` which already lowers SiLU through
+    # the fast rcp+ex2 path on PTX and MSL.
+    activation: str | None = None
+    has_bias: bool = False
     # Whether the caller will hand this kernel a preshuffled B tensor
     # (bytes already permuted to match the vectorized fragment-load
     # layout). This is a property of the B tensor layout, hence a spec
@@ -75,10 +86,31 @@ class GemmSpec(KernelSpec):
             raise ValueError(f"GemmSpec: out_dtype {self.out_dtype!r} not in {_VALID_OUT}")
         if self.acc_dtype is not DType.F32:
             raise ValueError("GemmSpec: acc_dtype must be F32 (no tf32 path)")
-        if self.compute_dtype is not None and self.compute_dtype not in _VALID_AB:
-            raise ValueError(f"GemmSpec: compute_dtype {self.compute_dtype!r} not in {_VALID_AB}")
+        if self.compute_dtype is not None and self.compute_dtype not in _VALID_COMPUTE:
+            raise ValueError(
+                f"GemmSpec: compute_dtype {self.compute_dtype!r} not in {_VALID_COMPUTE} "
+                "(F32 has no tensor-core MMA; must be BF16/F16/E4M3/E5M2)"
+            )
+        if self.activation not in _VALID_ACTIVATIONS:
+            raise ValueError(
+                f"GemmSpec: activation {self.activation!r} not in {_VALID_ACTIVATIONS}"
+            )
+        # When A (or B) is F32 and the caller didn't pick a compute_dtype,
+        # we have to downcast on load — F32 has no MMA path. Pick B's
+        # dtype if it's MMA-capable, otherwise A's.
+        if self.compute_dtype is None and (self.a_dtype is DType.F32 or self.b_dtype is DType.F32):
+            fallback = (
+                self.b_dtype
+                if self.b_dtype in _VALID_COMPUTE
+                else self.a_dtype
+                if self.a_dtype in _VALID_COMPUTE
+                else DType.BF16
+            )
+            object.__setattr__(self, "compute_dtype", fallback)
 
     @property
     def compute_dtype_resolved(self) -> DType:
-        """Effective compute dtype — source a_dtype when not set."""
+        """Effective compute dtype — source a_dtype when not set, unless
+        a_dtype is F32 (no tensor-core F32 MMA) in which case __post_init__
+        has already filled ``compute_dtype`` with a valid fallback."""
         return self.compute_dtype if self.compute_dtype is not None else self.a_dtype

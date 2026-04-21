@@ -7,7 +7,7 @@ Architecture matches the old owl_attn kernel:
   - BlockQRows = NCW * MTiles * 16
   - KvTile: KV columns per pipeline chunk
   - KvPad: smem padding for bank conflict avoidance
-  - Double-buffered cp.async KV pipeline (2 stages)
+  - n_stages: cp.async KV pipeline depth (1 = sequential, 2 = double-buffered)
 """
 
 from __future__ import annotations
@@ -23,6 +23,13 @@ class AttnConfig(KernelConfig):
     MTiles: int = 2  # M-tiles per warp (1/2/4, each = 16 Q rows)
     NCW: int = 2  # consumer warps per GQA group
     KvPad: int = 8  # smem padding for K and V (bank conflict avoidance)
+    # cp.async pipeline depth. 1 = no double-buffer (sequential
+    # produce/consume), 2 = double-buffered. Matches every other
+    # pipelined kernel in the tree (gemm / attn / patchify / moe_* all
+    # expose the same axis); the value here was hardcoded to 2 which
+    # was sandbagging autotune for KvTile/MTiles combos that fit smem
+    # better at n_stages=1.
+    n_stages: int = 2
     # Per-site shape (MMA_SHAPES M3). Autotune fills from device caps;
     # "" falls back to the compute-dtype default (k=16).
     main_shape: str = ""

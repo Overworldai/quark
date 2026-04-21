@@ -75,6 +75,7 @@ _ARITH_KINDS = frozenset(
         "add",
         "sub",
         "mul",
+        "mul_hi",
         "neg",
         "abs",
         "min",
@@ -103,6 +104,8 @@ _MATH_KINDS = frozenset(
         "ex2_approx",
         "rcp_approx",
         "rsqrt_approx",
+        "log2_approx",
+        "sqrt_approx",
     }
 )
 

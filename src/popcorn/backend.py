@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import sys
 
+import numpy as np
+
 IS_METAL = sys.platform == "darwin"
 
 
@@ -173,6 +175,8 @@ class PT:
             import mlx.core as mx
 
             return mx.concatenate(arrays, axis=dim)
+        if arrays and PT._is_numpy(arrays[0]):
+            return np.concatenate(arrays, axis=dim)
         import torch
 
         return torch.cat(arrays, dim=dim)
@@ -211,6 +215,26 @@ class PT:
         return x.contiguous()
 
     @staticmethod
+    def permute(x, dims):
+        if PT._is_mx(x):
+            import mlx.core as mx
+
+            return mx.transpose(x, dims)
+        if PT._is_numpy(x):
+            return x.transpose(dims)
+        return x.permute(dims)
+
+    @staticmethod
+    def expand(x, shape):
+        if PT._is_mx(x):
+            import mlx.core as mx
+
+            return mx.broadcast_to(x, shape)
+        if PT._is_numpy(x):
+            return np.broadcast_to(x, shape)
+        return x.expand(shape)
+
+    @staticmethod
     def transpose(x, dim0: int = -1, dim1: int = -2):
         """Swap two axes. Defaults to the last two (most common case —
         A @ B.T, K_cache ↔ Vt_cache). mlx / torch agree on swapaxes,
@@ -220,17 +244,31 @@ class PT:
             return x.swapaxes(dim0, dim1)
         return x.transpose(dim0, dim1)
 
+    # Resolved once at class-definition time. On Metal ``mx.array`` is
+    # always importable; on CUDA it's usually missing. Without this
+    # cache, every ``PT._is_mx`` call did ``import mlx.core`` and
+    # caught ImportError — ~140 µs/call on CUDA, which silently
+    # destroyed any hot path that used ``PT.zero_`` / ``PT.astype`` /
+    # etc.
+    if IS_METAL:
+        import mlx.core as _mx_core
+
+        _mx_array_type = _mx_core.array
+    else:
+        _mx_array_type = None
+
     @staticmethod
     def _is_mx(x) -> bool:
         """True iff ``x`` is an mlx.core.array. Type-based dispatch so
         PT methods work even when the caller mixes tensor types (e.g.
         ``reference()`` gets torch CPU tensors on a Metal host)."""
-        try:
-            import mlx.core as mx
+        t = PT._mx_array_type
+        return t is not None and isinstance(x, t)
 
-            return isinstance(x, mx.array)
-        except ImportError:
-            return False
+    @staticmethod
+    def _is_numpy(x) -> bool:
+        """True iff ``x`` is a numpy array."""
+        return isinstance(x, np.ndarray)
 
     @staticmethod
     def _as_torch_dtype(dtype):
@@ -257,6 +295,8 @@ class PT:
     def astype(x, dtype):
         if PT._is_mx(x):
             return x.astype(PT._as_mx_dtype(dtype))
+        if PT._is_numpy(x):
+            return x.astype(dtype)
         return x.to(PT._as_torch_dtype(dtype))
 
     @staticmethod
@@ -466,6 +506,14 @@ class PT:
         return bool(torch.isfinite(x).all().item())
 
     @staticmethod
+    def reshape(x, shape):
+        if PT._is_mx(x):
+            import mlx.core as mx
+
+            return mx.reshape(x, shape)
+        return x.reshape(shape)
+
+    @staticmethod
     def abs_diff_stats(a, b) -> tuple[float, float]:
         """Return ``(mean_abs, max_abs)`` of ``|a - b|`` as Python floats.
         Backend-polymorphic — used by the correctness check for failure
@@ -638,6 +686,21 @@ class PT:
         fp8_e5m2 = getattr(torch, "float8_e5m2", None)
         if fp8_e5m2 is not None:
             table[fp8_e5m2] = DType.E5M2
+
+        # PopcornTensor / CudaTensor uses string dtypes.
+        str_table = {
+            "bf16": DType.BF16,
+            "f16": DType.F16,
+            "f32": DType.F32,
+            "s32": DType.S32,
+            "s8": DType.S8,
+            "u8": DType.U8,
+            "e4m3": DType.E4M3,
+            "e5m2": DType.E5M2,
+        }
+        if isinstance(dt, str):
+            return str_table.get(dt, DType.F32)
+
         return table.get(dt, DType.F32)
 
     # ------------------------------------------------------------------

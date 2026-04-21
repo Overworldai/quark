@@ -94,7 +94,12 @@ class MoeOutprojKernel(Kernel):
             return False
         if not self._validate_gemm_tile(mma_cfg):
             return False
-        # n_stages=2 uses a 2× unrolled K loop; require even K-iter count.
+        compute_dt = s.compute_dtype_resolved
+        elem_b = compute_dt.bytes
+        if c.a_pad and ((c.BK + c.a_pad) * elem_b) % 16 != 0:
+            return False
+        if c.b_pad and ((c.BK + c.b_pad) * elem_b) % 16 != 0:
+            return False
         if c.n_stages == 2 and (s.H // c.BK) % 2 != 0:
             return False
         slots_per_expert = s.total_slots // s.n_experts

@@ -13,14 +13,8 @@ the allocated output is shape ``[B * n_q_heads * tpf, Dh]`` in ``out_dtype``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
-
-from popcorn.backend import PT
-from popcorn.functional._dispatch import call_with_bindings, make_autotune, torch_op
+from popcorn.functional._dispatch import call_with_bindings, make_autotune
 from popcorn.kernels import get
-
-if TYPE_CHECKING:
-    import torch
 
 _OwlAttnCls = None
 
@@ -32,12 +26,13 @@ def _cls():
     return _OwlAttnCls
 
 
+_DUMMY_FRAME_T = None
+
+
 def _owl_attn_impl(
     Q,
     K_cache,
     Vt_cache,
-    cos,
-    sin,
     segments,
     n_segments,
     *,
@@ -51,14 +46,15 @@ def _owl_attn_impl(
     out_dtype=None,
     compute_dtype=None,
     max_segments=3,
+    packed_qkv=False,
+    frame_t=None,
+    out=None,
 ):
     cls = _cls()
     spec = cls.spec_from_tensors(
         Q,
         K_cache,
         Vt_cache,
-        cos,
-        sin,
         segments,
         n_segments,
         B=B,
@@ -71,73 +67,37 @@ def _owl_attn_impl(
         out_dtype=out_dtype,
         compute_dtype=compute_dtype,
         max_segments=max_segments,
+        packed_qkv=packed_qkv,
     )
-    result = call_with_bindings(
-        cls,
-        spec,
-        provided={
-            "Q": Q,
-            "K_cache": K_cache,
-            "Vt_cache": Vt_cache,
-            "cos": cos,
-            "sin": sin,
-            "segments": segments,
-            "n_segments": n_segments,
-        },
-        auto_alloc=("output",),
-        like=Q,
-    )
+    if frame_t is None:
+        # Cache a process-wide zero sentinel so callers that don't pass
+        # an explicit frame_t don't pay a ``cuMemAllocAsync`` per call.
+        global _DUMMY_FRAME_T
+        if _DUMMY_FRAME_T is None:
+            from popcorn.nn.module import _tensor
+
+            _DUMMY_FRAME_T = _tensor([0], dtype="s32")
+        frame_t = _DUMMY_FRAME_T
+    provided = {
+        "Q": Q,
+        "K_cache": K_cache,
+        "Vt_cache": Vt_cache,
+        "segments": segments,
+        "n_segments": n_segments,
+        "frame_t": frame_t,
+    }
+    auto_alloc: tuple[str, ...] = ("output",)
+    if out is not None:
+        provided["output"] = out
+        auto_alloc = ()
+    result = call_with_bindings(cls, spec, provided=provided, auto_alloc=auto_alloc, like=Q)
     return result["output"]
 
 
-@torch_op("popcorn::owl_attn", mutates_args=())
 def owl_attn(
-    Q: torch.Tensor,
-    K_cache: torch.Tensor,
-    Vt_cache: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    segments: torch.Tensor,
-    n_segments: torch.Tensor,
-    B: int,
-    n_kv_heads: int,
-    gqa_ratio: int,
-    H_spatial: int,
-    W_spatial: int,
-    num_buckets: int,
-    pinned_dilation: int,
-    out_dtype: Optional[str] = None,
-    compute_dtype: Optional[str] = None,
-    max_segments: int = 3,
-) -> torch.Tensor:
-    return _owl_attn_impl(
-        Q,
-        K_cache,
-        Vt_cache,
-        cos,
-        sin,
-        segments,
-        n_segments,
-        B=B,
-        n_kv_heads=n_kv_heads,
-        gqa_ratio=gqa_ratio,
-        H_spatial=H_spatial,
-        W_spatial=W_spatial,
-        num_buckets=num_buckets,
-        pinned_dilation=pinned_dilation,
-        out_dtype=out_dtype,
-        compute_dtype=compute_dtype,
-        max_segments=max_segments,
-    )
-
-
-@owl_attn.register_fake
-def _(
     Q,
     K_cache,
     Vt_cache,
-    cos,
-    sin,
     segments,
     n_segments,
     B,
@@ -150,16 +110,15 @@ def _(
     out_dtype=None,
     compute_dtype=None,
     max_segments=3,
+    packed_qkv=False,
+    frame_t=None,
+    *,
+    out=None,
 ):
-    import torch
-
-    cls = _cls()
-    spec = cls.spec_from_tensors(
+    return _owl_attn_impl(
         Q,
         K_cache,
         Vt_cache,
-        cos,
-        sin,
         segments,
         n_segments,
         B=B,
@@ -172,17 +131,10 @@ def _(
         out_dtype=out_dtype,
         compute_dtype=compute_dtype,
         max_segments=max_segments,
+        packed_qkv=packed_qkv,
+        frame_t=frame_t,
+        out=out,
     )
-    cfg = cls.CONFIG_CLS.default_for(spec)
-    out_decl = next(d for d in cls.TENSORS if d.name == "output")
-    shape = out_decl.shape(spec, cfg)
-    dtype = PT.ir_dtype_to_backend(out_decl.dtype(spec, cfg))
-    return torch.empty(tuple(shape), dtype=dtype, device=Q.device)
 
 
-@owl_attn.register_autograd
-def _(ctx, grad_out):
-    raise NotImplementedError("popcorn.functional.owl_attn: backward not implemented.")
-
-
-owl_attn.autotune = make_autotune(_owl_attn_impl, _cls)
+owl_attn.autotune = make_autotune(_owl_attn_impl, _cls)  # ty: ignore[unresolved-attribute]

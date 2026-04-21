@@ -14,7 +14,13 @@ from popcorn.ir import DType
 
 
 def gemm_reference(
-    A, B, *, out_dtype: DType | str = DType.BF16, compute_dtype: DType | str | None = None
+    A,
+    B,
+    *,
+    out_dtype: DType | str = DType.BF16,
+    compute_dtype: DType | str | None = None,
+    activation: str | None = None,
+    bias=None,
 ):
     """``C = A @ B^T``, accumulated in f32, cast to ``out_dtype``.
 
@@ -47,9 +53,26 @@ def gemm_reference(
     B_f32 = PT.astype(B, PT.float32)
     C_f32 = PT.matmul(A_f32, PT.transpose(B_f32))
 
+    if bias is not None:
+        C_f32 = C_f32 + PT.astype(bias, PT.float32)
+
+    if activation == "silu":
+        # SiLU in f32 matches the kernel, which applies the fused
+        # rcp+ex2 silu pre-cast in store_acc.
+        C_f32 = C_f32 * (1.0 / (1.0 + PT.exp(-C_f32)))
+    elif activation is not None:
+        raise ValueError(f"gemm_reference: unsupported activation {activation!r}")
+
     return PT.astype(C_f32, out_dt.backend)
 
 
-def gemm_reference_for_spec(kernel, A, B):
+def gemm_reference_for_spec(kernel, A, B, Bias=None):
     s = kernel.spec
-    return gemm_reference(A, B, out_dtype=s.out_dtype, compute_dtype=s.compute_dtype_resolved)
+    return gemm_reference(
+        A,
+        B,
+        out_dtype=s.out_dtype,
+        compute_dtype=s.compute_dtype_resolved,
+        activation=s.activation,
+        bias=Bias if s.has_bias else None,
+    )

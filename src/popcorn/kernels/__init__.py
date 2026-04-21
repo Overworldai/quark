@@ -9,8 +9,6 @@ config, kernel, and __init__.py.
 """
 
 from popcorn.kernels.base import (
-    Autotuner,
-    AutotuneResult,
     Baseline,
     Kernel,
     KernelConfig,
@@ -45,8 +43,6 @@ def _autodiscover_folder_kernels() -> None:
 _autodiscover_folder_kernels()
 
 __all__ = [
-    "AutotuneResult",
-    "Autotuner",
     "Baseline",
     "Kernel",
     "KernelConfig",

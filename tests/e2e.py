@@ -67,7 +67,7 @@ else:
     DEVICE = "cuda"
 
     def randn(shape, dtype=BF16):
-        base = torch.randn(*shape, dtype=BF16, device=DEVICE)  # ty: ignore[no-matching-overload]
+        base = torch.randn(*shape, dtype=BF16, device=DEVICE)
         return base if dtype is BF16 else base.to(dtype)
 
     def zeros(shape, dtype):
@@ -77,10 +77,10 @@ else:
         return torch.tensor(list(seq), dtype=I32, device=DEVICE)
 
     def arange_mod(n, mod):
-        return torch.arange(n, dtype=I32, device=DEVICE) % mod  # ty: ignore[no-matching-overload]
+        return torch.arange(n, dtype=I32, device=DEVICE) % mod
 
     def full_f32(shape, value):
-        return torch.full(shape, value, dtype=F32, device=DEVICE)  # ty: ignore[no-matching-overload]
+        return torch.full(shape, value, dtype=F32, device=DEVICE)
 
     def device_sync():
         torch.cuda.synchronize()
@@ -157,22 +157,20 @@ def owl_attn_bench(
     Q = randn((B * n_q * tpf, Dh))
     K_cache = randn((B * n_kv_heads * capacity, Dh))
     Vt_cache = randn((B * n_kv_heads * Dh, capacity))
-    cos = randn((tpf, Dh // 2), dtype=F32)
-    sin = randn((tpf, Dh // 2), dtype=F32)
     L = num_buckets * tpf
     seg_pad = B * max_segments * 2 - 4
     segments = i32_tensor([0, L, L, tpf] + [0] * seg_pad)
     n_segments = i32_tensor([2] * B)
+    frame_t = i32_tensor([0])
 
     def call():
         return pcf.owl_attn(
             Q,
             K_cache,
             Vt_cache,
-            cos,
-            sin,
             segments,
             n_segments,
+            frame_t=frame_t,
             B=B,
             n_kv_heads=n_kv_heads,
             gqa_ratio=gqa_ratio,
@@ -205,9 +203,8 @@ def kv_cache_update_bench(
     kv_dt = FP8 if kv_dtype == "e4m3" else BF16
     K = randn((B * n_kv_heads * tpf, Dh), dtype=BF16)
     V = randn((B * n_kv_heads * tpf, Dh), dtype=BF16)
-    cos = randn((tpf, Dh // 2), dtype=F32)
-    sin = randn((tpf, Dh // 2), dtype=F32)
     frame_t = i32_tensor([0])
+    frozen = zeros((1,), dtype=I32)
     K_cache = zeros((B * n_kv_heads * capacity, Dh), dtype=kv_dt)
     Vt_cache = zeros((B * n_kv_heads * Dh, capacity), dtype=kv_dt)
     segments = zeros((B * max_segments * 2,), dtype=I32)
@@ -217,9 +214,8 @@ def kv_cache_update_bench(
         return pcf.kv_cache_update(
             K,
             V,
-            cos,
-            sin,
             frame_t,
+            frozen,
             Vt_cache,
             segments,
             n_segments,

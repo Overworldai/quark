@@ -34,6 +34,15 @@ class KVCacheUpdateSpec(KernelSpec):
     in_dtype: DType = DType.BF16
     kv_dtype: DType = DType.BF16
     max_segments: int = 3
+    # When True, K and V are read from a packed QKV tensor [B*tpf, qkv_dim]
+    # using column offsets (k_col_offset, v_col_offset) instead of from
+    # separate [B*Hk*tpf, Dh] tensors. The packed tensor replaces K; V
+    # is unused.
+    packed_qkv: bool = False
+    n_q_heads: int = 0  # only used when packed_qkv=True (for column offsets)
+    # Number of frames in the cos/sin RoPE table. 1 = pre-sliced (legacy),
+    # >1 = full table (the kernel indexes via frame_t * tpf internally).
+    rope_n_frames: int = 1
 
     def __post_init__(self):
         for field in ("in_dtype", "kv_dtype"):
@@ -52,3 +61,24 @@ class KVCacheUpdateSpec(KernelSpec):
     @property
     def capacity(self) -> int:
         return self.L + self.tpf
+
+    @property
+    def qkv_dim(self) -> int:
+        return (self.n_q_heads + 2 * self.n_kv_heads) * self.Dh
+
+    @property
+    def k_col_offset(self) -> int:
+        return self.n_q_heads * self.Dh
+
+    @property
+    def v_col_offset(self) -> int:
+        return (self.n_q_heads + self.n_kv_heads) * self.Dh
+
+    @property
+    def k_input_rows(self) -> int:
+        """Row count of the K input tensor (or QKV when packed)."""
+        return (self.B * self.tpf) if self.packed_qkv else (self.B * self.n_kv_heads * self.tpf)
+
+    @property
+    def k_input_cols(self) -> int:
+        return self.qkv_dim if self.packed_qkv else self.Dh

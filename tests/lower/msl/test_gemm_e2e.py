@@ -74,10 +74,10 @@ def test_gemm_bf16_launch():
     tensors = GemmKernel.make_tensors(
         {"M": M, "N": N, "K": K, "a_dtype": "bf16", "b_dtype": "bf16", "out_dtype": "bf16"}
     )
-    A, B, Out = tensors["A"], tensors["B"], tensors["Out"]
+    A, B, Bias, Out = tensors["A"], tensors["B"], tensors["Bias"], tensors["Out"]
 
     # Launch.
-    result = compiled.launch(buffers=[A, B, Out])
+    result = compiled.launch(buffers=[A, B, Bias, Out])
     assert result is not None, "Metal launch should return output arrays"
     C_metal = result[0]
     mx.eval(C_metal)

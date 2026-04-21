@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 
 from popcorn.device import Device, DeviceCaps, current_device
+from popcorn.graph import capture_graph
 from popcorn.ir import Builder, DType, Module
 
 
@@ -38,6 +39,7 @@ __all__ = [
     "Device",
     "DeviceCaps",
     "Module",
+    "capture_graph",
     "current_device",
     "max_autotune",
 ]

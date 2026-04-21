@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from popcorn.blocks.dsl import Accumulators, Block, active_bctx
-from popcorn.ir import Builder, DType, Value
+from popcorn.ir import Builder, DType, SharedRegion, Value
+
+_FP8_DTYPES = (DType.E4M3, DType.E5M2)
 
 _LOG2E = math.log2(math.e)
 
@@ -71,6 +73,20 @@ class OnlineSoftmax(Block):
     s_acc: Accumulators  # S accumulator spec (MT × NK)
     o_acc: Accumulators  # O accumulator spec (MT × N_DH)
     scale: float
+    # fp8 smem-round-trip path for GEMM2's A-fragment. When the active
+    # MMA's a_dtype is e4m3 / e5m2 the in-register acc→a_frag convert
+    # (f32→fp8) doesn't line up same-lane with the 16-bit accumulator
+    # layout — the fp8 A-fragment wants 4 consecutive k-cols per lane
+    # while the bf16 C-fragment hands us 2 cols from each of 2 adjacent
+    # lanes. Caller allocates ``p_smem`` sized ``(n_warps * MT * m, K)``
+    # in the compute dtype; softmax writes its f32 P through
+    # ``packed_convert`` into this warp's slice at ``p_row_base`` and
+    # returns ``p_frags=None``. The caller then issues a block barrier
+    # and rebuilds ``p_frags`` via ``load_matrix`` from ``p_smem`` into
+    # the fp8 A-frag layout. When ``p_smem is None`` the legacy
+    # in-register ``frag_convert`` path runs (only correct for bf16).
+    p_smem: SharedRegion | None = None
+    p_row_base: Any = 0  # runtime Value or Python int
 
     # Populated on call.
     o_vals: list[Value] | None = None
@@ -85,7 +101,7 @@ class OnlineSoftmax(Block):
         o_vals: list[Value],
         m_vals: list[Value],
         l_vals: list[Value],
-    ) -> tuple[list[Value], list[Value], list[Value], list[list[Value]]]:
+    ) -> tuple[list[Value], list[Value], list[Value], list[list[Value]] | None]:
         ctx = active_bctx()
         b = ctx.bld
         cfg = ctx.mma_cfg
@@ -275,22 +291,83 @@ class OnlineSoftmax(Block):
                         new_l_vals[mt * n_rc + rc], local_psum_final[mt][rc]
                     )
 
-            # Step 4c: convert nk_per_kstep ACC tiles → one A-fragment
-            # for GEMM2. m16n8k16: packs 2 nk-tiles per k-step;
-            # m8n8k8: 1 nk-tile per step.
-            p_frags: list[list[Any]] = [[None for _ in range(GEMM2_K_STEPS)] for _ in range(MT)]
-            for mt in range(MT):
-                for k_step in range(GEMM2_K_STEPS):
-                    src = tuple(p_acc[mt][k_step * nk_per_kstep + i] for i in range(nk_per_kstep))
-                    p_frags[mt][k_step] = b.frag_convert(
-                        mma_shape_id,
-                        src_frags=src,
-                        src_layout="acc",
-                        dst_layout="a_frag",
-                        src_dtype=DType.F32,
-                        dst_dtype=DType.BF16,
-                        cd_offsets=cd_offsets,
+            # Step 4c: materialize the P A-fragment for GEMM2.
+            # Two paths selected by the active MMA's A-dtype:
+            #  - 16-bit (bf16/f16): in-register ``frag_convert`` packs
+            #    ``nk_per_kstep`` f32 acc tiles into one b32-wide A-frag.
+            #    Same-lane layout, no shuffles.
+            #  - 8-bit (e4m3/e5m2): smem round-trip. Per-lane f32 P values
+            #    go through ``packed_convert`` (f32×2 → fp8×2 in one b16)
+            #    and scalar-store to ``p_smem`` at their true (row, col).
+            #    The caller issues a block barrier and reloads with
+            #    ``load_matrix`` into the fp8 A-frag layout — those reads
+            #    match the PTX ISA fp8 m16n8k16/k32 fragment map.
+            a_dtype = cfg.shape.a_dtype
+            if a_dtype in _FP8_DTYPES:
+                assert self.p_smem is not None, (
+                    f"OnlineSoftmax: fp8 compute ({a_dtype}) requires p_smem "
+                    f"for smem-round-trip P; pass p_smem= in the block init."
+                )
+                # cd_offsets for every m16n8 MMA in the registry is
+                # ((0,0),(0,1),(8,0),(8,1)). We use this ordering directly
+                # — pair slots {0,1} at row dr=0 and {2,3} at row dr=8.
+                if tuple(cd_offsets) != ((0, 0), (0, 1), (8, 0), (8, 1)):
+                    raise NotImplementedError(
+                        f"OnlineSoftmax fp8 path expects m16n8 cd_offsets, got {cd_offsets}"
                     )
+                shape_m = cfg.shape.m
+                shape_n = cfg.shape.n
+                # Per-lane offsets into the warp's p_smem slice:
+                #   row = p_row_base + mt*m + gid            (top half)
+                #   row = p_row_base + mt*m + (m//2) + gid   (bottom half)
+                #   col = nk*n + 2*tig                        (packed pair)
+                gid = ctx.gid
+                # Emit ``tig * 2`` locally instead of going through the
+                # bctx.tig_x2 lazy property. The property caches its Value
+                # on first access, which creates an SSA scope violation
+                # when ``consume()`` is called from multiple IR regions
+                # (for_range body + epilogue tail): the first call caches
+                # the MulOp inside the for_range body region, and the
+                # epilogue's re-use references a Value that doesn't
+                # dominate it. Emitting fresh each call lets the builder's
+                # region-scoped CSE pick the right Value per caller region.
+                tig_x2 = b.mul(ctx.tig, ctx.c(2))
+                p_base = self.p_row_base
+                p_base_v = p_base if isinstance(p_base, Value) else ctx.c(p_base)
+                for mt in range(MT):
+                    row_top = b.add(b.add(p_base_v, ctx.c(mt * shape_m)), gid)
+                    row_bot = b.add(row_top, ctx.c(shape_m // 2))
+                    for nk in range(NK):
+                        col = b.add(ctx.c(nk * shape_n), tig_x2)
+                        p_vec = p_acc[mt][nk]
+                        c0 = b.vec_extract(p_vec, 0)
+                        c1 = b.vec_extract(p_vec, 1)
+                        c2 = b.vec_extract(p_vec, 2)
+                        c3 = b.vec_extract(p_vec, 3)
+                        p01 = b.packed_convert(c0, c1, a_dtype)
+                        p23 = b.packed_convert(c2, c3, a_dtype)
+                        b.store(self.p_smem, p01, row_top, col)
+                        b.store(self.p_smem, p23, row_bot, col)
+                p_frags: list[list[Value]] | None = None
+            else:
+                # m16n8k16: packs 2 nk-tiles per k-step; m8n8k8: 1 nk-tile.
+                p_frags = [
+                    [
+                        b.frag_convert(
+                            mma_shape_id,
+                            src_frags=tuple(
+                                p_acc[mt][k_step * nk_per_kstep + i] for i in range(nk_per_kstep)
+                            ),
+                            src_layout="acc",
+                            dst_layout="a_frag",
+                            src_dtype=DType.F32,
+                            dst_dtype=DType.BF16,
+                            cd_offsets=cd_offsets,
+                        )
+                        for k_step in range(GEMM2_K_STEPS)
+                    ]
+                    for mt in range(MT)
+                ]
         else:
             # Legacy PTX fallback: extract → compute → merge_b32 pack.
             local_psum = [[b.const(DType.F32, 0.0) for _ in range(n_rc)] for _ in range(MT)]

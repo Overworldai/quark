@@ -8,8 +8,8 @@ Flow (matches kv_cache_update.reference + owl_attn semantics):
   3. ``PT.attention(Q, K, V, mask=...)`` — dispatches to each
      backend's fast SDPA (flash-attn on MLX, torch SDPA on CUDA).
 
-No manual softmax, no backend-type branching — the reference only
-talks to ``PT`` and lets it route to the right hardware path.
+Inline RoPE: cos/sin computed from (H, W, frame_t, Dh) — no
+precomputed table tensors.
 """
 
 from __future__ import annotations
@@ -18,8 +18,7 @@ from popcorn.backend import PT
 
 
 def apply_rope_fp32_concat(x, cos, sin):
-    """Ortho-RoPE in fp32 with concat layout — mirrors
-    ``kv_cache_update.reference.apply_rope_fp32``."""
+    """Ortho-RoPE in fp32 with concat layout."""
     orig_dt = x.dtype
     x32 = PT.astype(x, PT.float32)
     x0 = x32[..., 0::2]
@@ -32,14 +31,8 @@ def apply_rope_fp32_concat(x, cos, sin):
 
 
 def _additive_mask_from_segments(segments, n_segments, capacity: int):
-    """Build a ``[B, 1, 1, capacity]`` additive mask: 0 where valid,
-    ``-inf`` elsewhere. Segments are tiny (2 per batch in steady
-    state) so a Python-side scan is fine. Returns a PT tensor in the
-    same backend as ``segments``."""
     B = int(segments.shape[0])
     rows = [[float("-inf")] * capacity for _ in range(B)]
-    # Pull the segment data to Python once — segments is [B, max_seg, 2]
-    # int32, a handful of entries per batch.
     seg_list = PT.to_cpu_numpy(segments).tolist()
     nseg_list = PT.to_cpu_numpy(n_segments).tolist()
     for b in range(B):
@@ -49,37 +42,17 @@ def _additive_mask_from_segments(segments, n_segments, capacity: int):
             for j in range(st, min(st + ln, capacity)):
                 rows[b][j] = 0.0
     m = PT.tensor(rows, dtype=PT.float32)
-    # Broadcast-friendly shape: [B, 1, 1, capacity].
     return m.reshape(B, 1, 1, capacity)
 
 
-def owl_attn_reference(
-    Q,  # [B, Hq, tpf, Dh]     a_dtype
-    K_cache,  # [B, Hk, capacity, Dh]  kv_dtype
-    Vt_cache,  # [B, Hk, Dh, capacity]  kv_dtype
-    cos,  # [tpf, Dh//2]      f32
-    sin,  # [tpf, Dh//2]      f32
-    segments,  # [B, max_segments, 2] int32
-    n_segments,  # [B]          int32
-    *,
-    out_dtype,
-):
+def owl_attn_reference(Q, K_cache, Vt_cache, cos, sin, segments, n_segments, *, out_dtype):
     """Returns output ``[B, Hq, tpf, Dh]`` in ``out_dtype``."""
     capacity = K_cache.shape[2]
-
-    # 1) Q-side ortho-RoPE in fp32.
-    cos_b = cos[None, None, :, :]  # [1, 1, tpf, Dh//2]
+    cos_b = cos[None, None, :, :]
     sin_b = sin[None, None, :, :]
-    Q_rot = apply_rope_fp32_concat(Q, cos_b, sin_b)  # [B, Hq, tpf, Dh]
-
-    # 2) Reconstruct V from Vt_cache: swap last two dims.
+    Q_rot = apply_rope_fp32_concat(Q, cos_b, sin_b)
     V_cache = PT.transpose(Vt_cache)
-
-    # 3) Additive mask over capacity.
     mask = _additive_mask_from_segments(segments, n_segments, capacity)
-
-    # 4) Cast everything to bf16 so the SDPA matmul stays bf16 — matches
-    #    the kernel's bf16 MMA precision.
     Qf = PT.astype(Q_rot, PT.bfloat16)
     Kf = PT.astype(K_cache, PT.bfloat16)
     Vf = PT.astype(V_cache, PT.bfloat16)
@@ -87,10 +60,30 @@ def owl_attn_reference(
     return PT.astype(y, out_dtype)
 
 
-def owl_attn_reference_for_spec(kernel, Q, K_cache, Vt_cache, cos, sin, segments, n_segments):
+def owl_attn_reference_for_spec(kernel, Q, K_cache, Vt_cache, segments, n_segments, frame_t):
+    """Reference matching inline-RoPE TENSORS: Q, K_cache, Vt_cache,
+    segments, n_segments, frame_t, output."""
+    from popcorn.kernels.kv_cache_update.reference import make_ortho_rope_freqs
+
     s = kernel.spec
     out_dt = s.out_dtype.backend
-    Q4 = Q.reshape(s.B, s.n_q_heads, s.tpf, s.Dh)
+
+    # Compute cos/sin from frame_t (inline RoPE).
+    ft = int(frame_t.item() if hasattr(frame_t, "item") else frame_t[0])
+    cos_full, sin_full = make_ortho_rope_freqs(s.H_spatial, s.W_spatial, ft + 1, s.Dh)
+    cos = cos_full[ft * s.tpf : (ft + 1) * s.tpf, :]
+    sin = sin_full[ft * s.tpf : (ft + 1) * s.tpf, :]
+
+    # Extract Q from packed QKV if needed.
+    if s.packed_qkv:
+        # Q is [B*tpf, qkv_dim] — first n_q_heads*Dh columns are Q.
+        q_cols = s.n_q_heads * s.Dh
+        Q_raw = Q[:, :q_cols]  # [B*tpf, Hq*Dh]
+        Q4 = Q_raw.reshape(s.B, s.tpf, s.n_q_heads, s.Dh)
+        Q4 = PT.permute(Q4, (0, 2, 1, 3))  # [B, Hq, tpf, Dh]
+    else:
+        Q4 = Q.reshape(s.B, s.n_q_heads, s.tpf, s.Dh)
+
     Kc = K_cache.reshape(s.B, s.n_kv_heads, s.capacity, s.Dh)
     Vtc = Vt_cache.reshape(s.B, s.n_kv_heads, s.Dh, s.capacity)
     cos2 = cos.reshape(s.tpf, s.Dh // 2)
@@ -98,4 +91,10 @@ def owl_attn_reference_for_spec(kernel, Q, K_cache, Vt_cache, cos, sin, segments
     segs3 = segments.reshape(s.B, s.max_segments, 2)
     nseg1 = n_segments.reshape(s.B)
     out = owl_attn_reference(Q4, Kc, Vtc, cos2, sin2, segs3, nseg1, out_dtype=out_dt)
+
+    # Output shape matches kernel: packed → [B*tpf, Hq*Dh], else [B*Hq*tpf, Dh].
+    if s.packed_qkv:
+        # out is [B, Hq, tpf, Dh] → [B, tpf, Hq, Dh] → [B*tpf, Hq*Dh]
+        out = PT.permute(out, (0, 2, 1, 3))
+        return out.reshape(s.B * s.tpf, s.n_q_heads * s.Dh)
     return out.reshape(s.B * s.n_q_heads * s.tpf, s.Dh)

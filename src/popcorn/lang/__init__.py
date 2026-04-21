@@ -44,6 +44,7 @@ __all__ = [  # noqa: RUF022 — grouped by category; see comments below
     "add",
     "sub",
     "mul",
+    "mul_hi",
     "div",
     "rem",
     "min",
@@ -70,8 +71,10 @@ __all__ = [  # noqa: RUF022 — grouped by category; see comments below
     "rsqrt_approx",
     "ex2_approx",
     "sqrt",
+    "sqrt_approx",
     "exp2",
     "log2",
+    "log2_approx",
     "tanh",
     # vectors
     "vec_build",
@@ -208,6 +211,11 @@ def sub(*args, **kwargs):
 
 def mul(*args, **kwargs):
     return current_builder().mul(*args, **kwargs)
+
+
+def mul_hi(*args, **kwargs):
+    """High 32 bits of a u32×u32→u64 multiply. See ``Builder.mul_hi``."""
+    return current_builder().mul_hi(*args, **kwargs)
 
 
 def div(*args, **kwargs):
@@ -355,12 +363,28 @@ def sqrt(*args, **kwargs):
     return current_builder().sqrt(*args, **kwargs)
 
 
+def sqrt_approx(*args, **kwargs):
+    return current_builder().sqrt_approx(*args, **kwargs)
+
+
 def exp2(*args, **kwargs):
     return current_builder().exp2(*args, **kwargs)
 
 
 def log2(*args, **kwargs):
     return current_builder().log2(*args, **kwargs)
+
+
+def log2_approx(*args, **kwargs):
+    return current_builder().log2_approx(*args, **kwargs)
+
+
+def sin(*args, **kwargs):
+    return current_builder().sin(*args, **kwargs)
+
+
+def cos(*args, **kwargs):
+    return current_builder().cos(*args, **kwargs)
 
 
 def tanh(*args, **kwargs):

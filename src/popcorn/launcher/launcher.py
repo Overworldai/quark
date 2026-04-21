@@ -40,6 +40,78 @@ if TYPE_CHECKING:
     from popcorn.autotune import AutotuneCache
 
 
+def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> float:
+    """Budget-based timer using CUDA events or MLX sync. Returns μs/call.
+
+    Two-phase design, both phases driven by a wall-clock budget rather
+    than a fixed iteration count (which is fragile when per-iter time
+    drifts between the probe and the bench — clock ramps, thermal
+    throttling, cache warming all bias the probe-then-count approach
+    toward the first generation of configs).
+
+    Phase 1 — warmup: launch ``fn()`` in a tight loop until wall-clock
+    elapsed ≥ ``warmup_ms``, periodically draining the command queue
+    so the host doesn't run ahead and skew what "warmup" means. Sync
+    once at the end so the bench starts from a drained pipeline.
+
+    Phase 2 — bench: bracket a wall-clock-bounded loop with CUDA
+    events. The events measure actual GPU execution time across every
+    launched iter (including queued work that finishes after the host
+    exits the loop), so the returned µs/call reflects GPU occupancy,
+    not host-side queueing. Sync on the end event before reading the
+    elapsed time.
+
+    Sync gates at both ends keep adjacent measurements from bleeding
+    into each other — important when the autotuner times dozens of
+    configs back-to-back.
+    """
+    import time as _time
+
+    from popcorn.device import current_device
+
+    dev = current_device()
+    if dev.family is DeviceFamily.METAL:
+        # Metal path: use PT.time_callable (MLX still active in Stage 1).
+        from popcorn.backend import PT as _PT
+
+        return _PT.time_callable(fn, warmup_ms=warmup_ms, bench_ms=bench_ms)
+
+    from popcorn.runtime.cuda import CudaRuntime
+
+    rt = CudaRuntime.instance()
+    rt.stream_synchronize(0)
+
+    # Phase 1: warmup. Time-budget loop, periodic drain so the host
+    # doesn't race arbitrarily far ahead of the device.
+    t0 = _time.perf_counter()
+    n_warm = 0
+    while (_time.perf_counter() - t0) * 1000 < warmup_ms:
+        fn()
+        n_warm += 1
+        if n_warm % 32 == 0:
+            rt.stream_synchronize(0)
+    rt.stream_synchronize(0)
+
+    # Phase 2: bench. CUDA events bracket a wall-clock-bounded loop.
+    start = rt.event_create()
+    end = rt.event_create()
+    rt.event_record(start, 0)
+    t_bench = _time.perf_counter()
+    n_bench = 0
+    while (_time.perf_counter() - t_bench) * 1000 < bench_ms:
+        fn()
+        n_bench += 1
+    rt.event_record(end, 0)
+    rt.event_synchronize(end)
+    total_ms = rt.event_elapsed_time(start, end)
+    rt.event_destroy(start)
+    rt.event_destroy(end)
+    # Drain anything lingering so the caller's next timing starts
+    # from a known state.
+    rt.stream_synchronize(0)
+    return total_ms * 1000 / max(n_bench, 1)  # μs per call
+
+
 # ---------------------------------------------------------------------------
 # torch ↔ IR DType bridge
 # ---------------------------------------------------------------------------
@@ -136,16 +208,41 @@ def _check_dtype_mlx(buf, expected: DType) -> None:
         )
 
 
-def _check_contiguous(buf: torch.Tensor, spec) -> None:
-    """Default contiguity check. The proposal allows future ParamSpec
-    entries to mark layouts as 'free' (skip the check); for Bundle 3
-    we require contiguity unconditionally — every kernel today
-    expects row-major contiguous storage."""
-    if not buf.is_contiguous():
-        raise ValueError(
-            f"_check_contiguous: buffer {spec.name!r} must be contiguous; "
-            f"got tensor with strides {tuple(buf.stride())}"
+_CUDA_TENSOR_DTYPE_MAP: dict[str, DType] = {
+    "bf16": DType.BF16,
+    "f16": DType.F16,
+    "f32": DType.F32,
+    "s32": DType.S32,
+    "s8": DType.S8,
+    "u8": DType.U8,
+    "e4m3": DType.E4M3,
+    "e5m2": DType.E5M2,
+    "u16": DType.U16,
+    "u32": DType.U32,
+    "u64": DType.U64,
+    "s16": DType.S16,
+    "s64": DType.S64,
+}
+
+
+def _check_dtype_popcorn(buf, expected: DType) -> None:
+    """Validate that a PopcornTensor's dtype matches the kernel expectation."""
+    actual = _CUDA_TENSOR_DTYPE_MAP.get(buf.dtype)
+    if actual is None:
+        raise TypeError(
+            f"_check_dtype_popcorn: PopcornTensor dtype '{buf.dtype}' has no IR equivalent"
         )
+    if actual is not expected:
+        raise TypeError(
+            f"_check_dtype_popcorn: buffer dtype mismatch — kernel expects "
+            f"{expected!r}, got PopcornTensor of {actual!r} ('{buf.dtype}')"
+        )
+
+
+def _check_contiguous(buf, spec) -> None:
+    """Default contiguity check. PopcornTensors are always contiguous."""
+    if hasattr(buf, "is_contiguous") and not buf.is_contiguous():
+        raise ValueError(f"_check_contiguous: buffer {spec.name!r} must be contiguous")
 
 
 # ---------------------------------------------------------------------------
@@ -184,23 +281,10 @@ class CompiledKernel:
     # without re-passing the spec/config.
     grid_args: tuple = ()
     block_args: tuple = ()
-    # First-launch warmup tracking. Observed on CUDA/sm_120: the first
-    # ever launch of a freshly-compiled kernel with a given set of
-    # input buffer addresses produces wrong output (NaN / cos≪1)
-    # while every subsequent launch with the same module + same input
-    # addresses is correct and stable. Root cause not yet identified.
-    # Workaround: do a throwaway launch + sync the FIRST time we see
-    # a particular ``(this CompiledKernel, hash(input data_ptrs))``
-    # combination, then run the real launch. Subsequent launches with
-    # the same combination skip the warmup.
-    #
-    # We key only on READONLY buffer addresses (inputs), not the
-    # output. Output is typically freshly allocated per call (so its
-    # data_ptr changes every time) but the bug is about the kernel
-    # READING inputs correctly — once an input address has been
-    # touched once, subsequent reads from it are stable regardless
-    # of where the output buffer happens to land.
-    _warmed_input_keys: set = field(default_factory=set)
+    # Cache of input-role dummy tensors (e.g. has_bias=False Bias, zero
+    # Y for unary ops). Populated lazily by the functional dispatch
+    # layer on first call.
+    _input_dummies: dict = field(default_factory=dict)
 
     def launch(
         self,
@@ -213,9 +297,6 @@ class CompiledKernel:
 
         On CUDA: writes into preallocated output buffers, returns None.
         On Metal: returns list of mx.array outputs (MLX allocates them).
-
-        First-launch-per-input-set warmup: see ``_warmed_input_keys``
-        doc above. CUDA only.
         """
         if len(buffers) != len(self.param_spec.buffers):
             raise ValueError(
@@ -230,34 +311,40 @@ class CompiledKernel:
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.METAL:
             return self._launch_metal(buffers, scalars)
 
-        input_key = tuple(
-            buffers[i].data_ptr() for i, b in enumerate(self.param_spec.buffers) if b.readonly
-        )
-        if input_key not in self._warmed_input_keys:
-            self._launch_cuda(buffers, scalars, stream)
-            from popcorn.backend import PT as _PT
-
-            _PT.synchronize()
-            self._warmed_input_keys.add(input_key)
         return self._launch_cuda(buffers, scalars, stream)
 
     def _launch_cuda(self, buffers, scalars, stream) -> None:
-        """CUDA launch path — pointer-based, writes in place."""
+        """CUDA launch path — pointer-based, writes in place.
+
+        Accepts both ``torch.Tensor`` and ``PopcornTensor`` buffers.
+        PopcornTensors use ``_check_dtype_popcorn``; torch tensors
+        use the existing ``_check_dtype`` path.
+        """
+        from popcorn.runtime.tensor import PopcornTensor
+
         ptrs: list[int] = []
         for i, (buf, pspec) in enumerate(zip(buffers, self.param_spec.buffers, strict=False)):
-            if buf.device.type not in ("cuda", "mps"):
-                raise ValueError(
-                    f"CompiledKernel.launch: buffer {i} ({pspec.name!r}) "
-                    f"is on {buf.device}, not a GPU device"
-                )
-            _check_dtype(buf, pspec.dtype)
+            if isinstance(buf, PopcornTensor):
+                _check_dtype_popcorn(buf, pspec.dtype)
+            else:
+                if buf.device.type not in ("cuda", "mps"):
+                    raise ValueError(
+                        f"CompiledKernel.launch: buffer {i} ({pspec.name!r}) "
+                        f"is on {buf.device}, not a GPU device"
+                    )
+                _check_dtype(buf, pspec.dtype)
             _check_contiguous(buf, pspec)
             ptrs.append(buf.data_ptr())
 
         scalar_bytes = self.param_spec.pack_scalars(tuple(scalars))
 
         if stream is None:
-            stream_handle = self.driver.current_torch_stream()
+            if isinstance(buffers[0], PopcornTensor):
+                from popcorn.graph import active_stream
+
+                stream_handle = active_stream()  # 0 normally, capture stream during graph capture
+            else:
+                stream_handle = self.driver.current_torch_stream()
         elif isinstance(stream, int):
             stream_handle = stream
         else:
@@ -410,11 +497,21 @@ class Launcher:
                 smem_bytes=lowered.smem_bytes,
             )
         else:
-            compiled_mod = self.driver.compile(
-                source=lowered.ptx,
-                entry_name=lowered.kernel_name or kernel.entry_name(),
-                smem_bytes=lowered.smem_bytes,
-            )
+            try:
+                compiled_mod = self.driver.compile(
+                    source=lowered.ptx,
+                    entry_name=lowered.kernel_name or kernel.entry_name(),
+                    smem_bytes=lowered.smem_bytes,
+                )
+            except Exception as exc:
+                from popcorn.utils.ptx_dump import classify_compile_error, dump_path_for
+
+                if classify_compile_error(exc) == "ptx":
+                    path = dump_path_for(kernel_cls, spec, config)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(lowered.ptx)
+                    raise type(exc)(f"{exc}\n\nPTX dumped to: {path}") from exc
+                raise
 
         ck = CompiledKernel(
             driver=self.driver,
@@ -462,7 +559,7 @@ class Launcher:
         Compiles a single (kernel, spec, config) combo and times one
         launch. When ``tensors`` is provided (the AutotuneCache builds
         a single dict up front and threads it through every candidate),
-        we reuse it — matching ``genetic_search``'s one-alloc-per-search
+        we reuse it — matching ``_search_full``'s one-alloc-per-search
         pattern. Per-call ``make_tensors`` was churning the CUDA caching
         allocator across candidates and observed to corrupt subsequent
         launches on sm_120. Falls back to ``make_tensors(problems()[0])``
@@ -496,11 +593,9 @@ class Launcher:
         # Order buffers by ParamSpec (authoritative IR declaration order).
         buffers = [launch_tensors[b.name] for b in ck.param_spec.buffers]
 
-        from popcorn.backend import PT as _PT
-
         for _ in range(self._autotune.warmup):
             ck.launch(buffers=buffers)
-        return _PT.time_callable(lambda: ck.launch(buffers=buffers), warmup_ms=10.0, bench_ms=50.0)
+        return _time_callable(lambda: ck.launch(buffers=buffers), warmup_ms=10.0, bench_ms=50.0)
 
 
 def _kernel_is_valid(kernel, caps) -> bool:

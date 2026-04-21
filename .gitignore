@@ -9,3 +9,4 @@ proposals/
 configs/
 *.egg-info/
 .DS_Store
+.claude/

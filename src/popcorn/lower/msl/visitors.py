@@ -137,6 +137,12 @@ def _visit_arith(self, op: ArithOp, ctx: _MslCtx) -> None:
         a = ctx.names.name_for(op.operands[0])
         b = ctx.names.name_for(op.operands[1])
         ctx.emit(f"{ty} {dst} = metal::max({a}, {b});")
+    elif kind == "mul_hi":
+        a = ctx.names.name_for(op.operands[0])
+        b = ctx.names.name_for(op.operands[1])
+        # MSL's metal::mulhi computes the high half of an unsigned
+        # 32×32→64 multiply (or the matching width for u16/u64 ops).
+        ctx.emit(f"{ty} {dst} = metal::mulhi({a}, {b});")
     else:
         sym = _ARITH_OP.get(kind)
         if sym is None:

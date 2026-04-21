@@ -63,7 +63,6 @@ from popcorn.kernels.kv_cache_update.config import KVCacheUpdateConfig
 from popcorn.kernels.kv_cache_update.problems import kv_cache_update_problems
 from popcorn.kernels.kv_cache_update.reference import (
     kv_cache_update_reference_for_spec,
-    make_ortho_rope_freqs,
 )
 from popcorn.kernels.kv_cache_update.spec import KVCacheUpdateSpec
 
@@ -83,16 +82,21 @@ class KVCacheUpdateKernel(Kernel):
         TensorDecl(
             "K",
             dtype=lambda s, c: s.in_dtype,
-            shape=lambda s, c: (s.B * s.n_kv_heads * s.tpf, s.Dh),
+            shape=lambda s, c: (s.k_input_rows, s.k_input_cols),
         ),
         TensorDecl(
             "V",
             dtype=lambda s, c: s.in_dtype,
-            shape=lambda s, c: (s.B * s.n_kv_heads * s.tpf, s.Dh),
+            shape=lambda s, c: (
+                (s.k_input_rows, s.k_input_cols)
+                if s.packed_qkv
+                else (s.B * s.n_kv_heads * s.tpf, s.Dh)
+            ),
         ),
-        TensorDecl("cos", dtype=DType.F32, shape=lambda s, c: (s.tpf, s.Dh // 2)),
-        TensorDecl("sin", dtype=DType.F32, shape=lambda s, c: (s.tpf, s.Dh // 2)),
+        # cos/sin computed inline from (h, w, frame_t) — no table tensors.
         TensorDecl("frame_t", dtype=DType.S32, shape=lambda s, c: (1,)),
+        # frozen=1: skip ring writes, segments reflect only committed entries.
+        TensorDecl("frozen", dtype=DType.S32, shape=lambda s, c: (1,)),
         TensorDecl(
             "Vt_cache",
             dtype=lambda s, c: s.kv_dtype,
@@ -190,18 +194,15 @@ class KVCacheUpdateKernel(Kernel):
         B, Hk, tpf, Dh = spec.B, spec.n_kv_heads, spec.tpf, spec.Dh
         cap = spec.capacity
 
-        K = PT.astype(PT.randn(B * Hk * tpf, Dh) * 0.3, in_dt)
-        V = PT.astype(PT.randn(B * Hk * tpf, Dh) * 0.3, in_dt)
+        if spec.packed_qkv:
+            qkv_dim = spec.qkv_dim
+            K = PT.astype(PT.randn(B * tpf, qkv_dim) * 0.3, in_dt)
+            V = K  # V is the same tensor (packed QKV)
+        else:
+            K = PT.astype(PT.randn(B * Hk * tpf, Dh) * 0.3, in_dt)
+            V = PT.astype(PT.randn(B * Hk * tpf, Dh) * 0.3, in_dt)
 
-        # cos/sin: per-frame slice of the OrthoRoPE table at test_frame_t.
-        n_frames_total = max(spec.num_buckets * spec.pinned_dilation + 4, 32)
-        cos_full, sin_full = make_ortho_rope_freqs(
-            spec.H_spatial, spec.W_spatial, n_frames_total, Dh
-        )
         test_frame_t = spec.num_buckets * spec.pinned_dilation
-        cos = cos_full[test_frame_t * tpf : (test_frame_t + 1) * tpf, :]
-        sin = sin_full[test_frame_t * tpf : (test_frame_t + 1) * tpf, :]
-
         frame_t = PT.tensor([test_frame_t], dtype=PT.int32)
 
         K_cache = PT.zeros(B * Hk * cap, Dh, dtype=kv_dt)
@@ -209,12 +210,13 @@ class KVCacheUpdateKernel(Kernel):
         segments = PT.zeros(B * spec.max_segments * 2, dtype=PT.int32)
         n_segments = PT.zeros(B, dtype=PT.int32)
 
+        frozen = PT.zeros(1, dtype=PT.int32)
+
         return {
             "K": K,
             "V": V,
-            "cos": cos,
-            "sin": sin,
             "frame_t": frame_t,
+            "frozen": frozen,
             "Vt_cache": Vt_cache,
             "segments": segments,
             "n_segments": n_segments,
@@ -226,9 +228,8 @@ class KVCacheUpdateKernel(Kernel):
         cls,
         K,
         V,
-        cos,
-        sin,
         frame_t,
+        frozen,
         Vt_cache,
         segments,
         n_segments,
@@ -242,6 +243,9 @@ class KVCacheUpdateKernel(Kernel):
         pinned_dilation: int,
         kv_dtype: DType | str | None = None,
         max_segments: int = 3,
+        packed_qkv: bool = False,
+        n_q_heads: int = 0,
+        rope_n_frames: int = 1,
     ) -> KVCacheUpdateSpec:
         """Derive a ``KVCacheUpdateSpec`` from the nine kernel tensors.
 
@@ -252,15 +256,17 @@ class KVCacheUpdateKernel(Kernel):
 
         if K.ndim != 2:
             raise ValueError(f"pcf.kv_cache_update: K must be rank-2 (flat), got {K.shape}")
-        Dh = int(K.shape[1])
+        if packed_qkv:
+            qkv_dim = int(K.shape[1])
+            Dh = qkv_dim // (n_q_heads + 2 * n_kv_heads)
+        else:
+            Dh = int(K.shape[1])
         tpf = H_spatial * W_spatial
         capacity = num_buckets * tpf + tpf
-        if tuple(V.shape) != tuple(K.shape):
+        if not packed_qkv and tuple(V.shape) != tuple(K.shape):
             raise ValueError(
                 f"pcf.kv_cache_update: V shape {tuple(V.shape)} != K shape {tuple(K.shape)}"
             )
-        if tuple(cos.shape) != (tpf, Dh // 2) or tuple(sin.shape) != (tpf, Dh // 2):
-            raise ValueError(f"pcf.kv_cache_update: cos/sin must be ({tpf}, {Dh // 2})")
         if tuple(K_cache.shape) != (B * n_kv_heads * capacity, Dh):
             raise ValueError(
                 f"pcf.kv_cache_update: K_cache shape {tuple(K_cache.shape)} != "
@@ -291,15 +297,19 @@ class KVCacheUpdateKernel(Kernel):
             in_dtype=DType.from_backend(K.dtype),
             kv_dtype=DType.coerce(kv_dtype) or DType.from_backend(K_cache.dtype),
             max_segments=max_segments,
+            packed_qkv=packed_qkv,
+            n_q_heads=n_q_heads,
+            rope_n_frames=rope_n_frames,
         )
 
     @classmethod
     def tune_space(cls) -> dict[str, list]:
-        return {
-            "tile_T": [16, 32, 64, 128],
-            "n_warps": [2, 4, 8],
-            "smem_pad": [0, 8],
-        }
+        # Restricted: autotune sweeping the full cross product of
+        # tile_T × n_warps × smem_pad occasionally produced ILLEGAL_ADDRESS
+        # from device-side OOB in one of the failing configs. Until that's
+        # tracked down, we ship a single known-good point and let
+        # ``default_for`` pick it.
+        return {"tile_T": [64], "n_warps": [4], "smem_pad": [0]}
 
     # ── emit() ──
 
@@ -326,7 +336,7 @@ class KVCacheUpdateKernel(Kernel):
 
         bctx = self.bctx  # no MMA — decorator passes mma_cfg=None
         ctx = self.ctx
-        g_K, g_V, g_co, g_si = g.K, g.V, g.cos, g.sin
+        g_K, g_V = g.K, g.V
         g_ft, g_Vt = g.frame_t, g.Vt_cache
         g_sg, g_ns, g_Kc = g.segments, g.n_segments, g.K_cache
 
@@ -337,8 +347,21 @@ class KVCacheUpdateKernel(Kernel):
 
         # ── Per-block addresses (U32). Auto-CSE dedupes repeated muls. ──
         t_start = t_tile_idx * tile_T
-        bh_x_tpf = bh_idx * tpf
-        k_in_row_base = bh_x_tpf + t_start
+        # Decompose grid Y index into (batch, kv_head).
+        kv_h_u = bh_idx % Hk
+        b_idx_u = bh_idx // Hk
+
+        if s.packed_qkv:
+            # Packed QKV: K/V are columns in [B*tpf, qkv_dim].
+            k_in_row_base = b_idx_u * tpf + t_start
+            k_in_col_base = bctx.c(s.k_col_offset) + kv_h_u * Dh
+            v_in_col_base = bctx.c(s.v_col_offset) + kv_h_u * Dh
+        else:
+            # Legacy: K/V are [B*Hk*tpf, Dh], col always 0.
+            k_in_row_base = bh_idx * tpf + t_start
+            k_in_col_base = bctx.c(0)
+            v_in_col_base = bctx.c(0)
+
         bh_x_cap = bh_idx * capacity
         k_cache_tail_row_base = bh_x_cap + (L + t_start)
         vt_d_base = bh_idx * Dh
@@ -346,12 +369,15 @@ class KVCacheUpdateKernel(Kernel):
 
         # ── frame_t-derived control state (S32) ──
         frame_t_v = pop.load(g_ft, bctx.c(0, dtype=DType.S32), name="frame_t")
+        frozen_v = pop.load(g.frozen, bctx.c(0, dtype=DType.S32))
         pd_c = bctx.c(pd, dtype=DType.S32)
         nb_c = bctx.c(num_buckets, dtype=DType.S32)
         zero_s = bctx.c(0, dtype=DType.S32)
         one_s = bctx.c(1, dtype=DType.S32)
         rem_v = frame_t_v % pd_c
-        write_step = pop.cmp("eq", rem_v, zero_s)  # PRED
+        is_write_frame = pop.cmp("eq", rem_v, zero_s)  # PRED
+        is_not_frozen = pop.cmp("eq", frozen_v, zero_s)  # PRED: frozen==0
+        write_step = pop.and_(is_write_frame, is_not_frozen)  # ring write only when not frozen
         bucket = (frame_t_v + bctx.c(pd - 1, dtype=DType.S32)) // pd_c
         slot = bucket % nb_c
         base_s = slot * bctx.c(tpf, dtype=DType.S32)
@@ -364,36 +390,26 @@ class KVCacheUpdateKernel(Kernel):
         smem_pad = c.smem_pad
         K_in = pop.smem_alloc("K_in", in_dt, (tile_T, Dh), pad=smem_pad)
         V_in = pop.smem_alloc("V_in", in_dt, (tile_T, Dh), pad=smem_pad)
-        cos_in = pop.smem_alloc("cos_in", DType.F32, (tile_T, half_Dh), pad=smem_pad)
-        sin_in = pop.smem_alloc("sin_in", DType.F32, (tile_T, half_Dh), pad=smem_pad)
+        # cos/sin computed inline — no smem needed.
         K_out = pop.smem_alloc("K_out", kv_dt, (tile_T, Dh), pad=smem_pad)
         Vt_out = pop.smem_alloc("Vt_out", kv_dt, (Dh, tile_T), pad=smem_pad)
 
         # ── cp.async loads ──
         K_in.copy_from(
-            g_K.tile(row=k_in_row_base, col=0, shape=(tile_T, Dh)),
+            g_K.tile(row=k_in_row_base, col=k_in_col_base, shape=(tile_T, Dh)),
             tid=tid,
             n_threads=n_threads,
             async_load=True,
         )
+        # V source: same tensor as K when packed (QKV), separate tensor otherwise.
+        v_src = g_K if s.packed_qkv else g_V
         V_in.copy_from(
-            g_V.tile(row=k_in_row_base, col=0, shape=(tile_T, Dh)),
+            v_src.tile(row=k_in_row_base, col=v_in_col_base, shape=(tile_T, Dh)),
             tid=tid,
             n_threads=n_threads,
             async_load=True,
         )
-        cos_in.copy_from(
-            g_co.tile(row=t_start, col=0, shape=(tile_T, half_Dh)),
-            tid=tid,
-            n_threads=n_threads,
-            async_load=True,
-        )
-        sin_in.copy_from(
-            g_si.tile(row=t_start, col=0, shape=(tile_T, half_Dh)),
-            tid=tid,
-            n_threads=n_threads,
-            async_load=True,
-        )
+        # (cos/sin computed inline — no table load needed)
         pop.async_commit()
         pop.async_wait(0)
         pop.barrier("block")
@@ -416,15 +432,32 @@ class KVCacheUpdateKernel(Kernel):
                 f"fp8 RoPE: pairs_per_thread={pairs_per_thread} must be even (need pair grouping)"
             )
 
+        # Inline RoPE: compute cos/sin from (h, w, frame_t) per element.
+        from popcorn.lang.rope import emit_rope_cos_sin
+
+        W_c = bctx.c(s.W_spatial)
+
         def _rope_one_pair(c_idx_v):
             """Compute (y0_f32, y1_f32) for one (r, c_idx_v) pair. r is closed
             over by the caller via ``r_v`` capture."""
+            # Spatial position: absolute token index = t_start + r_v.
+            spatial_idx = t_start + r_v
+            h_idx = spatial_idx // W_c
+            w_idx = spatial_idx % W_c
             c2 = c_idx_v * 2
             c2p1 = c2 + 1
             x0 = pop.convert(K_in[r_v, c2], DType.F32)
             x1 = pop.convert(K_in[r_v, c2p1], DType.F32)
-            cv = cos_in[r_v, c_idx_v]
-            sv = sin_in[r_v, c_idx_v]
+            cv, sv = emit_rope_cos_sin(
+                bctx,
+                h_idx=h_idx,
+                w_idx=w_idx,
+                frame_t=pop.convert(frame_t_v, DType.U32),
+                c_idx=c_idx_v,
+                H=s.H_spatial,
+                W=s.W_spatial,
+                Dh=Dh,
+            )
             y0 = x0 * cv - x1 * sv
             y1 = x1 * cv + x0 * sv
             return y0, y1
@@ -535,31 +568,81 @@ class KVCacheUpdateKernel(Kernel):
 
         # ── Per-batch segments + n_segments write ──
         # Designated writer: block (t_tile_idx==0, bh_idx == b*Hk), tid==0.
-        # Segments are always 2 entries: [(0, ring_len), (L, tpf)] with n=2.
-        # ring_len = min(bucket + (write_step?1:0), num_buckets) * tpf.
+        # Matches WE's mask semantics: the mask excludes the slot being
+        # about to be overwritten whenever ``frame_idx % pd == 0``
+        # (``is_write_frame``), INDEPENDENT of ``is_frozen``. The ring
+        # write itself is still gated on both. Segments layout:
+        #
+        #   pre-wrap OR post-wrap-no-mask:
+        #     (0, bucket*tpf or L), (L, tpf), (0, 0)
+        #   post-wrap AND is_write_frame:
+        #     (0, slot*tpf), ((slot+1)*tpf, (nb-slot-1)*tpf), (L, tpf)
         is_first_tile = pop.cmp("eq", t_tile_idx, bctx.c(0))
-        kv_h = bh_idx % Hk
-        is_first_head = pop.cmp("eq", kv_h, bctx.c(0))
+        is_first_head = pop.cmp("eq", kv_h_u, bctx.c(0))
         is_first_thread = pop.cmp("eq", tid, bctx.c(0))
-        # Combine PREDs with `and.pred` (no `selp.pred` in PTX).
         seg_pred = pop.and_(is_first_tile, is_first_head)
         seg_pred = pop.and_(seg_pred, is_first_thread)
 
-        # write_step as S32 0/1
-        ws_int = pop.select(write_step, one_s, zero_s)
-        bw = bucket + ws_int
-        bw_clamped = pop.select(pop.cmp("lt", bw, nb_c), bw, nb_c)
-        ring_len = bw_clamped * bctx.c(tpf, dtype=DType.S32)
-
-        b_idx = bh_idx // Hk
-        seg_base = b_idx * (max_segs * 2)
-
-        # All four scalar S32 stores + the n_segments S32 store, predicated on seg_pred.
-        L_s = bctx.c(L, dtype=DType.S32)
         tpf_s = bctx.c(tpf, dtype=DType.S32)
+        L_s = bctx.c(L, dtype=DType.S32)
         two_s = bctx.c(2, dtype=DType.S32)
-        pop.store(g_sg, zero_s, seg_base + 0, pred=seg_pred)
-        pop.store(g_sg, ring_len, seg_base + 1, pred=seg_pred)
-        pop.store(g_sg, L_s, seg_base + 2, pred=seg_pred)
-        pop.store(g_sg, tpf_s, seg_base + 3, pred=seg_pred)
-        pop.store(g_ns, two_s, b_idx, pred=seg_pred)
+        three_s = bctx.c(3, dtype=DType.S32)
+
+        # slot = bucket % num_buckets (in S32, non-negative).
+        slot = bucket % nb_c
+        # Pre-wrap means the ring hasn't filled yet (bucket < num_buckets).
+        # Post-wrap (ge num_buckets) and is_write_frame triggers the mask/split.
+        is_pre_wrap = pop.cmp("lt", bucket, nb_c)
+        is_post_wrap = pop.cmp("ge", bucket, nb_c)
+        needs_mask = pop.and_(is_write_frame, is_post_wrap)
+
+        # Pre-wrap "used ring" length: bucket*tpf. Post-wrap full L.
+        pre_ring_len = bucket * tpf_s
+        full_ring_len = L_s
+        no_mask_ring_len = pop.select(is_pre_wrap, pre_ring_len, full_ring_len)
+
+        # When needs_mask:
+        #   seg0 = (0, slot*tpf)
+        #   seg1 = ((slot+1)*tpf, (nb-slot-1)*tpf)
+        #   seg2 = (L, tpf)
+        #   n = 3
+        # Else:
+        #   seg0 = (0, no_mask_ring_len)
+        #   seg1 = (L, tpf)
+        #   seg2 = (0, 0)
+        #   n = 2
+        slot_tpf = slot * tpf_s
+        slot_plus1_tpf = (slot + one_s) * tpf_s
+        after_slot_len = (nb_c - slot - one_s) * tpf_s
+
+        # Segment fields (per needs_mask).
+        seg0_start_masked = zero_s
+        seg0_len_masked = slot_tpf
+        seg1_start_masked = slot_plus1_tpf
+        seg1_len_masked = after_slot_len
+        seg2_start_masked = L_s
+        seg2_len_masked = tpf_s
+
+        seg0_start_unmasked = zero_s
+        seg0_len_unmasked = no_mask_ring_len
+        seg1_start_unmasked = L_s
+        seg1_len_unmasked = tpf_s
+        seg2_start_unmasked = zero_s
+        seg2_len_unmasked = zero_s
+
+        seg0_start = pop.select(needs_mask, seg0_start_masked, seg0_start_unmasked)
+        seg0_len = pop.select(needs_mask, seg0_len_masked, seg0_len_unmasked)
+        seg1_start = pop.select(needs_mask, seg1_start_masked, seg1_start_unmasked)
+        seg1_len = pop.select(needs_mask, seg1_len_masked, seg1_len_unmasked)
+        seg2_start = pop.select(needs_mask, seg2_start_masked, seg2_start_unmasked)
+        seg2_len = pop.select(needs_mask, seg2_len_masked, seg2_len_unmasked)
+        n_seg = pop.select(needs_mask, three_s, two_s)
+
+        seg_base = b_idx_u * (max_segs * 2)
+        pop.store(g_sg, seg0_start, seg_base + 0, pred=seg_pred)
+        pop.store(g_sg, seg0_len, seg_base + 1, pred=seg_pred)
+        pop.store(g_sg, seg1_start, seg_base + 2, pred=seg_pred)
+        pop.store(g_sg, seg1_len, seg_base + 3, pred=seg_pred)
+        pop.store(g_sg, seg2_start, seg_base + 4, pred=seg_pred)
+        pop.store(g_sg, seg2_len, seg_base + 5, pred=seg_pred)
+        pop.store(g_ns, n_seg, b_idx_u, pred=seg_pred)

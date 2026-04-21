@@ -412,8 +412,11 @@ def _atomic_add_dtypes_for_cuda(cc_major: int, cc_minor: int) -> frozenset:
     # that added f16x2 vector atomics.
     if cc_major >= 7:
         dts.add(DType.F16)
-    # bf16 scalar atomic add is sm_90+ (Hopper).
-    if cc_major >= 9:
+    # bf16 scalar atomic-add: Blackwell (sm_100+) only. Hopper (sm_90)
+    # exposes bf16x2 red.add but not a clean scalar bf16 atomic — we
+    # gate the whole dtype here so split-K GEMMs with bf16 output only
+    # enumerate on arches where atomic accumulation is actually cheap.
+    if cc_major >= 10:
         dts.add(DType.BF16)
     return frozenset(dts)
 
@@ -427,9 +430,9 @@ def _atomic_add_vector_for_cuda(cc_major: int, cc_minor: int) -> frozenset[tuple
         # red.add.noftz.f16x2 — Volta+. Reliable way to atomic-accumulate
         # packed fp16 epilogues.
         caps.add((DType.F16, 2))
-    if cc_major >= 9:
-        # red.add.noftz.bf16x2 — Hopper+. Matching pattern for bf16
-        # packed epilogues (the moe_outproj scatter target).
+    if cc_major >= 10:
+        # red.add.noftz.bf16x2 on Blackwell — matches the scalar bf16
+        # gate above so split-K with bf16 out stays consistent.
         caps.add((DType.BF16, 2))
     return frozenset(caps)
 

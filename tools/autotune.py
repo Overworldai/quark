@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Registry-driven kernel autotuner — CLI wrapper over ``popcorn.autotune.genetic_search``.
+"""Registry-driven kernel autotuner — CLI wrapper over ``AutotuneCache``.
 
 For each (kernel, problem), runs a full genetic search (warm-seeded from
 existing on-disk configs) and saves the winner to ``configs/``.
@@ -40,25 +40,13 @@ def _config_to_dict(cfg) -> dict:
     return {k: getattr(cfg, k) for k in dir(cfg) if not k.startswith("_")}
 
 
-def _time_kernel(compiled, buffers, *, warmup_ms=10.0, bench_ms=50.0) -> float:
-    """Budget-based timing — dispatches through PT."""
-    from popcorn.backend import PT
-
-    return PT.time_callable(
-        lambda: compiled.launch(buffers=buffers),
-        warmup_ms=warmup_ms,
-        bench_ms=bench_ms,
-    )
-
-
 # ── PTX-dump compile-error hook ──────────────────────────────────────
 
 
 def _make_ptx_error_hook():
     """Return a closure that deduplicates PTX dumps across compile errors.
 
-    Passed as ``on_compile_error`` to ``popcorn.autotune._parallel_compile``
-    via the ``compile_batch_fn`` wrapper in ``autotune_one``.
+    Attached to ``AutotuneCache._compile_error_hook`` in ``autotune_one``.
     """
     dumped: dict[tuple[str, str], str] = {}
 
@@ -99,8 +87,6 @@ def autotune_one(
     seed: int,
     max_workers: int | None,
 ) -> None:
-    from popcorn.autotune import _parallel_compile as _pc
-    from popcorn.autotune import genetic_search
     from popcorn.utils.pretty import print_header, style
 
     name = kernel_cls.NAME
@@ -134,69 +120,49 @@ def autotune_one(
         if pinned:
             print(f"  [problem config_overrides: {', '.join(pinned)}]")
 
-    # Build tensors + reference. Reference always uses the plain (un-
-    # shuffled) tensors — per-config launch tensors are built inside
-    # genetic_search via ``kernel.prepare_launch_tensors``.
     default_kernel = kernel_cls.from_problem(problem.params)
-    po_overrides = getattr(problem, "config_overrides", None) or {}
-    if po_overrides:
-        import dataclasses as _dc
-
-        default_kernel.config = _dc.replace(default_kernel.config, **po_overrides)
-    try:
-        tensors = kernel_cls.make_tensors(problem.params)
-    except Exception as e:
-        print(f"  SKIP: make_tensors failed: {e!s:.60s}")
-        return
-
-    pspec = default_kernel.param_spec()
-    buffers = [tensors[b.name] for b in pspec.buffers]
-    out_idx = kernel_cls.OUTPUT_IDX
-    if out_idx < 0:
-        out_idx = len(buffers) + out_idx
-    inputs = [buffers[i] for i in range(len(buffers)) if i != out_idx]
-    try:
-        reference = default_kernel.reference(*inputs)
-    except Exception as e:
-        print(f"  SKIP: reference failed: {e!s:.60s}")
-        return
-
     spec = spec_cls(**problem.params) if spec_cls is not None else None
     print(f"  tune_space: {tune_space}")
 
-    # PTX-dump wrapper around the shared _parallel_compile.
-    ptx_hook = _make_ptx_error_hook()
-
-    def _compile_batch(kernel_cls_, spec_, configs_, launcher_, *, knob_names, max_workers=None):
-        return _pc(
-            kernel_cls_,
-            spec_,
-            configs_,
-            launcher_,
-            knob_names=knob_names,
-            max_workers=max_workers,
-            on_compile_error=ptx_hook,
-        )
-
-    result = genetic_search(
-        kernel_cls,
-        spec,
-        tune_space,
-        launcher,
-        tensors=tensors,
-        reference=reference,
-        out_idx=out_idx,
-        seeds=None,
-        compile_batch_fn=_compile_batch,
-        pop_size=pop_size,
-        n_gens=n_gens,
-        early_stop_gens=early_stop_gens,
-        mutate_prob=mutate_prob,
-        rng_seed=seed,
-        bench_ms=bench_ms,
-        max_workers=max_workers,
-        verbose=True,
+    # Temporarily route the shared cache through tools/autotune's tuning
+    # overrides (pop size, gens, PTX-dump hook), run the full search,
+    # then restore the defaults so subsequent calls to the same cache
+    # aren't affected.
+    cache = launcher._autotune
+    prev = (
+        cache.pop_size,
+        cache.n_gens,
+        cache.early_stop_gens,
+        cache.mutate_prob,
+        cache.rng_seed,
+        cache.bench_ms,
+        cache.max_workers,
+        cache._compile_error_hook,
     )
+    cache.pop_size = pop_size
+    cache.n_gens = n_gens
+    cache.early_stop_gens = early_stop_gens
+    cache.mutate_prob = mutate_prob
+    cache.rng_seed = seed
+    cache.bench_ms = bench_ms
+    cache.max_workers = max_workers
+    cache._compile_error_hook = _make_ptx_error_hook()
+
+    os.environ["POPCORN_AUTOTUNE_VERBOSE"] = "1"
+    try:
+        seeds = cache._load_warm_seeds(kernel_cls, spec)
+        result = cache._search_full_result(kernel_cls, spec, seeds, tune_space=tune_space)
+    finally:
+        (
+            cache.pop_size,
+            cache.n_gens,
+            cache.early_stop_gens,
+            cache.mutate_prob,
+            cache.rng_seed,
+            cache.bench_ms,
+            cache.max_workers,
+            cache._compile_error_hook,
+        ) = prev
 
     if result is None:
         print("  NO valid+correct configs found")

@@ -12,14 +12,8 @@ in f32 (the kernel output is always f32; caller casts as needed).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
-
-from popcorn.backend import PT
-from popcorn.functional._dispatch import call_with_bindings, make_autotune, torch_op
+from popcorn.functional._dispatch import call_with_bindings, make_autotune
 from popcorn.kernels import get
-
-if TYPE_CHECKING:
-    import torch
 
 _Cls = None
 
@@ -73,19 +67,18 @@ def _impl(
     return result["output"]
 
 
-@torch_op("popcorn::moe_outproj", mutates_args=())
 def moe_outproj(
-    h_in: torch.Tensor,
-    W_out: torch.Tensor,
-    token_ids: torch.Tensor,
-    slot_weights: torch.Tensor,
-    work_list: torch.Tensor,
-    M: int,
-    n_experts: int,
-    top_k: int = 2,
-    out_dtype: str = "bf16",
-    compute_dtype: Optional[str] = None,
-) -> torch.Tensor:
+    h_in,
+    W_out,
+    token_ids,
+    slot_weights,
+    work_list,
+    M,
+    n_experts,
+    top_k=2,
+    out_dtype="bf16",
+    compute_dtype=None,
+):
     return _impl(
         h_in,
         W_out,
@@ -100,44 +93,4 @@ def moe_outproj(
     )
 
 
-@moe_outproj.register_fake
-def _(
-    h_in,
-    W_out,
-    token_ids,
-    slot_weights,
-    work_list,
-    M,
-    n_experts,
-    top_k=2,
-    out_dtype="bf16",
-    compute_dtype=None,
-):
-    import torch
-
-    cls = _cls()
-    spec = cls.spec_from_tensors(
-        h_in,
-        W_out,
-        token_ids,
-        slot_weights,
-        work_list,
-        M=M,
-        n_experts=n_experts,
-        top_k=top_k,
-        out_dtype=out_dtype,
-        compute_dtype=compute_dtype,
-    )
-    cfg = cls.CONFIG_CLS.default_for(spec)
-    out_decl = next(d for d in cls.TENSORS if d.name == "output")
-    shape = out_decl.shape(spec, cfg)
-    dtype = PT.ir_dtype_to_backend(out_decl.dtype(spec, cfg))
-    return torch.empty(tuple(shape), dtype=dtype, device=h_in.device)
-
-
-@moe_outproj.register_autograd
-def _(ctx, grad_out):
-    raise NotImplementedError("popcorn.functional.moe_outproj: backward not implemented.")
-
-
-moe_outproj.autotune = make_autotune(_impl, _cls)
+moe_outproj.autotune = make_autotune(_impl, _cls)  # ty: ignore[unresolved-attribute]

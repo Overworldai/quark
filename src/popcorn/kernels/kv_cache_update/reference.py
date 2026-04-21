@@ -56,25 +56,35 @@ def compute_segments(
 ):
     """Compute valid (start, length) segments after this step's write.
 
-    Layout: ring [0, L), tail [L, capacity).
-      - tail is always valid (current frame).
-      - ring buckets visited so far are valid; physical buffer is
-        circular so they form at most 2 contiguous runs.
+    Matches WE's mask semantics:
+      - Always attend to tail [L, capacity).
+      - Attend to ring slots [0, bucket) when not wrapped.
+      - After wrap, attend to all ring slots EXCEPT slot % nb when
+        ``frame_t % pd == 0`` (the "about to be overwritten" slot).
 
-    Returns ``(segments[max_segments, 2] int32, n_segments int)`` on the
-    active backend.
+    Returns ``(segments[max_segments, 2] int32, n_segments int)``.
     """
-    bucket_now = (frame_t + pinned_dilation - 1) // pinned_dilation
-    write_step = (frame_t % pinned_dilation) == 0
-    buckets_written = min(bucket_now + (1 if write_step else 0), num_buckets)
-    ring_len = buckets_written * tpf
+    bucket = (frame_t + pinned_dilation - 1) // pinned_dilation
+    is_write_frame = (frame_t % pinned_dilation) == 0
+    is_post_wrap = bucket >= num_buckets
+    slot = bucket % num_buckets
 
-    # Build the [max_segments, 2] table as a Python list then bounce
-    # through PT.tensor — avoids needing a polymorphic scatter-into-
-    # zero-tensor helper for a four-element initialisation.
-    rows = [[0, ring_len], [L, tpf]]
+    if is_post_wrap and is_write_frame:
+        # Split the full ring around the excluded slot.
+        rows = [
+            [0, slot * tpf],
+            [(slot + 1) * tpf, (num_buckets - slot - 1) * tpf],
+            [L, tpf],
+        ]
+        n = 3
+    else:
+        # One contiguous ring run + tail.
+        ring_len = min(bucket, num_buckets) * tpf
+        rows = [[0, ring_len], [L, tpf]]
+        n = 2
+
     rows.extend([[0, 0]] * (max_segments - len(rows)))
-    return PT.tensor(rows, dtype=PT.int32), 2
+    return PT.tensor(rows, dtype=PT.int32), n
 
 
 def kv_cache_update_reference(
@@ -205,22 +215,42 @@ def make_ortho_rope_freqs(
 
 
 def kv_cache_update_reference_for_spec(
-    kernel, K, V, cos, sin, frame_t, Vt_cache, segments, n_segments
+    kernel, K, V, frame_t, frozen, Vt_cache, segments, n_segments
 ):
     """Run the reference and return a fresh K_cache tensor.
 
-    ``kv_cache_update_reference`` returns fresh tensors on MLX (arrays
-    are immutable), so we must capture and reshape its return — the
-    caller-visible ``K_cache`` is the returned value, not the zero
-    buffer we fed in.
+    Inline RoPE: cos/sin computed from (H, W, frame_t, Dh).
+    Signature matches TENSORS minus output (K_cache): K, V, frame_t,
+    Vt_cache, segments, n_segments.
     """
     s = kernel.spec
     kv_dt = s.kv_dtype.backend
-    K_cache_init = PT.zeros(s.B, s.n_kv_heads, s.capacity, s.Dh, dtype=kv_dt)
     ft = int(frame_t.item() if hasattr(frame_t, "item") else frame_t[0])
+
+    # Compute cos/sin from frame_t via the vectorized ortho-RoPE helper.
+    cos_full, sin_full = make_ortho_rope_freqs(s.H_spatial, s.W_spatial, ft + 1, s.Dh)
+    cos = cos_full[ft * s.tpf : (ft + 1) * s.tpf, :]
+    sin = sin_full[ft * s.tpf : (ft + 1) * s.tpf, :]
+
+    # Extract K/V from packed QKV if needed.
+    if s.packed_qkv:
+        Hk, Dh = s.n_kv_heads, s.Dh
+        k_start = s.k_col_offset
+        v_start = s.v_col_offset
+        K_flat = K[:, k_start : k_start + Hk * Dh]  # [B*tpf, Hk*Dh]
+        V_flat = K[:, v_start : v_start + Hk * Dh]  # [B*tpf, Hk*Dh] (V from same packed tensor)
+        K_4d = K_flat.reshape(s.B, s.tpf, Hk, Dh)
+        K_4d = PT.permute(K_4d, (0, 2, 1, 3))  # [B, Hk, tpf, Dh]
+        V_4d = V_flat.reshape(s.B, s.tpf, Hk, Dh)
+        V_4d = PT.permute(V_4d, (0, 2, 1, 3))  # [B, Hk, tpf, Dh]
+    else:
+        K_4d = K.reshape(s.B, s.n_kv_heads, s.tpf, s.Dh)
+        V_4d = V.reshape(s.B, s.n_kv_heads, s.tpf, s.Dh)
+
+    K_cache_init = PT.zeros(s.B, s.n_kv_heads, s.capacity, s.Dh, dtype=kv_dt)
     K_cache_out, _Vt, _segs, _nsegs = kv_cache_update_reference(
-        K.reshape(s.B, s.n_kv_heads, s.tpf, s.Dh),
-        V.reshape(s.B, s.n_kv_heads, s.tpf, s.Dh),
+        K_4d,
+        V_4d,
         cos.reshape(s.tpf, s.Dh // 2),
         sin.reshape(s.tpf, s.Dh // 2),
         K_cache_init,

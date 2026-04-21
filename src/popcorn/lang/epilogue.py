@@ -97,6 +97,7 @@ def store_acc(
     col: Value | int,
     cast: DType | None = None,
     activation: str | None = None,
+    bias: GlobalTensor | None = None,
     stage_in_smem: bool = False,
     staging_smem: SharedRegion | None = None,
     smem_col_offset: Value | None = None,
@@ -106,6 +107,7 @@ def store_acc(
     warp_id: Value | None = None,
     kv_pad: int = 0,
     use_staging_smem: bool = True,
+    atomic: bool = False,
 ) -> None:
     """Store an accumulator tile result to ``dst`` at ``(row, col)``.
 
@@ -204,7 +206,9 @@ def store_acc(
         col_base=col,
         cast=cast or DType.F32,
         activation=activation,
+        bias=bias,
         row_scale=row_scale,
+        atomic=atomic,
     )
 
 
@@ -274,7 +278,9 @@ def _emit_scatter_store(
     col_base: Any,
     cast: DType,
     activation: str | None = None,
+    bias: GlobalTensor | None = None,
     row_scale: list[Value] | None = None,
+    atomic: bool = False,
 ) -> None:
     """Direct per-lane scalar scatter to gmem. Mirrors the legacy
     ``ScatterStore`` body byte-for-byte; no smem staging.
@@ -283,11 +289,18 @@ def _emit_scatter_store(
     element body so silu happens at the same MMA-frag-source the MSL
     lowerer requires (no separate FragForEach pass on derived values).
 
+    ``bias`` if provided: a 1-D ``[N]`` GlobalTensor whose element at
+    the output column is added to each accumulator element before
+    activation and cast. Fuses ``Out = matmul + bias`` into the
+    epilogue, eliminating a separate element-wise add pass.
+
     ``row_scale`` if provided: per-(mt, rc) Values whose reciprocal is
     multiplied into each element pre-cast (the attn ``O /= l`` epilogue).
     """
-    from popcorn.lang import convert, frag_for_each, rcp_approx
+    from popcorn.lang import convert, frag_for_each, load, rcp_approx
     from popcorn.lang import store as _scalar_store
+
+    _use_atomic = atomic
 
     cfg = bctx.mma_cfg
     shape_id = cfg.shape_id
@@ -297,6 +310,7 @@ def _emit_scatter_store(
     _col = bctx.c(col_base) if isinstance(col_base, int) else col_base
     log2e = bctx.c(_LOG2E) if activation == "silu" else None
     one = bctx.c(1.0) if activation == "silu" else None
+    _bias = bias
 
     rc_info = _rc_info(cfg) if row_scale is not None else None
     rcps = [rcp_approx(v) for v in row_scale] if row_scale is not None else None
@@ -311,14 +325,23 @@ def _emit_scatter_store(
             def fn(elem, row, col, *sels, _mt=mt_row_base, _nt=nt_col_base):
                 if sels:
                     elem = elem * sels[0]
+                gmem_col = _col + (_nt + col)
+                if _bias is not None:
+                    b_val = load(_bias, gmem_col)
+                    b_f32 = convert(b_val, DType.F32) if b_val.dtype != DType.F32 else b_val
+                    elem = elem + b_f32
                 if activation == "silu":
                     assert log2e is not None and one is not None
                     elem = _silu_scalar(elem, log2e, one)
                 if cast != DType.F32:
                     elem = convert(elem, cast)
                 gmem_row = _row + (_mt + row)
-                gmem_col = _col + (_nt + col)
-                _scalar_store(dst, elem, gmem_row, gmem_col)
+                if _use_atomic:
+                    from popcorn.lang import atomic_rmw
+
+                    atomic_rmw(dst, "add", elem, gmem_row, gmem_col)
+                else:
+                    _scalar_store(dst, elem, gmem_row, gmem_col)
 
             if rc_info is not None and rcps is not None:
                 n_rc, slot_to_selector_idx = rc_info

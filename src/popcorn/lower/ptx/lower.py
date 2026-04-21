@@ -358,6 +358,15 @@ class PtxLowerer:
         # Integer multiply needs .lo. Int div/rem use the same syntax.
         if kind == "mul" and (dtype.is_int or dtype.is_bit):
             instr = f"mul.lo.{suffix}"
+        elif kind == "mul_hi":
+            # Unsigned high half of 32×32→64 (used by Philox-family RNG).
+            # Emitted with the unsigned suffix regardless of the Value's
+            # declared int signedness — mul.hi is well-defined either way
+            # and we only need the unsigned variant for counter-based RNG.
+            hi_suf = {2: "u16", 4: "u32", 8: "u64"}.get(dtype.bytes)
+            if hi_suf is None:
+                raise NotImplementedError(f"mul_hi: unsupported dtype {dtype}")
+            instr = f"mul.hi.{hi_suf}"
         elif kind == "fma" and dtype.is_float:
             instr = f"fma.rn.{suffix}"
         elif kind in ("and", "or", "xor") and dtype is DType.PRED:
@@ -436,9 +445,11 @@ class PtxLowerer:
                 f"`builder.packed_convert(lo, hi, {dst_dtype})` to convert "
                 f"two source values at once."
             )
-        # Rounding mode only emitted when converting TO a narrower float.
+        # Rounding mode: required when converting to a narrower float OR
+        # when converting from integer to float (the integer value may
+        # not be exactly representable).
         round_prefix = ""
-        if dst_dtype.is_float and dst_dtype.bytes <= src_dtype.bytes:
+        if dst_dtype.is_float and (dst_dtype.bytes < src_dtype.bytes or src_dtype.is_int):
             round_prefix = f".{rounding}"
         ctx.emit(
             f"cvt{round_prefix}.{_cvt_suffix(dst_dtype)}.{_cvt_suffix(src_dtype)} {dst}, {src};"
@@ -581,23 +592,87 @@ class PtxLowerer:
     def _visit_vec_build(self, op: VecBuildOp, ctx: _FnCtx) -> None:
         """Pack N scalars into a width-N vec Value.
 
-        Zero emit: we just bind the result's component tuple to the
-        concat of each input scalar's (single) component tuple. A
-        subsequent VecStore or VecExtract reads the same regs.
+        When the element dtype is sub-register-width (e.g. BF16 scalars
+        packed into B32 registers), pairs of elements are merged via
+        ``mov.b32 dst, {lo, hi}`` to produce the physical register set.
+        Otherwise zero-emit: bind the result to the concat of input regs.
         """
         (out,) = op.results
-        names: list[str] = []
-        for operand in op.operands:
-            (single,) = ctx.regs.components(operand)
-            names.append(single)
-        ctx.regs.bind(out, tuple(names))
+        n_logical = len(op.operands)
+        elem_dt = op.operands[0].dtype
+        form = _vec_phys_form(n_logical, elem_dt)
+
+        if form is None or form[0] == n_logical:
+            # 1:1 mapping — no packing needed.
+            names: list[str] = []
+            for operand in op.operands:
+                (single,) = ctx.regs.components(operand)
+                names.append(single)
+            ctx.regs.bind(out, tuple(names))
+            return
+
+        v_width, reg_dt = form
+        pack_factor = n_logical // v_width
+
+        if pack_factor == 2:
+            # Merge pairs of B16 → B32.
+            packed: list[str] = []
+            for i in range(0, n_logical, 2):
+                (lo_r,) = ctx.regs.components(op.operands[i])
+                (hi_r,) = ctx.regs.components(op.operands[i + 1])
+                dst = ctx.regs.declare(reg_class(reg_dt))
+                ctx.emit(f"mov.b32 {dst}, {{{lo_r}, {hi_r}}};")
+                packed.append(dst)
+            ctx.regs._components[out.id] = tuple(packed)
+        else:
+            raise NotImplementedError(f"VecBuildOp: pack_factor={pack_factor} not yet supported")
 
     def _visit_vec_extract(self, op: VecExtractOp, ctx: _FnCtx) -> None:
-        """Expose one component of a vec Value as a scalar."""
+        """Expose one component of a vec Value as a scalar.
+
+        When the logical element dtype is sub-register-width (e.g. BF16
+        elements packed into B32 registers from a v4.b32 load), this
+        emits sub-register extraction: identify the physical register
+        containing the element and split it via ``mov.b32 {lo, hi}, reg``.
+        """
         (out,) = op.results
         src = op.operands[0]
         idx = op.attrs["index"]
-        ctx.regs.alias_component(out, src, idx)
+        phys_comps = ctx.regs.components(src)
+        n_phys = len(phys_comps)
+        n_logical = src.width
+
+        if n_phys == n_logical:
+            # 1:1 mapping — no packing.
+            ctx.regs.alias_component(out, src, idx)
+            return
+
+        # Packed: n_logical > n_phys. Each physical register holds
+        # pack_factor logical elements.
+        pack_factor = n_logical // n_phys
+        phys_idx = idx // pack_factor
+        sub_idx = idx % pack_factor
+        phys_reg = phys_comps[phys_idx]
+
+        if pack_factor == 2:
+            # B32 → 2 × B16. Split via mov.b32 {lo, hi}, reg.
+            lo = ctx.regs.declare("b16")
+            hi = ctx.regs.declare("b16")
+            ctx.emit(f"mov.b32 {{{lo}, {hi}}}, {phys_reg};")
+            ctx.regs.bind(out, (lo if sub_idx == 0 else hi,))
+        elif pack_factor == 4:
+            # B32 → 4 × U8/E4M3. Extract via byte shifts.
+            tmp = ctx.regs.declare("b32")
+            shift = sub_idx * 8
+            if shift > 0:
+                ctx.emit(f"shr.u32 {tmp}, {phys_reg}, {shift};")
+            else:
+                ctx.emit(f"mov.b32 {tmp}, {phys_reg};")
+            out_r = ctx.regs.declare("b16")
+            ctx.emit(f"cvt.u16.u32 {out_r}, {tmp};")
+            ctx.regs.bind(out, (out_r,))
+        else:
+            raise NotImplementedError(f"VecExtractOp: pack_factor={pack_factor} not supported")
 
     def _visit_split_b32(self, op: SplitB32Op, ctx: _FnCtx) -> None:
         """b32 → (lo_b16, hi_b16) via `mov.b32 {lo, hi}, src;`."""
@@ -758,20 +833,21 @@ class PtxLowerer:
             raise NotImplementedError(f"BarrierOp scope {scope!r}")
 
     def _visit_for_loop(self, op: ForLoopOp, ctx: _FnCtx) -> None:
-        # Layout (matches proposal §5.7 worked example):
+        # Layout — while loop (guard before first iteration):
         #
         #     mov.u32 iv, lo
         #     (for each carried_in[i]) mov.<cls> result[i], carried_in[i]
+        #     setp.lt.u32 p_guard, iv, hi
+        #     @!p_guard bra end_label
         #   loop_label:
         #     (body ops — carried_body_vars[i] aliased to result[i])
         #     (yield) mov.<cls> result[i], yielded[i]      # coalesce
         #     add.u32 iv, iv, step
         #     setp.lt.u32 p, iv, hi
         #     @p bra loop_label
+        #   end_label:
         #
-        # The results live outside the loop and are reused as the
-        # carried-in slots. carried_body_vars alias the result regs, so
-        # body ops that read them implicitly pick up the current value.
+        # The guard ensures zero-trip loops skip the body entirely.
         iv = op.induction_var
         assert iv is not None
         iv_reg = ctx.regs.name_for(iv)
@@ -791,6 +867,12 @@ class PtxLowerer:
             ctx.regs.alias(cbv, res)
             _emit_value_mov(ctx, res, cin)
 
+        # Guard: skip body entirely when lo >= hi (zero-trip loop).
+        end_label = ctx.fresh_label("LEND")
+        guard_pred = ctx.regs.declare("pred")
+        ctx.emit(f"setp.lt.{iv_cls} {guard_pred}, {iv_reg}, {ctx.regs.name_for(hi)};")
+        ctx.emit(f"@!{guard_pred} bra {end_label};")
+
         loop_label = ctx.fresh_label("L")
         ctx.emit_label(loop_label)
 
@@ -805,6 +887,7 @@ class PtxLowerer:
         ctx.emit(f"add.{iv_cls} {iv_reg}, {iv_reg}, {ctx.regs.name_for(step)};")
         ctx.emit(f"setp.lt.{iv_cls} {pred}, {iv_reg}, {ctx.regs.name_for(hi)};")
         ctx.emit(f"@{pred} bra {loop_label};")
+        ctx.emit_label(end_label)
 
     def _visit_if_region(self, op: IfRegionOp, ctx: _FnCtx) -> None:
         n_carried = op.attrs.get("n_carried", 0)
@@ -1048,8 +1131,12 @@ class PtxLowerer:
             cls = atomic_type
         else:
             cls = arith_suffix(value.dtype)
+        # f16/bf16/f16x2/bf16x2 atomic add requires .noftz qualifier.
+        noftz = ""
+        if atomic_op == "add" and value.dtype in (DType.F16, DType.BF16):
+            noftz = ".noftz"
         ctx.emit(
-            f"{prefix}atom.global.{atomic_op}.{cls} "
+            f"{prefix}atom.global.{atomic_op}{noftz}.{cls} "
             f"{ctx.regs.name_for(out)}, [{addr_expr}], {ctx.regs.name_for(value)};"
         )
 
@@ -1747,12 +1834,14 @@ _MATH_MNEMONIC: dict[str, str] = {
     "sqrt": "sqrt",
     "exp2": "ex2",
     "log2": "lg2",
-    "sin": "sin",
-    "cos": "cos",
+    "sin": "sin.approx",
+    "cos": "cos.approx",
     "tanh": "tanh",
     "ex2_approx": "ex2.approx",
     "rcp_approx": "rcp.approx",
     "rsqrt_approx": "rsqrt.approx",
+    "log2_approx": "lg2.approx",
+    "sqrt_approx": "sqrt.approx",
 }
 
 

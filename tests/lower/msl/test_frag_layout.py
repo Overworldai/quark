@@ -59,7 +59,7 @@ def _probe_layout(acc_dtype_metal: str, acc_dtype_mx) -> list[tuple[int, int, in
         ),
         ensure_row_contiguous=True,
     )
-    outs = kernel(  # ty: ignore[call-non-callable]
+    outs = kernel(
         inputs=[],
         template=[],
         grid=(32, 1, 1),
@@ -209,7 +209,7 @@ def test_write_via_thread_elements_round_trip():
         ),
         ensure_row_contiguous=True,
     )
-    outs = kernel(  # ty: ignore[call-non-callable]
+    outs = kernel(
         inputs=[],
         template=[],
         grid=(32, 1, 1),

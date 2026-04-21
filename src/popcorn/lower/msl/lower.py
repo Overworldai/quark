@@ -202,6 +202,8 @@ _MATH_FN: dict[str, str] = {
     "ex2_approx": "metal::fast::exp2",
     "rcp_approx": "metal::fast::divide",
     "rsqrt_approx": "metal::fast::rsqrt",
+    "log2_approx": "metal::fast::log2",
+    "sqrt_approx": "metal::fast::sqrt",
 }
 
 _CMP_OP: dict[str, str] = {

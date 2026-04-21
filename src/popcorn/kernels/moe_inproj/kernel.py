@@ -95,11 +95,15 @@ class MoeInprojKernel(Kernel):
             return False
         if not self._validate_gemm_tile(mma_cfg):
             return False
-        # MoE-specific: per-expert slot count must divide evenly into BM chunks.
+        compute_dt = s.compute_dtype_resolved
+        elem_b = compute_dt.bytes
+        if c.a_pad and ((c.BK + c.a_pad) * elem_b) % 16 != 0:
+            return False
+        if c.b_pad and ((c.BK + c.b_pad) * elem_b) % 16 != 0:
+            return False
         slots_per_expert = s.total_slots // s.n_experts
         if slots_per_expert % c.BM != 0:
             return False
-        # n_stages=2 requires even K iteration count (loop unrolled 2×)
         if c.n_stages == 2 and (s.D // c.BK) % 2 != 0:
             return False
         return True
