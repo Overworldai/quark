@@ -33,12 +33,9 @@ from __future__ import annotations
 import contextlib
 import weakref as _weakref
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any
 
 import numpy as np
-
-if TYPE_CHECKING:
-    import torch
 
 
 def shuffle_weights_e4m3_k16(
@@ -221,15 +218,45 @@ def shuffle_b_for_frag_load(W, K_CHUNK: int, mma_k: int):
       * ``K_CHUNK`` must be a multiple of ``mma_k``.
     """
     # Dispatch by input type:
-    #   * torch tensor: has data_ptr / device attrs.
-    #   * numpy: has .dtype.itemsize.
-    #   * MLX: has .dtype but dtype is mlx.core.Dtype without itemsize.
-    #     Route through numpy and reconstruct the mlx.array on return.
-    if hasattr(W, "data_ptr") and hasattr(W, "device"):
-        return _shuffle_torch(W, K_CHUNK, mma_k)
+    #   * PopcornTensor — has ``to_bytes`` + string dtype.
+    #   * MLX — has .dtype as mlx.core.Dtype.
+    #   * numpy — has .dtype.itemsize.
+    if hasattr(W, "to_bytes") and isinstance(getattr(W, "dtype", None), str):
+        return _shuffle_popcorn(W, K_CHUNK, mma_k)
     if _is_mlx_array(W):
         return _shuffle_mlx(W, K_CHUNK, mma_k)
     return _shuffle_numpy(W, K_CHUNK, mma_k)
+
+
+def _shuffle_popcorn(W, K_CHUNK: int, mma_k: int):
+    """PopcornTensor path — copy to numpy, shuffle, copy back."""
+    from popcorn.runtime.tensor import PopcornTensor
+
+    shape = tuple(W.shape)
+    # View as bytes via the raw copy-to-host.
+    raw = W.contiguous().to_bytes()
+    elem_bytes = W.nbytes // (W.numel() or 1)
+    N, K = shape
+    W_bytes = np.frombuffer(raw, dtype=np.uint8).reshape(N, K * elem_bytes).copy()
+    # Reshape + shuffle as in _shuffle_numpy, byte-level.
+    K_CHUNK_BYTES = K_CHUNK * elem_bytes
+    K_BYTES = K * elem_bytes
+    if K_BYTES % K_CHUNK_BYTES != 0 or N % 8 != 0:
+        raise ValueError(
+            f"shuffle_b_for_frag_load: shape {shape} not aligned to (8, K_CHUNK={K_CHUNK})"
+        )
+    n8_tiles = N // 8
+    n_k_tiles = K_BYTES // K_CHUNK_BYTES
+    W_tiled = W_bytes.reshape(n8_tiles, 8, n_k_tiles, K_CHUNK_BYTES)
+    W_tiled = np.ascontiguousarray(W_tiled.transpose(0, 2, 1, 3))
+    flat = W_tiled.reshape(n8_tiles * n_k_tiles, 8 * K_CHUNK_BYTES)
+    perm = _cached_perm_np(K_CHUNK, mma_k, elem_bytes)
+    out_flat = flat[:, perm]
+    out_tiled = out_flat.reshape(n8_tiles, n_k_tiles, 8, K_CHUNK_BYTES)
+    out_tiled = np.ascontiguousarray(out_tiled.transpose(0, 2, 1, 3))
+    out_bytes = out_tiled.reshape(N, K_BYTES)
+    # Back to device in the original dtype.
+    return PopcornTensor.from_bytes(out_bytes.tobytes(), shape, W.dtype)
 
 
 def _is_mlx_array(W) -> bool:
@@ -311,38 +338,6 @@ def _shuffle_numpy(W: np.ndarray, K_CHUNK: int, mma_k: int) -> np.ndarray:
     return out_tiled.reshape(N, K_BYTES).view(W.dtype).reshape(N, K)
 
 
-def _shuffle_torch(W, K_CHUNK: int, mma_k: int):
-    import torch
-
-    elem_bytes = W.element_size()
-    N, K = W.shape
-    K_CHUNK_BYTES = K_CHUNK * elem_bytes
-    K_BYTES = K * elem_bytes
-    if K_BYTES % K_CHUNK_BYTES != 0 or N % 8 != 0:
-        raise ValueError(
-            f"shuffle_b_for_frag_load: shape ({N}, {K}) not aligned to (8, K_CHUNK={K_CHUNK})"
-        )
-
-    orig_dtype = W.dtype
-    W_bytes = W.contiguous().view(torch.uint8).reshape(N, K_BYTES)
-    n8_tiles = N // 8
-    n_k_tiles = K_BYTES // K_CHUNK_BYTES
-
-    W_tiled = (
-        W_bytes.reshape(n8_tiles, 8, n_k_tiles, K_CHUNK_BYTES).permute(0, 2, 1, 3).contiguous()
-    )
-    flat = W_tiled.reshape(n8_tiles * n_k_tiles, 8 * K_CHUNK_BYTES)
-
-    perm_np = _cached_perm_np(K_CHUNK, mma_k, elem_bytes)
-    perm = torch.from_numpy(perm_np).to(W.device)
-    out_flat = flat[:, perm]
-
-    out_tiled = (
-        out_flat.reshape(n8_tiles, n_k_tiles, 8, K_CHUNK_BYTES).permute(0, 2, 1, 3).contiguous()
-    )
-    return out_tiled.reshape(N, K_BYTES).view(orig_dtype).reshape(N, K)
-
-
 # ═══════════════════════════════════════════════════════════════════
 # ShuffledWeight — typed wrapper for offline-shuffled weight tensors
 # ═══════════════════════════════════════════════════════════════════
@@ -368,7 +363,7 @@ class ShuffledWeight:
     smem rows using the shuffled per-lane layout. Everything matches.
     """
 
-    tensor: torch.Tensor  # physical [N, K_shuffled] on device
+    tensor: Any  # physical [N, K_shuffled] on device — PopcornTensor / mx.array
     logical_K: int  # original K (before shuffle + pad)
     kchunk: int  # logical K elements per pipeline stage
     bpad: int  # pad elements per k-tile (0 = no pad)
@@ -400,25 +395,38 @@ class ShuffledWeight:
     def from_plain(W, *, kchunk: int, bpad: int = 0, mma_k: int = 16):
         """Offline shuffle ``W: [N, K]`` → ``ShuffledWeight([N, K_shuffled])``.
 
-        Handles bf16 and e4m3 via byte-level permutation. The padding is
-        baked into the output's K dimension following the owl_kernels
-        convention: each ``[8, kchunk]`` source tile becomes an
-        ``[8, kchunk + bpad]`` shuffled tile in the output.
-
-        The permutation matches what ``bfrag_load_shuffled_*_hoisted``
-        expects at runtime: lane L reads ``FRAG_BYTES`` contiguous bytes
-        starting at ``ks * 32 * FRAG_BYTES + L * FRAG_BYTES`` within the
-        ``bstride``-wide smem row, where the padding bytes serve as a
-        bank-conflict gap.
+        Accepts ``PopcornTensor`` (CUDA) or ``mx.array`` (Metal). Handles
+        bf16 and e4m3 via byte-level permutation. The padding is baked
+        into the output's K dimension — each ``[8, kchunk]`` source tile
+        becomes an ``[8, kchunk + bpad]`` shuffled tile.
         """
-        import torch as _torch
+        # ─── Normalize input → (byte-view np.ndarray, elem_bytes, dtype handle) ───
+        if hasattr(W, "to_bytes") and isinstance(getattr(W, "dtype", None), str):
+            # PopcornTensor path
+            N, K = tuple(W.shape)
+            elem_bytes = W.nbytes // (W.numel() or 1)
+            W_np_bytes = (
+                np.frombuffer(W.contiguous().to_bytes(), dtype=np.uint8)
+                .reshape(N, K * elem_bytes)
+                .copy()
+            )
+            orig_dtype = W.dtype  # short string
+            is_popcorn = True
+        else:
+            # MLX path (import lazily to keep CUDA-only envs free of mlx).
+            import mlx.core as mx
 
-        elem_bytes = W.element_size()
-        N, K = W.shape
+            if not isinstance(W, mx.array):
+                raise TypeError(f"ShuffledWeight.from_plain: unsupported input {type(W).__name__}")
+            N, K = tuple(W.shape)
+            elem_bytes = W.dtype.size
+            W_np_bytes = np.array(W.view(mx.uint8)).reshape(N, K * elem_bytes).copy()
+            orig_dtype = W.dtype  # mx.Dtype
+            is_popcorn = False
+
         bstride = kchunk + bpad
         bstride_bytes = bstride * elem_bytes
         kchunk_bytes = kchunk * elem_bytes
-        K_bytes = K * elem_bytes
 
         if K % kchunk != 0:
             raise ValueError(f"K={K} not divisible by kchunk={kchunk}")
@@ -430,31 +438,34 @@ class ShuffledWeight:
         n8 = N // 8
         n_k = K // kchunk
 
-        # Build the padded permutation (8 * bstride_bytes → 8 * bstride_bytes)
-        perm_np = _build_padded_perm(kchunk, bpad, mma_k, elem_bytes)
-        perm = _torch.from_numpy(perm_np).to(W.device)
-
-        # View as bytes, reshape into tiles, zero-pad K to bstride
-        W_bytes = W.contiguous().view(_torch.uint8).reshape(N, K_bytes)
-        W_tiled = W_bytes.reshape(n8, 8, n_k, kchunk_bytes)
-        # Pad each tile's K dim: [n8, 8, n_k, kchunk_bytes] → [..., bstride_bytes]
+        # Byte-level tiled shuffle + zero pad to bstride.
+        perm = _build_padded_perm(kchunk, bpad, mma_k, elem_bytes)
+        W_tiled = W_np_bytes.reshape(n8, 8, n_k, kchunk_bytes)
         if bpad > 0:
             pad_width = bstride_bytes - kchunk_bytes
-            W_tiled = _torch.nn.functional.pad(W_tiled, (0, pad_width))
-        # Transpose to group by tile: [n8, n_k, 8, bstride_bytes]
-        W_tiled = W_tiled.permute(0, 2, 1, 3).contiguous()
+            W_tiled = np.pad(W_tiled, ((0, 0), (0, 0), (0, 0), (0, pad_width)))
+        W_tiled = np.ascontiguousarray(W_tiled.transpose(0, 2, 1, 3))
         flat = W_tiled.reshape(n8 * n_k, 8 * bstride_bytes)
-
-        # Apply the shuffled permutation
         out_flat = flat[:, perm]
-
-        # Reshape back to [N, K_shuffled]
         out_tiled = out_flat.reshape(n8, n_k, 8, bstride_bytes)
-        out_tiled = out_tiled.permute(0, 2, 1, 3).contiguous()
+        out_tiled = np.ascontiguousarray(out_tiled.transpose(0, 2, 1, 3))
         K_shuffled_bytes = n_k * bstride_bytes
         out_bytes = out_tiled.reshape(N, K_shuffled_bytes)
         K_shuffled = K_shuffled_bytes // elem_bytes
-        out = out_bytes.view(W.dtype).reshape(N, K_shuffled)
+
+        if is_popcorn:
+            from popcorn.runtime.tensor import PopcornTensor
+
+            out = PopcornTensor.from_bytes(out_bytes.tobytes(), (N, K_shuffled), orig_dtype)
+        else:
+            import mlx.core as mx
+
+            out = (
+                mx.array(out_bytes)
+                .reshape(N * K_shuffled_bytes)
+                .view(orig_dtype)
+                .reshape(N, K_shuffled)
+            )
 
         return ShuffledWeight(
             tensor=out,

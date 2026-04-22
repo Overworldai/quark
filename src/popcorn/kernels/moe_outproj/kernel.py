@@ -33,7 +33,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.moe_outproj.baselines import moe_outproj_baselines
 from popcorn.kernels.moe_outproj.config import MoeOutprojConfig
 from popcorn.kernels.moe_outproj.problems import moe_outproj_problems
-from popcorn.kernels.moe_outproj.reference import moe_outproj_reference_for_spec
+from popcorn.kernels.moe_outproj.reference import moe_outproj_reference_numpy
 from popcorn.kernels.moe_outproj.spec import MoeOutprojSpec
 
 
@@ -44,7 +44,7 @@ from popcorn.kernels.moe_outproj.spec import MoeOutprojSpec
     output_idx=2,
     problems=moe_outproj_problems,
     baselines=moe_outproj_baselines,
-    reference=moe_outproj_reference_for_spec,
+    reference=moe_outproj_reference_numpy,
 )
 class MoeOutprojKernel(Kernel):
     # Atomic scatter-add accumulates in non-deterministic order, so
@@ -117,32 +117,30 @@ class MoeOutprojKernel(Kernel):
     # ── Registry classmethods ──
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy
 
         spec = MoeOutprojSpec(**problem)
         M, D, H, n_e, top_k = spec.M, spec.D, spec.H, spec.n_experts, spec.top_k
         total = M * top_k
         slots_per_expert = total // n_e
 
-        a_dt = spec.a_dtype.backend
-        b_dt = spec.b_dtype.backend
-
-        h_in = PT.astype(PT.randn(total, H), a_dt)
-        W_out = PT.astype(PT.randn(n_e * D, H), b_dt)
-        # Output is always f32 — atomic scatter-add target; downstream
-        # runtime casts to the caller's preferred dtype.
-        output = PT.zeros(M, D, dtype=PT.float32)
-        token_ids = PT.astype(PT.arange(total) % M, PT.int32)
-        slot_weights = PT.ones(total, dtype=PT.float32) * 0.5
+        rng = np.random.default_rng(seed)
+        token_ids = (np.arange(total) % M).astype(np.int32)
+        slot_weights = np.full(total, 0.5, dtype=np.float32)
         # Full-coverage work_list: one entry per BM=32 chunk, each
         # labelled with the expert that owns the chunk.
-        wl = [[grp_start, grp_start // slots_per_expert] for grp_start in range(0, total, 32)]
-        work_list = PT.tensor(wl, dtype=PT.int32).reshape(-1)
+        wl = [(grp_start, grp_start // slots_per_expert) for grp_start in range(0, total, 32)]
+        work_list = np.array(wl, dtype=np.int32).reshape(-1)
         return {
-            "h_in": h_in,
-            "W_out": W_out,
-            "output": output,
+            "h_in": astype_numpy(rng.standard_normal((total, H)).astype(np.float32), spec.a_dtype),
+            "W_out": astype_numpy(
+                rng.standard_normal((n_e * D, H)).astype(np.float32), spec.b_dtype
+            ),
+            # Output always f32 — atomic scatter-add target.
+            "output": np.zeros((M, D), dtype=np.float32),
             "token_ids": token_ids,
             "slot_weights": slot_weights,
             "work_list": work_list,

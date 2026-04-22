@@ -28,7 +28,7 @@ from popcorn.kernels.quantize_e4m3.spec import QuantizeE4M3Spec
     output_idx=-1,
     problems=lambda: [],
     baselines=lambda: [],
-    reference=lambda kernel, X: X,
+    reference=lambda spec, *, X, Out=None: X,
 )
 class QuantizeE4M3Kernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -66,14 +66,17 @@ class QuantizeE4M3Kernel(Kernel):
         return {"n_warps": [2, 4, 8], "elems_per_block": [128, 256, 512, 1024]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy
 
         spec = QuantizeE4M3Spec(**problem)
-        dt = spec.src_dtype.backend
+        rng = np.random.default_rng(seed)
         return {
-            "X": PT.astype(PT.randn(spec.N), dt),
-            "Out": PT.zeros(spec.N // 2, dtype=DType.B16.backend),
+            "X": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.src_dtype),
+            # Out is a packed-b16 buffer (two e4m3 per 16-bit slot).
+            "Out": np.zeros(spec.N // 2, dtype=np.uint16),
         }
 
     def build(self) -> None:

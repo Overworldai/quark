@@ -17,12 +17,14 @@ that fixes the same problem on the autotune side.
 
 from __future__ import annotations
 
+import sys
 import threading
 from typing import Any
 
-from popcorn.backend import IS_METAL, PT
 from popcorn.device import current_device
 from popcorn.launcher import Launcher
+
+IS_METAL = sys.platform == "darwin"
 
 # Module-level cached Launcher. ``current_device()`` is itself cached
 # inside ``popcorn.device``, so the first call fixes the singleton for
@@ -55,53 +57,47 @@ def reset_launcher() -> None:
 
 
 def alloc_from_decl(decl, spec, config, *, like=None):
-    """Allocate a fresh tensor sized to ``decl.shape(spec, config)`` with
-    ``decl.dtype(spec, config)`` in the active backend.
+    """Allocate a fresh tensor sized to ``decl.shape(spec, config)`` in
+    ``decl.dtype(spec, config)``.
 
-    On torch, ``like`` (any reference tensor) provides the device. On
-    MLX we'd never call this — MLX allocates outputs itself — but we
-    keep the path uniform for the CUDA custom-op wrapper.
+    Backend-native: ``mx.array`` on Metal, ``PopcornTensor`` on CUDA.
+    ``like`` is unused on CUDA (PopcornTensor allocates its own device
+    memory) and ignored on Metal.
     """
     shape = decl.shape(spec, config) if callable(decl.shape) else decl.shape
     dtype_val = decl.dtype(spec, config) if callable(decl.dtype) else decl.dtype
-    # decl.dtype may be an IR DType (for static typing) or a callable.
-    from popcorn.ir import DType
+    from popcorn.ir import DType as _DT
 
-    if isinstance(dtype_val, DType):
-        backend_dt = PT.ir_dtype_to_backend(dtype_val)
-    else:
-        backend_dt = PT.ir_dtype_to_backend(dtype_val)
+    dt_str = dtype_val.value if isinstance(dtype_val, _DT) else str(dtype_val)
 
     if IS_METAL:
-        return PT.zeros(*shape, dtype=backend_dt)
+        import mlx.core as mx
 
-    # CUDA path: use PopcornTensor if the input is a PopcornTensor (no torch),
-    # otherwise fall back to torch for torch.Tensor inputs.
+        _MX = {
+            "bf16": mx.bfloat16,
+            "f16": mx.float16,
+            "f32": mx.float32,
+            "s32": mx.int32,
+            "s64": mx.int64,
+            "u8": mx.uint8,
+            "s8": mx.int8,
+            "u16": mx.uint16,
+            "u32": mx.uint32,
+        }
+        mx_dt = _MX.get(dt_str)
+        if mx_dt is None:
+            # e4m3/e5m2 have no MLX equivalent — raise so callers know.
+            raise TypeError(f"alloc_from_decl: dtype {dt_str!r} has no MLX dtype")
+        return mx.zeros(shape, dtype=mx_dt)
+
     from popcorn.runtime.tensor import PopcornTensor
 
-    if like is not None and isinstance(like, PopcornTensor):
-        from popcorn.ir import DType as _DT
-
-        _IR_TO_PC = {
-            _DT.BF16: "bf16",
-            _DT.F16: "f16",
-            _DT.F32: "f32",
-            _DT.S32: "s32",
-            _DT.U8: "u8",
-            _DT.S8: "s8",
-            _DT.E4M3: "e4m3",
-            _DT.E5M2: "e5m2",
-            _DT.B16: "u16",  # bit-typed 16-bit → u16 storage
-            _DT.B32: "u32",
-            _DT.U16: "u16",
-            _DT.U32: "u32",
-        }
-        return PopcornTensor.zeros(*shape, dtype=_IR_TO_PC[dtype_val])
-
-    import torch
-
-    device = like.device if like is not None else torch.device("cuda")
-    return torch.zeros(tuple(shape), dtype=backend_dt, device=device)
+    _STORAGE = {
+        "b16": "u16",  # bit-typed 16-bit → u16 storage
+        "b32": "u32",
+    }
+    storage = _STORAGE.get(dt_str, dt_str)
+    return PopcornTensor.zeros(*shape, dtype=storage)
 
 
 def launch_kernel(
@@ -140,11 +136,11 @@ def call_with_bindings(
     ``provided`` must contain every kernel buffer *except* those listed
     in ``auto_alloc`` — those are allocated fresh from the kernel's
     ``TENSORS`` manifest.  On MLX the returned dict's auto-allocated
-    entries are the fresh ``mx.array`` MLX emitted; on torch they are
-    the pre-allocated ``torch.empty`` buffers (now populated in place).
+    entries are the fresh ``mx.array`` MLX emitted; on CUDA they are
+    the pre-allocated ``PopcornTensor`` buffers (populated in place).
 
-    ``like`` provides the torch device for ``auto_alloc`` entries.
-    Defaults to the first value in ``provided``.
+    ``like`` is currently unused on CUDA (PopcornTensor picks its own
+    device) and ignored on Metal; kept for API stability.
 
     When ``config`` is ``None`` (the default), the config is resolved
     from the process-wide ``AutotuneCache``: hot dict → on-disk JSON →
@@ -229,14 +225,45 @@ def call_with_bindings(
         for b in pspec.buffers:
             if not b.readonly:
                 full[b.name] = next(out_iter)
-    # torch: buffers were written in place; nothing to rebind.
+    # CUDA / PopcornTensor: buffers were written in place; nothing to rebind.
     return full
 
 
+def _zero_placeholder_s32(n: int, *, like: Any = None) -> Any:
+    """Backend-appropriate zeros(n, s32) placeholder — MLX on Metal,
+    PopcornTensor on CUDA. ``like`` is accepted for future-proofing
+    but currently ignored (PopcornTensor picks its own device)."""
+    del like
+    if IS_METAL:
+        import mlx.core as mx
+
+        return mx.zeros((n,), dtype=mx.int32)
+    from popcorn.runtime.tensor import PopcornTensor
+
+    return PopcornTensor.zeros(n, dtype="s32")
+
+
+def _zero_placeholder_f32(n: int, *, like: Any = None) -> Any:
+    del like
+    if IS_METAL:
+        import mlx.core as mx
+
+        return mx.zeros((n,), dtype=mx.float32)
+    from popcorn.runtime.tensor import PopcornTensor
+
+    return PopcornTensor.zeros(n, dtype="f32")
+
+
 def is_mlx_tensor(x: Any) -> bool:
-    """True iff ``x`` is an ``mx.array``. Delegates to PT's private
-    helper so we don't repeat the lazy-import dance."""
-    return PT._is_mx(x)
+    """True iff ``x`` is an ``mx.array``."""
+    if not IS_METAL:
+        return False
+    try:
+        import mlx.core as mx
+
+        return isinstance(x, mx.array)
+    except ImportError:
+        return False
 
 
 def make_autotune(impl_fn, cls_fn, *, doc: str | None = None):

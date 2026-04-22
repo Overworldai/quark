@@ -51,14 +51,16 @@ class EulerStepConfig(KernelConfig):
         return cls(n_warps=4, elems_per_block=1024)
 
 
-def _reference(kernel, X, V, Dsig):
-    from popcorn.backend import PT
+def _reference(spec, *, X, V, Dsig, Out=None):
+    from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
 
-    x_f = PT.astype(X, PT.float32)
-    v_f = PT.astype(V, PT.float32)
-    dsig_scalar = Dsig[0] if hasattr(Dsig, "__getitem__") else Dsig
-    out = x_f + dsig_scalar * v_f
-    return PT.astype(out, X.dtype)
+    del Out
+    hint = spec.dtype.value
+    x_f = to_f32_numpy(X, dtype_hint=hint)
+    v_f = to_f32_numpy(V, dtype_hint=hint)
+    dsig_f = to_f32_numpy(Dsig, dtype_hint="f32")
+    out = x_f + dsig_f[0] * v_f
+    return astype_numpy(out, spec.dtype)
 
 
 @kernel(
@@ -105,16 +107,18 @@ class EulerStepKernel(Kernel):
         return {"n_warps": [1, 2, 4, 8], "elems_per_block": [128, 256, 512, 1024, 2048]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = EulerStepSpec(**problem)
-        dt = spec.dtype.backend
+        rng = np.random.default_rng(seed)
         return {
-            "X": PT.astype(PT.randn(spec.N), dt),
-            "V": PT.astype(PT.randn(spec.N), dt),
-            "Dsig": PT.tensor([0.1], dtype=PT.float32),
-            "Out": PT.zeros(spec.N, dtype=dt),
+            "X": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype),
+            "V": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype),
+            "Dsig": np.array([0.1], dtype=np.float32),
+            "Out": zeros_for_dtype((spec.N,), spec.dtype),
         }
 
     @classmethod

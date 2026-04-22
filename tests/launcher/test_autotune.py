@@ -7,6 +7,13 @@ real Launcher injects ``_compile_and_time_for_autotune``.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip(
+    "torch",
+    reason="torch removed from runtime; numpy-refs migration — test kept for dev-only cross-check when torch is installed",
+)
+
 import json
 from dataclasses import dataclass
 from pathlib import Path

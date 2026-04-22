@@ -79,26 +79,16 @@ _compute_cap_cache: int | None = None
 
 
 def current_device_smem_cap() -> int:
-    """Max dynamic smem per block (bytes) for the current CUDA device.
+    """Max dynamic smem per block (bytes) for the current device.
 
-    Reads from torch's ``cuda.get_device_properties`` on the first
-    call and caches it. Use this anywhere you'd otherwise hardcode a
-    smem ceiling (kernel ``is_valid()``, ``SharedLayout(capacity=...)``,
-    occupancy calculations). New code should prefer
+    New code should prefer
     ``popcorn.device.current_device().caps.max_smem_per_block``.
     """
     global _smem_cap_cache
     if _smem_cap_cache is None:
-        import torch
+        from popcorn.device import current_device
 
-        props = torch.cuda.get_device_properties(0)
-        _smem_cap_cache = int(
-            getattr(
-                props,
-                "shared_memory_per_block_optin",
-                getattr(props, "shared_memory_per_block", 49152),
-            )
-        )
+        _smem_cap_cache = int(current_device().caps.max_smem_per_block)
     return _smem_cap_cache
 
 
@@ -106,9 +96,9 @@ def current_device_sm_count() -> int:
     """Number of SMs on the current device (cached)."""
     global _n_sms_cache
     if _n_sms_cache is None:
-        import torch
+        from popcorn.device import current_device
 
-        _n_sms_cache = int(torch.cuda.get_device_properties(0).multi_processor_count)
+        _n_sms_cache = int(current_device().caps.compute_unit_count)
     return _n_sms_cache
 
 
@@ -116,9 +106,12 @@ def current_device_compute_capability() -> int:
     """Compute capability as a packed int (e.g. 120 for sm_120)."""
     global _compute_cap_cache
     if _compute_cap_cache is None:
-        import torch
+        from popcorn.device import current_device
 
-        major, minor = torch.cuda.get_device_capability(0)
+        cc = current_device().caps.compute_capability
+        if cc is None:
+            raise RuntimeError("current_device_compute_capability: no CC (non-CUDA device?)")
+        major, minor = cc
         _compute_cap_cache = major * 10 + minor
     return _compute_cap_cache
 

@@ -22,7 +22,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.rmsnorm.baselines import rmsnorm_baselines
 from popcorn.kernels.rmsnorm.config import RMSNormConfig
 from popcorn.kernels.rmsnorm.problems import rmsnorm_problems
-from popcorn.kernels.rmsnorm.reference import rmsnorm_reference_for_spec
+from popcorn.kernels.rmsnorm.reference import rmsnorm_reference_numpy
 from popcorn.kernels.rmsnorm.spec import RMSNormSpec
 
 _WARP = 32
@@ -36,7 +36,7 @@ _CP_BYTES = 16
     output_idx=-1,
     problems=rmsnorm_problems,
     baselines=rmsnorm_baselines,
-    reference=rmsnorm_reference_for_spec,
+    reference=rmsnorm_reference_numpy,
 )
 class RMSNormKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -100,14 +100,17 @@ class RMSNormKernel(Kernel):
         return {"n_warps": [1, 2, 4, 8]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = RMSNormSpec(**problem)
-        dt = spec.dtype.backend
-        X = PT.astype(PT.randn(spec.B, spec.D), dt)
-        Out = PT.zeros(spec.B, spec.D, dtype=dt)
-        return {"X": X, "Out": Out}
+        rng = np.random.default_rng(seed)
+        return {
+            "X": astype_numpy(rng.standard_normal((spec.B, spec.D)).astype(np.float32), spec.dtype),
+            "Out": zeros_for_dtype((spec.B, spec.D), spec.dtype),
+        }
 
     @classmethod
     def spec_from_tensors(cls, X, *, eps: float = 1.1920929e-07) -> RMSNormSpec:

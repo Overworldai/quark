@@ -89,10 +89,9 @@ def _precompute_cuda(sigmas, freqs_list, fourier_dim, n, W1, W2):
 
 
 def _precompute_metal(sigmas, freqs_list, fourier_dim, n, W1, W2):
-    """Metal path: uses PT (MLX) for now."""
+    """Metal path — mlx directly, no PT."""
+    import mlx.core as mx
     import numpy as np
-
-    from popcorn.backend import PT
 
     BM_MIN = 16
     freqs_np = np.array(freqs_list, dtype=np.float32)
@@ -109,11 +108,11 @@ def _precompute_metal(sigmas, freqs_list, fourier_dim, n, W1, W2):
         fourier_np = np.concatenate([fourier_np, pad_np], axis=0)
 
     fourier_u16 = (fourier_np.view(np.uint32) >> 16).astype(np.uint16)
-    fourier_dev = PT.tensor(fourier_u16.tolist(), dtype=PT.bfloat16)
+    fourier_dev = mx.array(fourier_u16).view(mx.bfloat16)
     out_dt = _dtype_str(W2.dtype)
     h = _pcf_gemm(fourier_dev, W1, activation="silu", out_dtype=out_dt)
     emb = _pcf_gemm(h, W2, out_dtype=out_dt)
-    PT.synchronize()
+    mx.synchronize()
 
     return emb[:n]
 

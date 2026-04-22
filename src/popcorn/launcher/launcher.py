@@ -35,8 +35,6 @@ from popcorn.launcher.param_spec import ParamSpec, ProgramFootprint
 from popcorn.lower.ptx import PtxLowerer
 
 if TYPE_CHECKING:
-    import torch
-
     from popcorn.autotune import AutotuneCache
 
 
@@ -71,10 +69,26 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
 
     dev = current_device()
     if dev.family is DeviceFamily.METAL:
-        # Metal path: use PT.time_callable (MLX still active in Stage 1).
-        from popcorn.backend import PT as _PT
+        # Metal path: drive the timing loop directly over mlx.sync.
+        import mlx.core as _mx
 
-        return _PT.time_callable(fn, warmup_ms=warmup_ms, bench_ms=bench_ms)
+        _mx.synchronize()
+        t0 = _time.perf_counter()
+        n_warm = 0
+        while (_time.perf_counter() - t0) * 1000 < warmup_ms:
+            fn()
+            n_warm += 1
+            if n_warm % 32 == 0:
+                _mx.synchronize()
+        _mx.synchronize()
+        t_bench = _time.perf_counter()
+        n_bench = 0
+        while (_time.perf_counter() - t_bench) * 1000 < bench_ms:
+            fn()
+            n_bench += 1
+        _mx.synchronize()
+        elapsed_s = _time.perf_counter() - t_bench
+        return (elapsed_s * 1e6) / max(n_bench, 1)
 
     from popcorn.runtime.cuda import CudaRuntime
 
@@ -113,32 +127,8 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
 
 
 # ---------------------------------------------------------------------------
-# torch ↔ IR DType bridge
+# Backend ↔ IR DType bridge — MLX (Metal) + PopcornTensor (CUDA) only.
 # ---------------------------------------------------------------------------
-
-
-def _torch_dtype_table() -> dict[Any, DType]:
-    """Build the torch→IR DType map lazily so this module doesn't
-    hard-import torch at module-load time. Per §6.2."""
-    import torch
-
-    table = {
-        torch.float32: DType.F32,
-        torch.float16: DType.F16,
-        torch.bfloat16: DType.BF16,
-        torch.int8: DType.S8,
-        torch.uint8: DType.U8,
-        torch.int32: DType.S32,
-        torch.int64: DType.S64,
-        torch.float64: DType.F64,
-    }
-    fp8 = getattr(torch, "float8_e4m3fn", None)
-    if fp8 is not None:
-        table[fp8] = DType.E4M3
-    fp8b = getattr(torch, "float8_e5m2", None)
-    if fp8b is not None:
-        table[fp8b] = DType.E5M2
-    return table
 
 
 def _mlx_dtype_table() -> dict[Any, DType]:
@@ -176,23 +166,6 @@ def _ir_to_mlx_dtype(dtype: DType) -> Any:
     if result is None:
         raise TypeError(f"_ir_to_mlx_dtype: no mlx equivalent for {dtype}")
     return result
-
-
-def _check_dtype(buf: torch.Tensor, expected: DType) -> None:
-    """Validate that a torch tensor's dtype matches what the kernel
-    parameter expects. Raises TypeError on mismatch."""
-    table = _torch_dtype_table()
-    actual = table.get(buf.dtype)
-    if actual is None:
-        raise TypeError(
-            f"_check_dtype: torch dtype {buf.dtype} has no popcorn IR "
-            f"equivalent (or this torch build doesn't expose it)"
-        )
-    if actual is not expected:
-        raise TypeError(
-            f"_check_dtype: buffer dtype mismatch — kernel expects "
-            f"{expected!r}, got tensor of {actual!r} ({buf.dtype})"
-        )
 
 
 def _check_dtype_mlx(buf, expected: DType) -> None:
@@ -316,39 +289,34 @@ class CompiledKernel:
     def _launch_cuda(self, buffers, scalars, stream) -> None:
         """CUDA launch path — pointer-based, writes in place.
 
-        Accepts both ``torch.Tensor`` and ``PopcornTensor`` buffers.
-        PopcornTensors use ``_check_dtype_popcorn``; torch tensors
-        use the existing ``_check_dtype`` path.
+        Every buffer must be a ``PopcornTensor`` (the runtime inference
+        path; torch was retired with the numpy-refs migration).
         """
         from popcorn.runtime.tensor import PopcornTensor
 
         ptrs: list[int] = []
         for i, (buf, pspec) in enumerate(zip(buffers, self.param_spec.buffers, strict=False)):
-            if isinstance(buf, PopcornTensor):
-                _check_dtype_popcorn(buf, pspec.dtype)
-            else:
-                if buf.device.type not in ("cuda", "mps"):
-                    raise ValueError(
-                        f"CompiledKernel.launch: buffer {i} ({pspec.name!r}) "
-                        f"is on {buf.device}, not a GPU device"
-                    )
-                _check_dtype(buf, pspec.dtype)
+            if not isinstance(buf, PopcornTensor):
+                raise TypeError(
+                    f"CompiledKernel.launch: buffer {i} ({pspec.name!r}) "
+                    f"is {type(buf).__name__}, expected PopcornTensor"
+                )
+            _check_dtype_popcorn(buf, pspec.dtype)
             _check_contiguous(buf, pspec)
             ptrs.append(buf.data_ptr())
 
         scalar_bytes = self.param_spec.pack_scalars(tuple(scalars))
 
         if stream is None:
-            if isinstance(buffers[0], PopcornTensor):
-                from popcorn.graph import active_stream
+            from popcorn.graph import active_stream
 
-                stream_handle = active_stream()  # 0 normally, capture stream during graph capture
-            else:
-                stream_handle = self.driver.current_torch_stream()
+            stream_handle = active_stream()  # 0 normally, capture stream during graph capture
         elif isinstance(stream, int):
             stream_handle = stream
         else:
-            stream_handle = self.driver.stream_from_torch(stream)
+            raise TypeError(
+                f"CompiledKernel.launch: stream must be int or None, got {type(stream).__name__}"
+            )
 
         self.driver.launch(
             self.module,
@@ -573,17 +541,19 @@ class Launcher:
         ck = self.compile(kernel_cls, spec, config)
 
         if tensors is None:
+            from popcorn.refs import ref_cache
+            from popcorn.runtime.device_tensors import numpy_to_device_dict
+
             problems_fn = getattr(kernel_cls, "problems", None)
-            make_tensors = getattr(kernel_cls, "make_tensors", None)
-            if not (callable(problems_fn) and callable(make_tensors)):
+            if not callable(problems_fn):
                 raise NotImplementedError(
-                    "_compile_and_time_for_autotune: kernel does not expose "
-                    "problems() / make_tensors() — bounded search needs both"
+                    "_compile_and_time_for_autotune: kernel needs problems() for bounded search"
                 )
             problems = problems_fn()
             if not problems:
                 raise ValueError("_compile_and_time_for_autotune: kernel.problems() is empty")
-            tensors = make_tensors(problems[0].params)
+            inputs_np, _outputs_np = ref_cache().get(kernel_cls, problems[0].params)
+            tensors = numpy_to_device_dict(kernel_cls, kernel.spec, inputs_np)
 
         # Route through the kernel's launch-time transform (e.g. GEMM's
         # b_shuffle pre-shuffle) so b_shuffle=True configs receive the

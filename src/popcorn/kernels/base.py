@@ -13,16 +13,12 @@ from __future__ import annotations
 
 import json
 import os
-import time as _time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-import torch
-
-from popcorn.correctness import check_correctness
 from popcorn.ir import DType
 from popcorn.ir import Module as _Module
 from popcorn.launcher import ParamSpec
@@ -228,18 +224,6 @@ class Baseline:
 # ═══════════════════════════════════════════════════════════════════
 # Kernel base class
 # ═══════════════════════════════════════════════════════════════════
-
-
-def _current_sm() -> int:
-    """Compute capability of the active CUDA device, e.g. 89 for sm_89.
-
-    Reads from torch — no cupy. Used by the legacy `Kernel.compile()`
-    path that still wraps `popcorn.compiler.Compiler`. New IR-based
-    kernels go through `popcorn.launcher.Launcher`, which picks the
-    target SM from `device.caps.compute_capability` directly.
-    """
-    cap = torch.cuda.get_device_capability(0)
-    return cap[0] * 10 + cap[1]
 
 
 def _format_problem_label(problem: dict) -> str:
@@ -448,9 +432,6 @@ class Kernel(ABC):
 
     @abstractmethod
     def grid(self) -> tuple[int, ...]: ...
-
-    @abstractmethod
-    def reference(self, *tensors) -> Any: ...
 
     @abstractmethod
     def flops(self) -> int: ...
@@ -770,108 +751,8 @@ class Kernel(ABC):
         )
         return {**tensors, name: shuffled}
 
-    def time(
-        self,
-        tensors: Sequence,
-        *,
-        warmup_ms: float = 10.0,
-        bench_ms: float = 50.0,
-    ) -> float:
-        """Average runtime in microseconds.
-
-        Three phases:
-        1. Probe: run+sync until >=1ms to estimate per-kernel runtime.
-        2. Warmup: async-queue warmup_ms worth of runs, sync once.
-        3. Bench: async-queue bench_ms worth of runs between two
-           CUDA events, sync, report elapsed / n_iters.
-
-        No sync between individual launches in warmup/bench — this
-        minimizes host launch overhead and measures closer to the
-        true kernel runtime under async stream queuing.
-        """
-        buf_list = list(tensors) if not isinstance(tensors, list) else tensors
-        compiled = self.compile()
-
-        # Phase 1: Probe — get rough runtime estimate
-        compiled.launch(buffers=buf_list)
-        torch.cuda.synchronize()
-
-        elapsed_ms = 0.0
-        probe_iters = 0
-        while elapsed_ms < 1.0:
-            t0 = _time.perf_counter()
-            compiled.launch(buffers=buf_list)
-            torch.cuda.synchronize()
-            elapsed_ms += (_time.perf_counter() - t0) * 1000.0
-            probe_iters += 1
-        rough_us = (elapsed_ms / probe_iters) * 1000.0
-
-        # Phase 2: Warmup — async-queued, single sync at end
-        n_warmup = max(1, int(warmup_ms * 1000.0 / rough_us))
-        for _ in range(n_warmup):
-            compiled.launch(buffers=buf_list)
-        torch.cuda.synchronize()
-
-        # Phase 3: Bench — async-queued between two CUDA events
-        n_bench = max(1, int(bench_ms * 1000.0 / rough_us))
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(n_bench):
-            compiled.launch(buffers=buf_list)
-        end.record()
-        end.synchronize()
-        return start.elapsed_time(end) / n_bench * 1000.0
-
     def tflops(self, runtime_us: float) -> float:
         return self.flops() / (runtime_us * 1e-6) / 1e12
-
-    def correctness(
-        self,
-        tensors: Sequence,
-        ref: Any,
-        out_idx: int = -1,
-        cos_threshold: float | None = None,
-        **kwargs,
-    ) -> dict:
-        """Launch the kernel and compare tensors[out_idx] to ref.
-
-        Thin wrapper around `popcorn.correctness.check_correctness`,
-        kept for backward compatibility with the few call sites that
-        still expect a dict result. The legacy multi-metric
-        implementation that handled both cupy and torch tensors has
-        been removed — see Bundle 4 of the cleanup proposal §7.
-
-        New code should call `popcorn.correctness.check_correctness`
-        directly and consult `result.passed` / `result.cos_sim`.
-        """
-        self.launch(tensors)
-        torch.cuda.synchronize()
-        out = tensors[out_idx]
-        out_t = out if isinstance(out, torch.Tensor) else torch.from_dlpack(out)
-        ref_t = ref if isinstance(ref, torch.Tensor) else torch.from_dlpack(ref)
-
-        # The kernel doesn't necessarily declare an out_dtype field
-        # yet — fall back to inferring from the actual tensor dtype.
-        torch_to_ir = {
-            torch.float32: DType.F32,
-            torch.bfloat16: DType.BF16,
-            torch.float16: DType.F16,
-        }
-        out_dtype = torch_to_ir.get(out_t.dtype, DType.F32)
-
-        result = check_correctness(
-            out_t,
-            ref_t,
-            out_dtype=out_dtype,
-            threshold=cos_threshold,
-        )
-        return {
-            "match": result.passed,
-            "cos_sim": result.cos_sim,
-            "max_abs": result.max_abs if result.max_abs is not None else 0.0,
-            "norm_err": result.max_abs if result.max_abs is not None else 0.0,
-        }
 
     def prune_score(self) -> float:
         """Optional hook for the genetic autotuner. Returns a value in [0, 1]
@@ -936,14 +817,22 @@ class Kernel(ABC):
         return cls.from_problem(problem)
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        """Allocate launch tensors for a bench problem.
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        """Allocate numpy inputs + output stubs for a bench problem.
 
-        Returns a dict whose keys match the ``ParamSpec`` buffer names.
-        Subclasses override with a ``@classmethod`` that takes the same
-        ``problem`` dict consumed by ``from_problem``.
+        Returns a ``{name: np.ndarray}`` dict matching the kernel's
+        ``TENSORS`` manifest (every entry, including ``role="out"``
+        stubs zero-filled in the target carrier dtype). Seeded via
+        ``numpy.random.default_rng(seed)`` so the same
+        ``(kernel, problem, seed)`` triple yields identical arrays
+        across sessions — essential for on-disk ``RefCache``.
+
+        Subclasses override with a ``@classmethod`` taking the same
+        ``problem`` dict consumed by ``from_problem``. Device-side
+        conversion happens at the tool boundary (``fuzz`` / ``bench``
+        / ``autotune``), not here.
         """
-        raise NotImplementedError(f"{cls.__name__} doesn't implement make_tensors()")
+        raise NotImplementedError(f"{cls.__name__} doesn't implement make_tensors_numpy()")
 
     def baselines(self, tensors: dict) -> list[Baseline]:
         """Named baselines (default: none) for the speed comparison column."""

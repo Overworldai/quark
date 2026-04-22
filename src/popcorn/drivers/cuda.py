@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from popcorn.device import Device, DeviceCaps, DeviceFamily
 from popcorn.runtime.cuda import (
@@ -37,9 +36,6 @@ from popcorn.runtime.cuda import (
     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
     CudaRuntime,
 )
-
-if TYPE_CHECKING:
-    import torch
 
 # 48KB is the static-smem threshold above which a kernel must opt in
 # via cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES). Below it, the
@@ -243,20 +239,6 @@ class CudaDriver:
         del _holds
 
     # ---- streams ----
-
-    def stream_from_torch(self, torch_stream: torch.cuda.Stream) -> int:
-        """A CUstream IS just a void* in the driver API, and torch
-        exposes its underlying handle via `.cuda_stream`. Pass it
-        through unchanged."""
-        return int(torch_stream.cuda_stream)
-
-    def current_torch_stream(self) -> int:
-        """Convenience: return the current torch CUDA stream as a raw
-        CUstream pointer. Used by `CompiledKernel.launch` when the
-        caller doesn't pass an explicit stream."""
-        import torch
-
-        return self.stream_from_torch(torch.cuda.current_stream())
 
     def sync(self, stream: int) -> None:
         self.runtime.stream_synchronize(int(stream))

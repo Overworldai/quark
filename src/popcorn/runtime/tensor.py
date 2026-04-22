@@ -351,40 +351,6 @@ class PopcornTensor:
     # ── Zero-copy wrapping of external tensors ──
 
     @staticmethod
-    def from_torch(t) -> PopcornTensor:
-        """Zero-copy wrap a ``torch.Tensor`` as a PopcornTensor.
-
-        The torch tensor must be on a CUDA device and contiguous.
-        PopcornTensor borrows the data pointer — no memcpy. The
-        torch tensor is kept alive via a reference in the storage.
-        """
-        if not t.is_contiguous():
-            raise ValueError("from_torch: tensor must be contiguous")
-        if t.device.type != "cuda":
-            raise ValueError(f"from_torch: tensor must be on CUDA, got {t.device}")
-        import torch
-
-        _TORCH_TO_PC = {
-            torch.float32: "f32",
-            torch.float16: "f16",
-            torch.bfloat16: "bf16",
-            torch.int32: "s32",
-            torch.int64: "s64",
-            torch.int8: "s8",
-            torch.uint8: "u8",
-        }
-        fp8 = getattr(torch, "float8_e4m3fn", None)
-        if fp8 is not None:
-            _TORCH_TO_PC[fp8] = "u8"  # store fp8 as u8 raw bytes
-        dtype = _TORCH_TO_PC.get(t.dtype)
-        if dtype is None:
-            raise ValueError(f"from_torch: unsupported dtype {t.dtype}")
-        shape = tuple(t.shape)
-        nbytes = t.nelement() * t.element_size()
-        storage = _BorrowedStorage(t.data_ptr(), nbytes, owner=t)
-        return PopcornTensor(storage, shape, _contiguous_strides(shape), 0, dtype)
-
-    @staticmethod
     def from_mlx(t) -> PopcornTensor:
         """Zero-copy wrap an ``mx.array`` as a PopcornTensor.
 

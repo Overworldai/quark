@@ -384,15 +384,18 @@ class AutotuneCache:
         out_idx = None
         if lnch is not None:
             try:
-                tensors = kernel_cls.make_tensors(spec_dict)
+                from popcorn.refs import ref_cache
+                from popcorn.runtime.device_tensors import numpy_to_device_dict
+
+                inputs_np, outputs_np = ref_cache().get(kernel_cls, spec_dict)
                 default_kernel = kernel_cls.from_problem(spec_dict)
                 pspec = default_kernel.param_spec()
-                bufs = [tensors[b.name] for b in pspec.buffers]
+                tensors = numpy_to_device_dict(kernel_cls, default_kernel.spec, inputs_np)
                 out_idx = kernel_cls.OUTPUT_IDX
                 if out_idx < 0:
-                    out_idx = len(bufs) + out_idx
-                inputs = [bufs[i] for i in range(len(bufs)) if i != out_idx]
-                reference = default_kernel.reference(*inputs)
+                    out_idx = len(pspec.buffers) + out_idx
+                output_name = pspec.buffers[out_idx].name
+                reference = outputs_np[output_name]
             except Exception as e:
                 _log(name, f"reference setup failed ({type(e).__name__}: {e})")
                 tensors = None
@@ -420,9 +423,12 @@ class AutotuneCache:
         folds the return into the overall best tracking.
         """
         import math as _math
+        import sys as _sys
 
-        from popcorn.backend import IS_METAL, PT
         from popcorn.correctness import check_correctness
+        from popcorn.runtime.sync import ir_dtype_of, synchronize, zero_buffer
+
+        _is_metal = _sys.platform == "darwin"
 
         lnch = self._launcher
         timer = self._compile_and_time
@@ -433,7 +439,7 @@ class AutotuneCache:
         spec_dict = _dc.asdict(spec) if _dc.is_dataclass(spec) else {}
 
         compile_cache: dict = {}
-        if knob_names and not IS_METAL:
+        if knob_names and not _is_metal:
             try:
                 compile_cache = _parallel_compile(
                     kernel_cls, spec, batch, lnch, knob_names=knob_names
@@ -446,38 +452,31 @@ class AutotuneCache:
 
         def _check_config(cfg) -> tuple[bool, float, str | None]:
             # Drain any async error queued by the prior config before
-            # this one starts. Otherwise CUDA reports the prior
-            # launch's misalignment / OOB on the first call of the
-            # next config (typically ``PT.zero_``) and blames the
-            # wrong config. Surface it here, move on.
+            # this one starts. Without this, the prior launch's
+            # misalignment / OOB surfaces on the first call of the
+            # next config (typically ``zero_buffer``) and blames the
+            # wrong config.
             with contextlib.suppress(BaseException):
-                PT.synchronize()
+                synchronize()
             try:
                 cfg_kernel = kernel_cls(spec_cls(**spec_dict), cfg)
                 launch_tensors = cfg_kernel.prepare_launch_tensors(tensors)
                 cfg_buffers = [launch_tensors[b.name] for b in pspec.buffers]
-                cfg_output_buf = PT.zero_(cfg_buffers[out_idx])
+                cfg_output_buf = zero_buffer(cfg_buffers[out_idx])
                 cfg_buffers[out_idx] = cfg_output_buf
                 compiled = lnch.compile(kernel_cls, spec, cfg)
                 _launch_result = compiled.launch(buffers=cfg_buffers)
-                PT.synchronize()
+                synchronize()
                 # On CUDA the kernel writes ``cfg_output_buf`` in place;
                 # on Metal MLX returns fresh mx.arrays for every non-
-                # readonly buffer in pspec order, and the original
-                # ``cfg_output_buf`` stays zero. Pick the launch's
-                # actual output on Metal.
-                if IS_METAL and _launch_result:
+                # readonly buffer in pspec order — pick the launch's
+                # actual output there.
+                if _is_metal and _launch_result:
                     out_pos = sum(1 for b in pspec.buffers[:out_idx] if not b.readonly)
                     actual_output = _launch_result[out_pos]
                 else:
                     actual_output = cfg_output_buf
-                out_dtype = PT.backend_dtype_to_ir(actual_output.dtype)
-                # NOTE (regression test): we tried switching this to
-                # GPU-resident comparison to avoid the heavy D2H per
-                # config, but doing so broke the cast+cpu workaround in
-                # call_with_bindings — the previously-stable ground-
-                # truth fix stopped working. Restore D2H here to keep
-                # that ground truth stable while we hunt the root cause.
+                out_dtype = ir_dtype_of(actual_output)
                 cr = check_correctness(
                     actual_output,
                     reference,

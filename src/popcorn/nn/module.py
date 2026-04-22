@@ -13,7 +13,8 @@ No autograd, no training hooks, no optimizer state. Just:
 
 On CUDA, all tensors are ``PopcornTensor`` instances with no torch or
 numpy dependency. On Metal (until Stage 2 migration), the existing
-MLX path is used via ``popcorn.backend.PT``.
+MLX path uses ``mx.array`` directly; the old ``popcorn.backend.PT``
+polymorphic tensor was retired in the numpy-refs migration.
 """
 
 from __future__ import annotations
@@ -26,13 +27,30 @@ from typing import Any
 _IS_METAL = sys.platform == "darwin"
 
 
+_MX_DT_MAP = None
+
+
+def _mx_dt(dtype: str):
+    """Map popcorn short strings → mlx dtype. Metal only."""
+    global _MX_DT_MAP
+    if _MX_DT_MAP is None:
+        import mlx.core as mx
+
+        _MX_DT_MAP = {
+            "bf16": mx.bfloat16,
+            "f16": mx.float16,
+            "f32": mx.float32,
+            "s32": mx.int32,
+        }
+    return _MX_DT_MAP.get(dtype, _MX_DT_MAP["bf16"])
+
+
 def _randn(*shape, dtype="bf16"):
     """Create a random normal tensor on the active backend."""
     if _IS_METAL:
-        from popcorn.backend import PT
+        import mlx.core as mx
 
-        _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
-        return PT.astype(PT.randn(*shape), _dt.get(dtype, PT.bfloat16))
+        return mx.random.normal(shape=shape).astype(_mx_dt(dtype))
     from popcorn.runtime.tensor import PopcornTensor
 
     return PopcornTensor.randn(*shape, dtype=dtype)
@@ -40,10 +58,9 @@ def _randn(*shape, dtype="bf16"):
 
 def _zeros(*shape, dtype="bf16"):
     if _IS_METAL:
-        from popcorn.backend import PT
+        import mlx.core as mx
 
-        _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
-        return PT.zeros(*shape, dtype=_dt.get(dtype, PT.bfloat16))
+        return mx.zeros(shape, dtype=_mx_dt(dtype))
     from popcorn.runtime.tensor import PopcornTensor
 
     return PopcornTensor.zeros(*shape, dtype=dtype)
@@ -51,10 +68,9 @@ def _zeros(*shape, dtype="bf16"):
 
 def _tensor(data, dtype="f32"):
     if _IS_METAL:
-        from popcorn.backend import PT
+        import mlx.core as mx
 
-        _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
-        return PT.tensor(data, dtype=_dt.get(dtype, PT.float32))
+        return mx.array(data).astype(_mx_dt(dtype))
     from popcorn.runtime.tensor import PopcornTensor
 
     return PopcornTensor.from_list(data, dtype=dtype)
@@ -62,10 +78,7 @@ def _tensor(data, dtype="f32"):
 
 def _astype(x, dtype: str):
     if _IS_METAL:
-        from popcorn.backend import PT
-
-        _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
-        return PT.astype(x, _dt.get(dtype, PT.bfloat16))
+        return x.astype(_mx_dt(dtype))
     return x.astype(dtype)
 
 
@@ -78,14 +91,9 @@ def _quantize_to_e4m3(t):
 
 def _profile_sync():
     """Sync the active backend so wall-clock time reflects GPU time."""
-    if _IS_METAL:
-        from popcorn.backend import PT
+    from popcorn.runtime.sync import synchronize
 
-        PT.synchronize()
-    else:
-        from popcorn.runtime.cuda import CudaRuntime
-
-        CudaRuntime.instance().stream_synchronize(0)
+    synchronize()
 
 
 class Parameter:

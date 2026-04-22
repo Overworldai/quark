@@ -155,17 +155,20 @@ def _evaluate_config(
     ``None`` if the kernel's ``prepare_launch_tensors`` raised (caller
     logs and skips). Side effect: logs outcome via ``say``.
     """
-    from popcorn.backend import IS_METAL, PT
-    from popcorn.correctness import check_correctness
+    import sys as _sys
 
-    # Drain any async error queued by a prior config before we start
-    # this one. Without this barrier, a prior launch's misaligned /
-    # OOB access surfaces on the NEXT config's ``PT.zero_`` (or on the
-    # first torch/CUDA call after the faulting kernel finally hits
-    # the error reporter), and gets attributed to the wrong config.
-    # Surface it here, attribute it to "prior config", move on.
+    from popcorn.correctness import check_correctness
+    from popcorn.launcher.launcher import _time_callable
+    from popcorn.runtime.sync import ir_dtype_of, synchronize, zero_buffer
+
+    _is_metal = _sys.platform == "darwin"
+
+    # Drain any async error queued by a prior config. Without the sync
+    # a prior launch's misaligned / OOB access surfaces on the NEXT
+    # config's ``zero_buffer`` (or the first device call after the
+    # faulting kernel) and gets misattributed. Surface here, move on.
     try:
-        PT.synchronize()
+        synchronize()
     except BaseException as _e:
         say(f"  [prior cfg error drained]: {type(_e).__name__}: {_e}")
 
@@ -178,21 +181,21 @@ def _evaluate_config(
 
     cfg_buffers = [launch_tensors[b.name] for b in pspec.buffers]
     try:
-        cfg_output_buf = PT.zero_(cfg_buffers[out_idx])
+        cfg_output_buf = zero_buffer(cfg_buffers[out_idx])
         cfg_buffers[out_idx] = cfg_output_buf
         _launch_result = compiled.launch(buffers=cfg_buffers)
-        PT.synchronize()
+        synchronize()
     except BaseException as _e:
         say(f"  [launch err] {cfg}: {type(_e).__name__}: {_e}")
         return float("inf"), "launch"
 
-    if IS_METAL and _launch_result:
+    if _is_metal and _launch_result:
         out_pos = sum(1 for b in pspec.buffers[:out_idx] if not b.readonly)
         actual_output = _launch_result[out_pos]
     else:
         actual_output = cfg_output_buf
 
-    out_dtype = PT.backend_dtype_to_ir(actual_output.dtype)
+    out_dtype = ir_dtype_of(actual_output)
     cr = check_correctness(
         actual_output,
         reference,
@@ -204,9 +207,9 @@ def _evaluate_config(
         return float("inf"), "wrong"
 
     try:
-        cfg_output_buf = PT.zero_(cfg_buffers[out_idx])
+        cfg_output_buf = zero_buffer(cfg_buffers[out_idx])
         cfg_buffers[out_idx] = cfg_output_buf
-        us = PT.time_callable(
+        us = _time_callable(
             lambda _c=compiled, _b=cfg_buffers: _c.launch(buffers=_b),
             warmup_ms=10.0,
             bench_ms=bench_ms,
@@ -241,26 +244,29 @@ def run_full_search(
         fast_cfg = cache._search_fast(kernel_cls, spec, seeds)
         return (fast_cfg, float("inf")) if fast_cfg is not None else None
 
+    from popcorn.refs import ref_cache
+    from popcorn.runtime.device_tensors import numpy_to_device_dict
+
     spec_dict = dataclasses.asdict(spec) if dataclasses.is_dataclass(spec) else {}
 
     try:
-        tensors = kernel_cls.make_tensors(spec_dict)
+        inputs_np, outputs_np = ref_cache().get(kernel_cls, spec_dict)
     except Exception as e:
-        _log(name, f"full search: make_tensors failed ({e}), falling back to fast")
+        _log(name, f"full search: ref_cache.get failed ({e}), falling back to fast")
         fast_cfg = cache._search_fast(kernel_cls, spec, seeds)
         return (fast_cfg, float("inf")) if fast_cfg is not None else None
 
     try:
         default_kernel = kernel_cls.from_problem(spec_dict)
         pspec = default_kernel.param_spec()
-        buffers = [tensors[b.name] for b in pspec.buffers]
+        tensors = numpy_to_device_dict(kernel_cls, default_kernel.spec, inputs_np)
         out_idx = kernel_cls.OUTPUT_IDX
         if out_idx < 0:
-            out_idx = len(buffers) + out_idx
-        inputs = [buffers[i] for i in range(len(buffers)) if i != out_idx]
-        reference = default_kernel.reference(*inputs)
+            out_idx = len(pspec.buffers) + out_idx
+        output_name = pspec.buffers[out_idx].name
+        reference = outputs_np[output_name]
     except Exception as e:
-        _log(name, f"full search: reference failed ({e}), falling back to fast")
+        _log(name, f"full search: ref setup failed ({e}), falling back to fast")
         fast_cfg = cache._search_fast(kernel_cls, spec, seeds)
         return (fast_cfg, float("inf")) if fast_cfg is not None else None
 

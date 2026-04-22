@@ -1,78 +1,51 @@
-"""Backend-agnostic reference for the universal GEMM.
+"""GEMM numpy reference — ``C = A @ B^T`` with f32 accumulation.
 
-``C[M, N] = A[M, K] @ B^T[N, K]^T``
-
-Accumulates in f32, casts to the requested output dtype at the end.
-Uses ``popcorn.backend.PT`` for every tensor op so one reference runs
-on both torch (CUDA/CPU) and mlx (Metal).
+When ``compute_dtype`` differs from ``a_dtype`` / ``b_dtype`` we
+round-trip A / B through the compute carrier before the matmul so
+the cos-sim gate sees the same on-load precision loss the kernel
+does.
 """
 
 from __future__ import annotations
 
-from popcorn.backend import PT
+import numpy as np
+
 from popcorn.ir import DType
+from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
 
 
-def gemm_reference(
-    A,
-    B,
-    *,
-    out_dtype: DType | str = DType.BF16,
-    compute_dtype: DType | str | None = None,
-    activation: str | None = None,
-    bias=None,
-):
-    """``C = A @ B^T``, accumulated in f32, cast to ``out_dtype``.
-
-    A: ``[M, K]`` (or ``[*, K]`` — flattened to 2D first).
-    B: ``[N, K]`` (the weight matrix).
-    Returns ``[M, N]`` in the requested output dtype.
-
-    When ``compute_dtype`` is set and differs from the source A/B
-    dtype, the tensor is roundtripped through that dtype first — the
-    same on-load cast the kernel applies, so the cos-sim gate sees
-    the same precision loss on both sides.
-    """
-    if A.ndim > 2:
-        A = A.reshape(-1, A.shape[-1])
-    K = A.shape[-1]
-    assert B.shape[1] == K, f"K mismatch: A has K={K}, B has K={B.shape[1]}"
-
-    out_dt = DType(out_dtype) if isinstance(out_dtype, str) else out_dtype
-
-    # Simulate the compute-dtype cast.
-    if compute_dtype is not None:
-        compute_dt = DType(compute_dtype) if isinstance(compute_dtype, str) else compute_dtype
-        ct = compute_dt.backend
-        if A.dtype != ct:
-            A = PT.astype(A, ct)
-        if B.dtype != ct:
-            B = PT.astype(B, ct)
-
-    A_f32 = PT.astype(A, PT.float32)
-    B_f32 = PT.astype(B, PT.float32)
-    C_f32 = PT.matmul(A_f32, PT.transpose(B_f32))
-
-    if bias is not None:
-        C_f32 = C_f32 + PT.astype(bias, PT.float32)
-
-    if activation == "silu":
-        # SiLU in f32 matches the kernel, which applies the fused
-        # rcp+ex2 silu pre-cast in store_acc.
-        C_f32 = C_f32 * (1.0 / (1.0 + PT.exp(-C_f32)))
-    elif activation is not None:
-        raise ValueError(f"gemm_reference: unsupported activation {activation!r}")
-
-    return PT.astype(C_f32, out_dt.backend)
+def _roundtrip_through(arr_f32: np.ndarray, target: DType) -> np.ndarray:
+    """f32 → carrier → f32. Matches the kernel's on-load cast."""
+    carrier = astype_numpy(arr_f32, target)
+    return to_f32_numpy(carrier, dtype_hint=target.value)
 
 
-def gemm_reference_for_spec(kernel, A, B, Bias=None):
-    s = kernel.spec
-    return gemm_reference(
-        A,
-        B,
-        out_dtype=s.out_dtype,
-        compute_dtype=s.compute_dtype_resolved,
-        activation=s.activation,
-        bias=Bias if s.has_bias else None,
-    )
+def gemm_reference_numpy(spec, *, A, B, Bias=None, Out=None):
+    del Out
+    a_hint = spec.a_dtype.value
+    b_hint = spec.b_dtype.value
+
+    a = to_f32_numpy(A, dtype_hint=a_hint)
+    b = to_f32_numpy(B, dtype_hint=b_hint)
+
+    if a.ndim > 2:
+        a = a.reshape(-1, a.shape[-1])
+
+    # Simulate the compute-dtype cast when it differs from the source.
+    compute_dt = spec.compute_dtype_resolved
+    if compute_dt is not spec.a_dtype:
+        a = _roundtrip_through(a, compute_dt)
+    if compute_dt is not spec.b_dtype:
+        b = _roundtrip_through(b, compute_dt)
+
+    c = a @ b.T
+
+    if spec.has_bias and Bias is not None:
+        c = c + to_f32_numpy(Bias, dtype_hint=spec.out_dtype.value)
+
+    if spec.activation == "silu":
+        c = c * (1.0 / (1.0 + np.exp(-c)))
+    elif spec.activation is not None:
+        raise ValueError(f"gemm_reference: unsupported activation {spec.activation!r}")
+
+    return astype_numpy(c, spec.out_dtype)

@@ -63,11 +63,14 @@ def kernel(
         Installed as the instance ``baselines(self, tensors)`` method;
         the function gets the full kernel so it can reach ``kernel.spec``
         / ``kernel.config`` as needed.
-      * ``reference`` — ``fn(kernel, *tensors) -> out``. Installed as
-        the instance ``reference(self, *tensors)`` method.
+      * ``reference`` — ``fn(spec, **inputs_np) -> dict[str, ndarray] | ndarray``.
+        Installed as the ``reference_numpy(cls, spec, **inputs)`` classmethod.
+        Single-output kernels may return a bare ``np.ndarray``; multi-output
+        kernels return a ``{name: ndarray}`` dict keyed on the role="out"
+        TensorDecl names.
 
     Each hook lets the kernel keep its bookkeeping (problems table,
-    baseline construction, torch reference) in sibling modules so
+    baseline construction, numpy reference) in sibling modules so
     ``kernel.py`` stays focused on IR emission.
     """
 
@@ -93,11 +96,15 @@ def kernel(
             cls.baselines = _baselines  # type: ignore
 
         if reference is not None:
+            # ``reference`` is the numpy oracle. Store it as a
+            # classmethod so ``RefCache.get()`` can invoke it as
+            # ``kernel_cls.reference_numpy(spec, **inputs)``.
+            _ref_fn = reference
 
-            def _reference(self, *tensors, _fn=reference):
-                return _fn(self, *tensors)
+            def _reference_numpy(_cls, spec, _fn=_ref_fn, **inputs):
+                return _fn(spec, **inputs)
 
-            cls.reference = _reference  # type: ignore
+            cls.reference_numpy = classmethod(_reference_numpy)  # type: ignore
             cls.__abstractmethods__ = frozenset(  # type: ignore
                 m for m in getattr(cls, "__abstractmethods__", ()) if m != "reference"
             )

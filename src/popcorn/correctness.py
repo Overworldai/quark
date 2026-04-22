@@ -1,9 +1,9 @@
-"""Correctness metric for popcorn kernels — cosine similarity only.
+"""Correctness metric for popcorn kernels — cosine similarity, numpy-only.
 
-Per popcorn cleanup proposal §7. Replaces today's multi-metric
-`Kernel.correctness()` routine. The single gating criterion is
-cosine similarity, with thresholds picked from a dtype × accumulator
-table tuned against measured rounding behavior on real kernels.
+Per the numpy-refs migration: zero torch / mlx dependency at the
+autotune correctness gate. Inputs are normalized to f32 numpy via
+``popcorn.runtime.npconv.to_f32_numpy`` regardless of whether they
+arrive as ``PopcornTensor``, ``mx.array``, or raw numpy arrays.
 
 Why cosine similarity:
 
@@ -11,69 +11,45 @@ Why cosine similarity:
   that grows with reduction depth (large K). Direction of the
   output vector stays correct even when individual elements drift,
   so a directional metric is right.
-- `max_abs` and `mean_abs` exist as **diagnostic** fields on the
+- ``max_abs`` and ``mean_abs`` exist as **diagnostic** fields on the
   result struct, but are NEVER consulted for the pass/fail decision.
-  Tightening pass/fail to elementwise tolerances re-introduces
-  shape-scaled false positives the cosine path is designed to
-  avoid.
 - NaN / Inf in the output is a hard failure regardless of cosine
   similarity. NaN in the *reference* is rejected at the helper's
   entry — fix the reference instead of comparing to NaN.
-
-The proposal also bans shape-scaled thresholds: the table here is
-**fixed** at construction time. If a huge-K test fails on
-correctness, the response is to verify the reference computes the
-same way (f32 accumulation, same reduction order) or override the
-threshold on that ONE kernel via `Kernel.CORRECTNESS_THRESHOLD`.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
 
 from popcorn.ir import DType
+from popcorn.runtime.npconv import to_f32_numpy
 
 # ---------------------------------------------------------------------------
 # Threshold table
 # ---------------------------------------------------------------------------
 
 
-# Default cosine similarity thresholds, keyed by (out_dtype, accum_dtype).
-# Rationale:
-#   - wider output dtype  → tighter threshold
-#   - wider accumulator   → tighter threshold at a given output dtype
-# Tuned against measured rounding behavior on real kernels, not from
-# first principles. **Do not loosen these without a documented incident.**
 _THRESHOLD_TABLE: dict[tuple[DType, DType], float] = {
-    # f32 output
-    (DType.F32, DType.F32): 1 - 1e-5,  # exact modulo FMA reordering
-    (DType.F32, DType.F16): 1 - 1e-3,  # rare: f16 accum into f32 out
-    # bf16 output, various accumulators
-    (DType.BF16, DType.F32): 1 - 1e-3,  # the common path — GEMM, rmsnorm, MoE
+    (DType.F32, DType.F32): 1 - 1e-5,
+    (DType.F32, DType.F16): 1 - 1e-3,
+    (DType.BF16, DType.F32): 1 - 1e-3,
     (DType.BF16, DType.F16): 1 - 3e-3,
-    # f16 output
     (DType.F16, DType.F32): 1 - 1e-3,
-    (DType.F16, DType.F16): 1 - 5e-3,  # fp16 accumulated in fp16 — loose
-    # e4m3 output (rare — usually only intermediates)
+    (DType.F16, DType.F16): 1 - 5e-3,
     (DType.E4M3, DType.F32): 1 - 5e-3,
-    # int output (scatter/gather kernels, indexing)
-    (DType.S32, DType.S32): 1 - 1e-9,  # integer must be bitwise equal
+    (DType.S32, DType.S32): 1 - 1e-9,
     (DType.U32, DType.U32): 1 - 1e-9,
 }
 
 
 def _threshold_for(out: DType, accum: DType) -> float:
-    """Look up the default threshold for a (output, accumulator) pair.
-
-    Falls back to a conservative `1 - 5e-3` when the combination
-    isn't in the table — that's loose enough to catch direction
-    flips but tight enough that any real bug shows up.
-    """
     key = (out, accum)
-    if key in _THRESHOLD_TABLE:
-        return _THRESHOLD_TABLE[key]
-    return 1 - 5e-3
+    return _THRESHOLD_TABLE.get(key, 1 - 5e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +59,6 @@ def _threshold_for(out: DType, accum: DType) -> float:
 
 @dataclass
 class CorrectnessResult:
-    """Outcome of one `check_correctness` call.
-
-    `passed` and `cos_sim` are the only fields the caller should
-    branch on. `reason` is a human string for failure reporting.
-    `mean_abs` and `max_abs` are populated only when the cosine
-    check FAILS — they're diagnostic-only and should never be
-    consulted for pass/fail logic by upstream code.
-    """
-
     passed: bool
     cos_sim: float
     threshold: float = 0.0
@@ -104,90 +71,108 @@ class CorrectnessResult:
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _dtype_hint(x: Any, fallback: DType | None) -> str | None:
+    """Best-effort dtype hint for ``to_f32_numpy``. PopcornTensor and
+    mx.array self-describe their dtype; raw numpy u16/u8 arrays can't,
+    so we fall back to the kernel's declared ``out_dtype`` when the
+    caller passed a raw numpy carrier."""
+    if isinstance(x, np.ndarray) and x.dtype in (np.uint16, np.uint8):
+        if fallback is None:
+            return None
+        return fallback.value  # DType enum values are the short strings
+    return None
+
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    """f32 cosine similarity on flat views. Uses ``float64`` accum so
+    the norms + dot don't underflow to zero on long low-magnitude
+    reductions."""
+    af = a.ravel().astype(np.float64, copy=False)
+    bf = b.ravel().astype(np.float64, copy=False)
+    dot = float(np.dot(af, bf))
+    na = float(np.linalg.norm(af))
+    nb = float(np.linalg.norm(bf))
+    if na == 0.0 or nb == 0.0:
+        # Two zero vectors are equal by definition; one-zero is drift.
+        if na == 0.0 and nb == 0.0:
+            return 1.0
+        return 0.0
+    return dot / (na * nb)
+
+
+# ---------------------------------------------------------------------------
 # Public helper
 # ---------------------------------------------------------------------------
 
 
 def check_correctness(
-    out,
-    ref,
+    out: Any,
+    ref: Any,
     *,
     out_dtype: DType,
     accum_dtype: DType = DType.F32,
     threshold: float | None = None,
 ) -> CorrectnessResult:
-    """Compare `out` against `ref` via cosine similarity.
+    """Compare ``out`` against ``ref`` via cosine similarity.
 
-    Args:
-      out: kernel output (torch or mlx tensor; any device).
-      ref: reference output from the kernel's `reference()` method
-        (also torch or mlx — may differ from `out`'s backend).
-      out_dtype: the kernel's declared output dtype, used to look up
-        the default threshold from the dtype table.
-      accum_dtype: the kernel's declared accumulator dtype. Default
-        F32 — most kernels in this repo accumulate in f32 even when
-        outputting bf16 / fp16. Pass the actual accumulator if it
-        differs (e.g. f16 accum on older GPUs).
-      threshold: override the dtype-table default. Use sparingly —
-        per-kernel overrides should sit in
-        `KernelClass.CORRECTNESS_THRESHOLD` instead.
+    Both arguments are normalized to f32 numpy internally — accepts
+    ``PopcornTensor`` (CUDA runtime), ``mx.array`` (Metal), or raw
+    numpy arrays. ``out_dtype`` serves double duty: it picks the
+    default threshold *and* disambiguates numpy carrier dtypes (e.g.
+    a raw ``uint16`` array could be bf16 or a genuine u16 index
+    buffer — the declared kernel ``out_dtype`` decides).
 
-    Returns:
-      `CorrectnessResult` with `passed`, `cos_sim`, and `threshold`
-      filled in. On failure, `reason`, `mean_abs`, `max_abs` are
-      populated for diagnostic printing.
-
-    Raises:
-      ValueError: if `ref` contains NaN. The reference is the source
-        of truth — a NaN there is a bug in the reference, not a
-        kernel bug, and we don't compare against it.
+    Raises ``ValueError`` if ``ref`` contains NaN — the reference is
+    the source of truth, so a NaN there is a reference bug and we
+    refuse to silently compare against it.
     """
-    from popcorn.backend import PT
-
     thresh = threshold if threshold is not None else _threshold_for(out_dtype, accum_dtype)
 
-    n_out = PT.numel(out)
-    n_ref = PT.numel(ref)
-    if n_out != n_ref:
+    out_np = to_f32_numpy(out, dtype_hint=_dtype_hint(out, out_dtype))
+    ref_np = to_f32_numpy(ref, dtype_hint=_dtype_hint(ref, out_dtype))
+
+    if out_np.size != ref_np.size:
         return CorrectnessResult(
             passed=False,
             cos_sim=float("nan"),
             threshold=thresh,
-            reason=f"output / reference numel mismatch: out={n_out} ref={n_ref}",
+            reason=f"output / reference numel mismatch: out={out_np.size} ref={ref_np.size}",
         )
 
-    # NaN/Inf hard checks. NaN in the reference is a bug we refuse to
-    # silently compare against; NaN/Inf in the output is a hard failure
-    # that short-circuits the cosine math.
-    if PT.has_nan(ref):
+    if np.isnan(ref_np).any():
         raise ValueError(
             "check_correctness: reference contains NaN — fix the reference, don't compare to NaN"
         )
-    if not PT.all_finite(out):
-        bad_idx = PT.first_non_finite_index(out)
+
+    finite_mask = np.isfinite(out_np)
+    if not finite_mask.all():
+        bad_flat = np.argmax(~finite_mask)
         return CorrectnessResult(
             passed=False,
             cos_sim=float("nan"),
             threshold=thresh,
-            reason=f"output contains NaN/Inf at flat index {bad_idx}",
+            reason=f"output contains NaN/Inf at flat index {int(bad_flat)}",
             mean_abs=float("nan"),
             max_abs=float("nan"),
         )
 
-    cos_sim = PT.cosine_sim(out, ref)
+    cos_sim = _cosine_sim(out_np, ref_np)
     passed = cos_sim >= thresh
-
     if passed:
         return CorrectnessResult(passed=True, cos_sim=cos_sim, threshold=thresh)
 
-    mean_abs, max_abs = PT.abs_diff_stats(out, ref)
+    diff = np.abs(out_np - ref_np)
     return CorrectnessResult(
         passed=False,
         cos_sim=cos_sim,
         threshold=thresh,
         reason=f"cos_sim={cos_sim:.6f} < {thresh:.6f}",
-        mean_abs=mean_abs,
-        max_abs=max_abs,
+        mean_abs=float(diff.mean()),
+        max_abs=float(diff.max()),
     )
 
 
@@ -197,14 +182,6 @@ def check_correctness(
 
 
 def threshold_for_kernel(kernel_cls, out_dtype: DType, accum_dtype: DType = DType.F32) -> float:
-    """Pick the threshold a given kernel class wants.
-
-    Reads `kernel_cls.CORRECTNESS_THRESHOLD` if defined, otherwise
-    falls back to the dtype table. Per the proposal: per-kernel
-    overrides are a code smell — only set them when the dtype table
-    really doesn't capture the kernel's precision profile (e.g.
-    online softmax + RoPE branch dispatch).
-    """
     override = getattr(kernel_cls, "CORRECTNESS_THRESHOLD", None)
     if override is not None and not (isinstance(override, float) and math.isnan(override)):
         return float(override)

@@ -17,7 +17,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.silu.baselines import silu_baselines
 from popcorn.kernels.silu.config import SiLUConfig
 from popcorn.kernels.silu.problems import silu_problems
-from popcorn.kernels.silu.reference import silu_reference_for_spec
+from popcorn.kernels.silu.reference import silu_reference_numpy
 from popcorn.kernels.silu.spec import SiLUSpec
 
 _LOG2E = math.log2(math.e)
@@ -30,7 +30,7 @@ _LOG2E = math.log2(math.e)
     output_idx=-1,
     problems=silu_problems,
     baselines=silu_baselines,
-    reference=silu_reference_for_spec,
+    reference=silu_reference_numpy,
 )
 class SiLUKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -65,14 +65,17 @@ class SiLUKernel(Kernel):
         return {"n_warps": [1, 2, 4, 8], "elems_per_block": [128, 256, 512, 1024, 2048]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = SiLUSpec(**problem)
-        dt = spec.dtype.backend
+        rng = np.random.default_rng(seed)
+        x_f32 = rng.standard_normal(spec.N).astype(np.float32)
         return {
-            "X": PT.astype(PT.randn(spec.N), dt),
-            "Out": PT.zeros(spec.N, dtype=dt),
+            "X": astype_numpy(x_f32, spec.dtype),
+            "Out": zeros_for_dtype((spec.N,), spec.dtype),
         }
 
     @classmethod

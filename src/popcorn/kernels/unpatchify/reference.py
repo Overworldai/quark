@@ -1,29 +1,22 @@
-"""Unpatchify reference."""
+"""Unpatchify numpy reference — matmul + rearrange."""
 
 from __future__ import annotations
 
-from popcorn.backend import PT
+from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
 
 
-def unpatchify_reference_for_spec(kernel, X, W, Bias):
-    s = kernel.spec
+def unpatchify_reference_numpy(spec, *, X, W, Bias, Out=None):
+    del Out
+    hint = spec.dtype.value
+    x = to_f32_numpy(X, dtype_hint=hint)
+    w = to_f32_numpy(W, dtype_hint=hint)
+    h = x @ w.T  # [M, C*ph*pw]
+    if spec.has_bias:
+        h = h + to_f32_numpy(Bias, dtype_hint=hint)
 
-    X_f = PT.astype(X, PT.float32)
-    W_f = PT.astype(W, PT.float32)
-    h = PT.matmul(X_f, PT.transpose(W_f))  # [M, C*ph*pw]
-    if s.has_bias:
-        h = h + PT.astype(Bias, PT.float32)
-
-    # Rearrange to [B, C*H*W].
-    B, C = s.B, s.C
-    Hp, Wp = s.Hp, s.Wp
-    ph, pw = s.ph, s.pw
-    h_r = h.reshape(B, Hp, Wp, C, ph, pw)
-    if PT._is_mx(h_r):
-        import mlx.core as mx
-
-        h_r = mx.transpose(h_r, (0, 3, 1, 4, 2, 5))
-    else:
-        h_r = h_r.permute(0, 3, 1, 4, 2, 5).contiguous()
-    out = h_r.reshape(B, C * s.H * s.W)
-    return PT.astype(out, s.dtype.backend)
+    B, C = spec.B, spec.C
+    Hp, Wp = spec.Hp, spec.Wp
+    ph, pw = spec.ph, spec.pw
+    h = h.reshape(B, Hp, Wp, C, ph, pw).transpose(0, 3, 1, 4, 2, 5)
+    out = h.reshape(B, C * spec.H * spec.W)
+    return astype_numpy(out, spec.dtype)

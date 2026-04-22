@@ -26,7 +26,7 @@ from popcorn.kernels.base import Kernel
 from popcorn.kernels.decorator import kernel
 from popcorn.kernels.elementwise.config import ElementwiseConfig
 from popcorn.kernels.elementwise.problems import elementwise_problems
-from popcorn.kernels.elementwise.reference import elementwise_reference_for_spec
+from popcorn.kernels.elementwise.reference import elementwise_reference_numpy
 from popcorn.kernels.elementwise.spec import BINARY_OPS, ElementwiseSpec
 
 _LOG2E = math.log2(math.e)
@@ -46,7 +46,7 @@ def _y_shape(s, c):
     output_idx=-1,
     problems=elementwise_problems,
     baselines=lambda: [],
-    reference=elementwise_reference_for_spec,
+    reference=elementwise_reference_numpy,
 )
 class ElementwiseKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -101,19 +101,21 @@ class ElementwiseKernel(Kernel):
         return {"n_warps": [1, 2, 4, 8], "elems_per_block": [128, 256, 512, 1024, 2048]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = ElementwiseSpec(**problem)
-        dt = spec.dtype.backend
+        rng = np.random.default_rng(seed)
         tensors = {
-            "X": PT.astype(PT.randn(spec.N), dt),
-            "Out": PT.zeros(spec.N, dtype=spec.effective_out_dtype.backend),
+            "X": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype),
+            "Out": zeros_for_dtype((spec.N,), spec.effective_out_dtype),
         }
         if spec.arity == 2:
-            tensors["Y"] = PT.astype(PT.randn(spec.N), dt)
+            tensors["Y"] = astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype)
         else:
-            tensors["Y"] = PT.zeros(1, dtype=dt)
+            tensors["Y"] = zeros_for_dtype((1,), spec.dtype)
         return tensors
 
     @classmethod

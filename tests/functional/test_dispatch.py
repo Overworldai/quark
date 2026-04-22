@@ -14,19 +14,29 @@ rather than the raw Launcher path.
 
 from __future__ import annotations
 
+import sys as _sys
+
 import pytest
 
-from popcorn.backend import IS_METAL
+pytest.importorskip(
+    "torch",
+    reason=(
+        "torch removed from runtime; numpy-refs migration — test kept "
+        "for dev-only cross-check when torch is installed"
+    ),
+)
+
+import popcorn.functional as pcf
+from popcorn.correctness import check_correctness
+from popcorn.kernels import get
+
+IS_METAL = _sys.platform == "darwin"
 
 if not IS_METAL:
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("no GPU available (CUDA or Metal)", allow_module_level=True)
-
-import popcorn.functional as pcf
-from popcorn.correctness import check_correctness
-from popcorn.kernels import get
 
 
 def _skip_fp8_on_metal(params: dict) -> bool:
@@ -44,9 +54,13 @@ def _first_valid_problem(kernel_cls):
 
 
 def _check(out, ref, out_dtype, kernel_cls):
-    from popcorn.backend import PT
+    from popcorn.ir import DType
+    from popcorn.runtime.sync import ir_dtype_of
 
-    out_ir = PT.backend_dtype_to_ir(out.dtype)
+    try:
+        out_ir = ir_dtype_of(out)
+    except TypeError:
+        out_ir = DType.from_backend(out.dtype)
     threshold = kernel_cls.correctness_threshold(out_ir)
     cr = check_correctness(out, ref, out_dtype=out_ir, threshold=threshold)
     assert cr.passed, f"{kernel_cls.NAME}: cos_sim={cr.cos_sim:.4f} below threshold"

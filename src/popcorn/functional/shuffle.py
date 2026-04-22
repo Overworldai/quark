@@ -73,11 +73,11 @@ def shuffle_b_for_moe_inproj(X, W_in, *, n_experts, top_k=2, out_dtype=None, com
     cls = get("moe_inproj")
     # spec_from_tensors needs token_ids + work_list just for validation,
     # but they don't affect the shuffle layout. Synthesize placeholders.
-    from popcorn.backend import PT
+    from popcorn.functional._dispatch import _zero_placeholder_s32
 
     total_slots = X.shape[0] * top_k
-    token_ids = PT.zeros(total_slots, dtype=PT.int32)
-    work_list = PT.zeros(2, dtype=PT.int32)
+    token_ids = _zero_placeholder_s32(total_slots, like=X)
+    work_list = _zero_placeholder_s32(2, like=X)
     spec = cls.spec_from_tensors(
         X,
         W_in,
@@ -106,12 +106,12 @@ def shuffle_b_for_moe_outproj(
     unchanged — see :func:`shuffle_b_for_moe_inproj`.
     """
     cls = get("moe_outproj")
-    from popcorn.backend import PT
+    from popcorn.functional._dispatch import _zero_placeholder_f32, _zero_placeholder_s32
 
     total_slots = M * top_k
-    token_ids = PT.zeros(total_slots, dtype=PT.int32)
-    slot_weights = PT.zeros(total_slots, dtype=PT.float32)
-    work_list = PT.zeros(2, dtype=PT.int32)
+    token_ids = _zero_placeholder_s32(total_slots, like=h_in)
+    slot_weights = _zero_placeholder_f32(total_slots, like=h_in)
+    work_list = _zero_placeholder_s32(2, like=h_in)
     spec = cls.spec_from_tensors(
         h_in,
         W_out,

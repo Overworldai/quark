@@ -38,7 +38,7 @@ from popcorn.kernels.base import Kernel
 from popcorn.kernels.decorator import kernel
 from popcorn.kernels.randn.config import RandnConfig
 from popcorn.kernels.randn.problems import randn_problems
-from popcorn.kernels.randn.reference import randn_reference_for_spec
+from popcorn.kernels.randn.reference import randn_reference_numpy
 from popcorn.kernels.randn.spec import RandnSpec
 
 # Philox4x32-10 constants (standard — same values every implementation uses).
@@ -64,7 +64,7 @@ _U_BIAS = 2.0**-25
     output_idx=-1,
     problems=randn_problems,
     baselines=lambda: [],
-    reference=randn_reference_for_spec,
+    reference=randn_reference_numpy,
 )
 class RandnKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -118,13 +118,16 @@ class RandnKernel(Kernel):
         return {}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
 
+        from popcorn.runtime.npconv import zeros_for_dtype
+
+        del seed
         spec = RandnSpec(**problem)
         return {
-            "counter_offset": PT.zeros(1, dtype=PT.uint32),
-            "Out": PT.zeros(spec.N, dtype=spec.dtype.backend),
+            "counter_offset": np.zeros(1, dtype=np.uint32),
+            "Out": zeros_for_dtype((spec.N,), spec.dtype),
         }
 
     @classmethod

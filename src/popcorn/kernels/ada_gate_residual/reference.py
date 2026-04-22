@@ -1,33 +1,22 @@
-"""AdaGateResidual reference — ``out = x + gate_bmcast * y``."""
+"""AdaGateResidual numpy reference — ``out = x + gate_bmcast * y``."""
 
 from __future__ import annotations
 
-from popcorn.backend import PT
-from popcorn.ir import DType
+import numpy as np
+
+from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
 
 
-def ada_gate_residual_reference(X, Y, gate, *, dtype: DType | str = DType.BF16):
-    out_dt = DType(dtype) if isinstance(dtype, str) else dtype
-    B = int(X.shape[0])
-    G = int(gate.shape[0])
+def ada_gate_residual_reference_numpy(spec, *, X, Y, gate, Out=None):
+    del Out
+    hint = spec.dtype.value
+    x = to_f32_numpy(X, dtype_hint=hint)
+    y = to_f32_numpy(Y, dtype_hint=hint)
+    g = to_f32_numpy(gate, dtype_hint=hint)
+
+    B, G = spec.B, spec.G
     M = B // G
-    assert G * M == B, f"X rows ({B}) not divisible by gate groups ({G})"
-
-    X_f = PT.astype(X, PT.float32)
-    Y_f = PT.astype(Y, PT.float32)
-    G_f = PT.astype(gate, PT.float32)
-
-    if PT._is_mx(G_f):
-        import mlx.core as mx
-
-        g_bm = mx.repeat(G_f, M, axis=0)
-    else:
-        g_bm = G_f.repeat_interleave(M, dim=0)
-
-    out = X_f + g_bm * Y_f
-    return PT.astype(out, out_dt.backend)
-
-
-def ada_gate_residual_reference_for_spec(kernel, X, Y, gate):
-    s = kernel.spec
-    return ada_gate_residual_reference(X, Y, gate, dtype=s.dtype)
+    # Broadcast gate [G, D] → [B, D] by repeating each row M times.
+    g_bm = np.repeat(g, M, axis=0)
+    out = x + g_bm * y
+    return astype_numpy(out, spec.dtype)

@@ -36,7 +36,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.unpatchify.baselines import unpatchify_baselines
 from popcorn.kernels.unpatchify.config import UnpatchifyConfig
 from popcorn.kernels.unpatchify.problems import unpatchify_problems
-from popcorn.kernels.unpatchify.reference import unpatchify_reference_for_spec
+from popcorn.kernels.unpatchify.reference import unpatchify_reference_numpy
 from popcorn.kernels.unpatchify.spec import UnpatchifySpec
 
 
@@ -47,7 +47,7 @@ from popcorn.kernels.unpatchify.spec import UnpatchifySpec
     output_idx=-1,
     problems=unpatchify_problems,
     baselines=unpatchify_baselines,
-    reference=unpatchify_reference_for_spec,
+    reference=unpatchify_reference_numpy,
 )
 class UnpatchifyKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -116,16 +116,23 @@ class UnpatchifyKernel(Kernel):
         }
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = UnpatchifySpec(**problem)
-        dt = spec.dtype.backend
-        X = PT.astype(PT.randn(spec.M, spec.K), dt)
-        W = PT.astype(PT.randn(spec.N, spec.K), dt)
-        Bias = PT.astype(PT.randn(spec.N), dt) if spec.has_bias else PT.zeros(1, dtype=dt)
-        Out = PT.zeros(spec.B, spec.C * spec.H * spec.W, dtype=dt)
-        return {"X": X, "W": W, "Bias": Bias, "Out": Out}
+        rng = np.random.default_rng(seed)
+        if spec.has_bias:
+            bias_np = astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype)
+        else:
+            bias_np = zeros_for_dtype((1,), spec.dtype)
+        return {
+            "X": astype_numpy(rng.standard_normal((spec.M, spec.K)).astype(np.float32), spec.dtype),
+            "W": astype_numpy(rng.standard_normal((spec.N, spec.K)).astype(np.float32), spec.dtype),
+            "Bias": bias_np,
+            "Out": zeros_for_dtype((spec.B, spec.C * spec.H * spec.W), spec.dtype),
+        }
 
     @classmethod
     def spec_from_tensors(

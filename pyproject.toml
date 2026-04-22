@@ -2,20 +2,23 @@
 name = "popcorn"
 version = "0.1.0"
 requires-python = ">=3.11"
-# Base deps cover only what the launcher needs at steady state:
-# numpy everywhere, mlx for the Metal driver path. torch is an
-# optional dev dep used by reference implementations and the autotune
-# correctness gate — installs that skip autotune don't need it.
+# Runtime deps: numpy everywhere (inference path + numpy-refs oracle),
+# mlx on Metal (kernel launch driver). No torch — the numpy-refs
+# migration dropped it from every runtime code path and from the
+# autotune correctness gate.
 dependencies = [
     "numpy",
     "mlx; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
-# ``pip install .[dev]`` pulls torch for reference impls + autotune
-# correctness checks plus pytest for the test suite.
+# ``pip install .[dev]`` pulls the test runner. A couple of legacy
+# cross-check scripts (``tests/cross_check_world_engine.py``,
+# ``scripts/bench_world_engine.py``) and the VAE encode/decode helpers
+# (``scripts/{encode_frame,decode_latents}.py``) still reach for torch
+# — they're kept as standalone diagnostics and gate a graceful
+# ``ImportError`` when torch isn't installed.
 dev = [
-    "torch",
     "pytest",
 ]
 
@@ -118,9 +121,9 @@ call-non-callable = "error"
 # warn on them.
 unresolved-attribute = "warn"
 unresolved-import = "warn"
-# Torch's scaled_dot_product_attention returns `Tensor | tuple[...]`
-# depending on flags. Our callers know which variant they'll get, but
-# ty can't prove it without narrowing every call site — quiet.
+# MLX and numpy's type stubs are incomplete in spots (lazy attribute
+# exposure, overload gaps). Ignore missing-attr noise so lint stays
+# actionable on real bugs.
 possibly-missing-attribute = "ignore"
 
 [[tool.ty.overrides]]
@@ -138,11 +141,3 @@ invalid-argument-type = "ignore"
 # intentional, not shadowing bugs.
 invalid-assignment = "ignore"
 
-# flashinfer (cutlass fused MoE baseline) is an optional dep imported
-# inside a try/except ImportError block. Silence the
-# unresolved-import warning there so `make lint` is clean without
-# forcing flashinfer into the venv.
-[[tool.ty.overrides]]
-include = ["src/popcorn/kernels/moe_common.py"]
-[tool.ty.overrides.rules]
-unresolved-import = "ignore"

@@ -1,5 +1,12 @@
 """Tests for popcorn.correctness — cosine similarity gating helper."""
 
+import pytest
+
+pytest.importorskip(
+    "torch",
+    reason="torch removed from runtime; numpy-refs migration — test kept for dev-only cross-check when torch is installed",
+)
+
 import math
 
 import pytest

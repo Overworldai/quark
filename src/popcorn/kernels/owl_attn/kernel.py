@@ -55,7 +55,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.owl_attn.baselines import owl_attn_baselines
 from popcorn.kernels.owl_attn.config import AttnConfig as OwlAttnConfig
 from popcorn.kernels.owl_attn.problems import owl_attn_problems
-from popcorn.kernels.owl_attn.reference import owl_attn_reference_for_spec
+from popcorn.kernels.owl_attn.reference import owl_attn_reference_numpy
 from popcorn.kernels.owl_attn.spec import OwlAttnSpec
 
 
@@ -66,7 +66,7 @@ from popcorn.kernels.owl_attn.spec import OwlAttnSpec
     output_idx=-1,
     problems=owl_attn_problems,
     baselines=owl_attn_baselines,
-    reference=owl_attn_reference_for_spec,
+    reference=owl_attn_reference_numpy,
 )
 class OwlAttnKernel(Kernel):
     # Parameter manifest — every tensor shape derives from spec only
@@ -190,45 +190,46 @@ class OwlAttnKernel(Kernel):
         return 2 * 2 * s.B * s.n_q_heads * s.tpf * s.capacity * s.Dh
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
         """Build random-but-shape-valid inputs for the attention kernel.
 
         owl_attn *consumes* K_cache / Vt_cache / segments — it doesn't
         produce them. Test data here is generated directly, not by
         simulating the upstream kv_cache_update pipeline (which would
-        churn the allocator with 17 RoPE passes + set_slice writes +
-        broadcast/reshape copies, all irrelevant to this kernel's
-        correctness). Segments declare a single contiguous valid range
-        ``[0, capacity)`` so the kernel attends over the full cache,
-        matching what the real upstream pipeline would produce at
-        steady state (``num_buckets * tpf`` ring + ``tpf`` tail =
-        ``capacity``).
+        churn the allocator with redundant RoPE + set_slice work
+        irrelevant to this kernel's correctness). Segments declare a
+        single contiguous valid range ``[0, capacity)`` so the kernel
+        attends over the full cache, matching what the real upstream
+        pipeline would produce at steady state (``num_buckets * tpf``
+        ring + ``tpf`` tail = ``capacity``).
         """
-        from popcorn.backend import PT
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = OwlAttnSpec(**problem)
-        a_dt = spec.a_dtype.backend
-        kv_dt = spec.kv_dtype.backend
-        out_dt = spec.out_dtype.backend
-        B, Hq, Hk, tpf, Dh = (spec.B, spec.n_q_heads, spec.n_kv_heads, spec.tpf, spec.Dh)
+        B, Hk, tpf, Dh = spec.B, spec.n_kv_heads, spec.tpf, spec.Dh
         cap = spec.capacity
+        rng = np.random.default_rng(seed)
 
-        Q = PT.astype(PT.randn(B * Hq * tpf, Dh) * 0.3, a_dt)
-        K_cache = PT.astype(PT.randn(B * Hk * cap, Dh) * 0.3, kv_dt)
-        Vt_cache = PT.astype(PT.randn(B * Hk * Dh, cap) * 0.3, kv_dt)
+        Q_shape = (spec.q_rows, spec.q_cols)
+        Q = astype_numpy((rng.standard_normal(Q_shape) * 0.3).astype(np.float32), spec.a_dtype)
+        K_cache = astype_numpy(
+            (rng.standard_normal((B * Hk * cap, Dh)) * 0.3).astype(np.float32), spec.kv_dtype
+        )
+        Vt_cache = astype_numpy(
+            (rng.standard_normal((B * Hk * Dh, cap)) * 0.3).astype(np.float32), spec.kv_dtype
+        )
 
         L = spec.L
         seg_rows = [[0, L], [L, tpf]] + [[0, 0]] * (spec.max_segments - 2)
         seg_per_batch = [v for row in seg_rows for v in row]
-        seg_data = [seg_per_batch] * B
-        segments = PT.contiguous(
-            PT.tensor(seg_data, dtype=PT.int32).reshape(B * spec.max_segments * 2)
-        )
-        n_segments = PT.tensor([2] * B, dtype=PT.int32)
+        segments = np.array([seg_per_batch] * B, dtype=np.int32).reshape(B * spec.max_segments * 2)
+        n_segments = np.full(B, 2, dtype=np.int32)
 
         test_frame_t = spec.num_buckets * spec.pinned_dilation
-        frame_t = PT.tensor([test_frame_t], dtype=PT.int32)
-        output = PT.zeros(B * Hq * tpf, Dh, dtype=out_dt)
+        frame_t = np.array([test_frame_t], dtype=np.int32)
+        output = zeros_for_dtype((spec.out_rows, spec.out_cols), spec.out_dtype)
 
         return {
             "Q": Q,

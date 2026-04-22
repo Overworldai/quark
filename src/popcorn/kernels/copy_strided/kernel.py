@@ -32,7 +32,7 @@ from popcorn.kernels.decorator import kernel
     output_idx=-1,
     problems=lambda: [],
     baselines=lambda: [],
-    reference=lambda kernel, Src: Src,  # identity (correctness tested at tensor level)
+    reference=lambda spec, *, Src, Dst=None: Src,  # identity (numpy returns input unchanged)
 )
 class CopyStridedKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -71,14 +71,16 @@ class CopyStridedKernel(Kernel):
         return {"n_warps": [1, 2, 4], "elems_per_block": [128, 256, 512, 1024]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = CopyStridedSpec(**problem)
-        dt = spec.dtype.backend
+        rng = np.random.default_rng(seed)
         return {
-            "Src": PT.astype(PT.randn(spec.N), dt),
-            "Dst": PT.zeros(spec.N, dtype=dt),
+            "Src": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype),
+            "Dst": zeros_for_dtype((spec.N,), spec.dtype),
         }
 
     def build(self) -> None:

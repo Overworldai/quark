@@ -356,9 +356,7 @@ class Waypoint15(nn.Module):
             if _IS_METAL:
                 import mlx.core as mx
 
-                from popcorn.backend import PT
-
-                return np.array(PT.astype(w, mx.float32))
+                return np.array(w.astype(mx.float32))
             return np.array(w, dtype=np.float32)
 
         w1 = _to_f32(self.noise_fc1.weight.data)
@@ -593,11 +591,6 @@ GenerateOneFrame = GenerateFrame
 
 def _sync():
     """Synchronize the active backend."""
-    if _IS_METAL:
-        from popcorn.backend import PT
+    from popcorn.runtime.sync import synchronize
 
-        PT.synchronize()
-    else:
-        from popcorn.runtime.cuda import CudaRuntime
-
-        CudaRuntime.instance().stream_synchronize(0)
+    synchronize()

@@ -21,6 +21,13 @@ from __future__ import annotations
 
 import pytest
 
+pytest.importorskip(
+    "torch",
+    reason="torch removed from runtime; numpy-refs migration — test kept for dev-only cross-check when torch is installed",
+)
+
+import pytest
+
 try:
     import mlx.core as mx
 

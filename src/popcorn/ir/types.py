@@ -89,29 +89,40 @@ class DType(str, Enum):  # noqa: UP042
     def is_bit(self) -> bool:
         return self in _BIT_DTYPES
 
-    @property
-    def backend(self):
-        """Active backend's native dtype — torch.bfloat16 on CUDA,
-        mx.bfloat16 on Metal. Lazy import so ``DType`` stays free of
-        torch/mlx at module load.
-
-        ``DType.E4M3.backend`` on Metal falls back to ``mx.bfloat16``
-        (MLX has no fp8) and emits a one-time ``PerfWarning``.
-        """
-        from popcorn.backend import PT
-
-        return PT.ir_dtype_to_backend(self)
-
     @classmethod
     def from_backend(cls, dt) -> DType:
-        """Inverse of ``.backend`` — backend dtype → ``DType``. Raises
-        ``ValueError`` if the backend dtype has no registered mapping."""
-        from popcorn.backend import PT
+        """Backend-native dtype → ``DType``.
 
-        result = PT.backend_dtype_to_ir(dt)
-        if result is None:
-            raise ValueError(f"DType.from_backend: no mapping for {dt!r}")
-        return result
+        Accepts:
+          * ``PopcornTensor``-style short strings (``"bf16"``, ``"f32"``, ...).
+          * ``mx.Dtype`` (identified by its ``str()`` repr, e.g.
+            ``"mlx.core.bfloat16"``).
+
+        Torch dtypes aren't accepted — the runtime inference path does
+        not import torch in the numpy-refs era."""
+        if isinstance(dt, str):
+            try:
+                return cls(dt)
+            except ValueError as e:
+                raise ValueError(f"DType.from_backend: no mapping for {dt!r}") from e
+        # mx.Dtype stringifies to "mlx.core.<name>" — strip the prefix.
+        _MX_MAP = {
+            "float32": cls.F32,
+            "float16": cls.F16,
+            "bfloat16": cls.BF16,
+            "int32": cls.S32,
+            "int64": cls.S64,
+            "uint8": cls.U8,
+            "int8": cls.S8,
+            "uint16": cls.U16,
+            "uint32": cls.U32,
+        }
+        dt_str = str(dt)
+        if dt_str.startswith("mlx.core."):
+            dt_str = dt_str[len("mlx.core.") :]
+        if dt_str in _MX_MAP:
+            return _MX_MAP[dt_str]
+        raise ValueError(f"DType.from_backend: no mapping for {dt!r}")
 
     @classmethod
     def coerce(cls, value: DType | str | None) -> DType | None:

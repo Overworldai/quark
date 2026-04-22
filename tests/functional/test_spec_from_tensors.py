@@ -11,10 +11,13 @@ inspection.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
-from popcorn.backend import IS_METAL
 from popcorn.kernels import all_kernels
+
+IS_METAL = sys.platform == "darwin"
 
 # Per-kernel: which fields from Problem.params are scalar kwargs (not
 # derivable from tensor shapes) that ``spec_from_tensors`` needs. The
@@ -110,7 +113,11 @@ def test_spec_from_tensors_round_trip(kernel_cls):
     problem = next((p for p in problems if _dtypes_survive(p.params)), problems[0])
 
     try:
-        tensors = kernel_cls.make_tensors(problem.params)
+        inputs_np = kernel_cls.make_tensors_numpy(problem.params)
+        spec = kernel_cls.SPEC_CLS(**problem.params)
+        from popcorn.runtime.device_tensors import numpy_to_device_dict
+
+        tensors = numpy_to_device_dict(kernel_cls, spec, inputs_np)
     except Exception as e:
         pytest.skip(f"{name}: make_tensors failed ({e!s:.60})")
         return  # unreachable — pytest.skip raises

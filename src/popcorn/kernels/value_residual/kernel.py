@@ -20,7 +20,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.value_residual.baselines import value_residual_baselines
 from popcorn.kernels.value_residual.config import ValueResidualConfig
 from popcorn.kernels.value_residual.problems import value_residual_problems
-from popcorn.kernels.value_residual.reference import value_residual_reference_for_spec
+from popcorn.kernels.value_residual.reference import value_residual_reference_numpy
 from popcorn.kernels.value_residual.spec import ValueResidualSpec
 
 
@@ -31,7 +31,7 @@ from popcorn.kernels.value_residual.spec import ValueResidualSpec
     output_idx=-1,
     problems=value_residual_problems,
     baselines=value_residual_baselines,
-    reference=value_residual_reference_for_spec,
+    reference=value_residual_reference_numpy,
 )
 class ValueResidualKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -76,16 +76,19 @@ class ValueResidualKernel(Kernel):
         }
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = ValueResidualSpec(**problem)
-        dt = spec.dtype.backend
-        V = PT.astype(PT.randn(spec.N), dt)
-        V1 = PT.astype(PT.randn(spec.N), dt)
-        lamb = PT.tensor([0.35], dtype=PT.float32)  # arbitrary per-layer mix
-        Out = PT.zeros(spec.N, dtype=dt)
-        return {"V": V, "V1": V1, "lamb": lamb, "Out": Out}
+        rng = np.random.default_rng(seed)
+        return {
+            "V": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype),
+            "V1": astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.dtype),
+            "lamb": np.array([0.35], dtype=np.float32),  # arbitrary per-layer mix
+            "Out": zeros_for_dtype((spec.N,), spec.dtype),
+        }
 
     @classmethod
     def spec_from_tensors(cls, V, V1, lamb) -> ValueResidualSpec:

@@ -36,11 +36,12 @@ class IncrementConfig(KernelConfig):
         return cls()
 
 
-def _reference(kernel, T):
-    from popcorn.backend import PT
+def _reference(spec, *, T):
 
-    one = PT.tensor([1], dtype=T.dtype)
-    return T + one  # returns new tensor; caller compares flat values
+    from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
+
+    val = to_f32_numpy(T, dtype_hint=spec.dtype.value)
+    return astype_numpy(val + 1.0, spec.dtype).reshape(T.shape if hasattr(T, "shape") else (1,))
 
 
 @kernel(
@@ -81,11 +82,12 @@ class IncrementKernel(Kernel):
         return {}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        from popcorn.runtime.npconv import zeros_for_dtype
 
+        del seed
         spec = IncrementSpec(**problem)
-        return {"T": PT.zeros(1, dtype=spec.dtype.backend)}
+        return {"T": zeros_for_dtype((1,), spec.dtype)}
 
     @classmethod
     def spec_from_tensors(cls, T) -> IncrementSpec:

@@ -35,7 +35,7 @@ from popcorn.kernels.shuffle_weight.spec import ShuffleWeightSpec
     output_idx=-1,
     problems=lambda: [],
     baselines=lambda: [],
-    reference=lambda kernel, Src: Src,
+    reference=lambda spec, *, Src, Dst=None: Src,
 )
 class ShuffleWeightKernel(Kernel):
     # Tensors use the actual weight dtype. Shapes are in elements.
@@ -76,14 +76,18 @@ class ShuffleWeightKernel(Kernel):
         return {"n_warps": [2, 4, 8]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = ShuffleWeightSpec(**problem)
-        dt = spec.dtype.backend
+        rng = np.random.default_rng(seed)
         return {
-            "Src": PT.astype(PT.randn(spec.N, spec.K), dt),
-            "Dst": PT.zeros(spec.N, spec.K_out, dtype=dt),
+            "Src": astype_numpy(
+                rng.standard_normal((spec.N, spec.K)).astype(np.float32), spec.dtype
+            ),
+            "Dst": zeros_for_dtype((spec.N, spec.K_out), spec.dtype),
         }
 
     def build(self) -> None:

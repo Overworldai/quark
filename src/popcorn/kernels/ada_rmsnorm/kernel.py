@@ -27,7 +27,7 @@ from popcorn.ir import DType
 from popcorn.kernels.ada_rmsnorm.baselines import ada_rmsnorm_baselines
 from popcorn.kernels.ada_rmsnorm.config import AdaRMSNormConfig
 from popcorn.kernels.ada_rmsnorm.problems import ada_rmsnorm_problems
-from popcorn.kernels.ada_rmsnorm.reference import ada_rmsnorm_reference_for_spec
+from popcorn.kernels.ada_rmsnorm.reference import ada_rmsnorm_reference_numpy
 from popcorn.kernels.ada_rmsnorm.spec import AdaRMSNormSpec
 from popcorn.kernels.base import Kernel
 from popcorn.kernels.decorator import kernel
@@ -50,7 +50,7 @@ class _XStage:
     output_idx=-1,
     problems=ada_rmsnorm_problems,
     baselines=ada_rmsnorm_baselines,
-    reference=ada_rmsnorm_reference_for_spec,
+    reference=ada_rmsnorm_reference_numpy,
 )
 class AdaRMSNormKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -109,16 +109,23 @@ class AdaRMSNormKernel(Kernel):
         return {"n_warps": [1, 2, 4, 8], "chunk_D": [256, 512, 1024, 2048]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = AdaRMSNormSpec(**problem)
-        dt = spec.dtype.backend
-        X = PT.astype(PT.randn(spec.B, spec.D), dt)
-        scale = PT.astype(PT.randn(spec.G, spec.D) * 0.1, dt)
-        bias = PT.astype(PT.randn(spec.G, spec.D) * 0.1, dt)
-        Out = PT.zeros(spec.B, spec.D, dtype=dt)
-        return {"X": X, "scale": scale, "bias": bias, "Out": Out}
+        rng = np.random.default_rng(seed)
+        return {
+            "X": astype_numpy(rng.standard_normal((spec.B, spec.D)).astype(np.float32), spec.dtype),
+            "scale": astype_numpy(
+                (rng.standard_normal((spec.G, spec.D)) * 0.1).astype(np.float32), spec.dtype
+            ),
+            "bias": astype_numpy(
+                (rng.standard_normal((spec.G, spec.D)) * 0.1).astype(np.float32), spec.dtype
+            ),
+            "Out": zeros_for_dtype((spec.B, spec.D), spec.dtype),
+        }
 
     @classmethod
     def spec_from_tensors(cls, X, scale, bias, *, eps: float = 1.1920929e-07) -> AdaRMSNormSpec:

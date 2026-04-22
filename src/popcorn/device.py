@@ -235,24 +235,6 @@ class Device:
     index: int
     caps: DeviceCaps
 
-    @property
-    def torch_device(self):  # type: ignore[no-untyped-def]
-        """The `torch.device` this Popcorn device corresponds to.
-
-        Imported lazily so the rest of this module doesn't hard-depend
-        on torch — useful for tests that mock the device.
-        """
-        import torch
-
-        if self.family is DeviceFamily.CUDA or self.family is DeviceFamily.ROCM:
-            return torch.device(f"cuda:{self.index}")
-        if self.family is DeviceFamily.METAL:
-            return torch.device("mps")
-        if self.family in (DeviceFamily.OPENCL, DeviceFamily.CPU):
-            # OpenCL launches an iGPU but tensors live on CPU.
-            return torch.device("cpu")
-        raise ValueError(f"Unknown device family {self.family}")
-
     def fingerprint(self) -> str:
         """Stable string used as the device portion of autotune cache
         keys. Two machines with the same family but different
@@ -286,38 +268,28 @@ def _detect_family() -> DeviceFamily:
     """Auto-detect the active backend.
 
     Detection order (first match wins):
-      1. CUDA  (torch.cuda.is_available() and torch.version.hip is None)
-      2. ROCm  (torch.cuda.is_available() and torch.version.hip is not None)
-      3. Metal (MLX metal available, or torch.mps.is_available())
-      4. OpenCL — TODO Bundle 5
-      5. CPU   (always available as a fallback)
+      1. CUDA   (libcuda probe finds a device)
+      2. Metal  (MLX metal available)
+      3. CPU    (always available as a fallback)
+
+    ROCm / OpenCL aren't auto-detected; force via ``POPCORN_FORCE_BACKEND``
+    and plug a dedicated probe when a user lands on that path.
     """
     forced = _forced_family()
     if forced is not None:
         return forced
+    # Probe libcuda via ctypes — doesn't require torch to be installed.
     try:
-        import torch
+        from popcorn.runtime.cuda import CudaRuntime
 
-        if torch.cuda.is_available():
-            if torch.version.hip is None:  # type: ignore[attr-defined]
-                return DeviceFamily.CUDA
-            return DeviceFamily.ROCM
-    except ImportError:
+        if CudaRuntime.instance().device_count() > 0:
+            return DeviceFamily.CUDA
+    except Exception:
         pass
-    # Check for MLX Metal availability (preferred over torch.mps).
     try:
         import mlx.core as mx
 
         if mx.metal.is_available():
-            return DeviceFamily.METAL
-    except ImportError:
-        pass
-    # Fallback: check torch.mps.
-    try:
-        import torch
-
-        mps = getattr(torch, "mps", None)
-        if mps is not None and mps.is_available():
             return DeviceFamily.METAL
     except ImportError:
         pass
@@ -339,7 +311,7 @@ def current_device() -> Device:
     """
     family = _detect_family()
     if family is DeviceFamily.CUDA:
-        return _probe_cuda_via_torch(index=0)
+        return _probe_cuda_via_libcuda(index=0)
     if family is DeviceFamily.METAL:
         return _probe_metal_via_mlx(index=0)
     raise NotImplementedError(
@@ -348,35 +320,41 @@ def current_device() -> Device:
     )
 
 
-def _probe_cuda_via_torch(index: int) -> Device:
-    """Bundle-2 stand-in CUDA probe.
+def _probe_cuda_via_libcuda(index: int) -> Device:
+    """CUDA probe through libcuda ctypes — no torch dependency."""
+    from popcorn.runtime.cuda import (
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        CudaRuntime,
+    )
 
-    Reads device properties from torch's `cuda.get_device_properties`
-    rather than calling `cuDeviceGetAttribute` directly — that path
-    moves to `CudaDriver.probe()` in Bundle 3, but the field set is
-    a strict subset so kernels written against this version of
-    `DeviceCaps` will keep working when Bundle 3 lands.
-    """
-    import torch
+    rt = CudaRuntime.instance()
+    if rt.device_count() == 0:
+        raise RuntimeError("CUDA probe: no CUDA devices visible to libcuda")
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA probe: torch.cuda is not available")
-    props = torch.cuda.get_device_properties(index)
-    cc_major, cc_minor = props.major, props.minor
+    cc_major = rt.get_device_attribute(index, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+    cc_minor = rt.get_device_attribute(index, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
     arch_tag = f"sm_{cc_major}{cc_minor}"
+    try:
+        smem_optin = rt.get_device_attribute(
+            index, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+        )
+    except Exception:
+        smem_optin = 49152
     caps = DeviceCaps(
         family=DeviceFamily.CUDA,
-        name=props.name,
-        compute_unit_count=props.multi_processor_count,
+        name=rt.get_device_name(index),
+        compute_unit_count=rt.get_device_attribute(index, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
         warp_size=32,
-        max_threads_per_block=props.max_threads_per_multi_processor,
-        max_smem_per_block=getattr(
-            props,
-            "shared_memory_per_block_optin",
-            getattr(props, "shared_memory_per_block", 49152),
+        max_threads_per_block=rt.get_device_attribute(
+            index, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK
         ),
+        max_smem_per_block=smem_optin,
         max_regs_per_thread=255,
-        max_regs_per_block=getattr(props, "regs_per_multiprocessor", None),
+        max_regs_per_block=None,
         arch_tag=arch_tag,
         compute_capability=(cc_major, cc_minor),
         supports_async_copy=cc_major >= 8,  # Ampere+

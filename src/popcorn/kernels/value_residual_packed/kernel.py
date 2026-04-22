@@ -20,7 +20,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.value_residual_packed.baselines import value_residual_packed_baselines
 from popcorn.kernels.value_residual_packed.config import ValueResidualPackedConfig
 from popcorn.kernels.value_residual_packed.problems import value_residual_packed_problems
-from popcorn.kernels.value_residual_packed.reference import value_residual_packed_reference_for_spec
+from popcorn.kernels.value_residual_packed.reference import value_residual_packed_reference_numpy
 from popcorn.kernels.value_residual_packed.spec import ValueResidualPackedSpec
 
 _WARP = 32
@@ -42,7 +42,7 @@ class _VResStage:
     output_idx=-1,
     problems=value_residual_packed_problems,
     baselines=value_residual_packed_baselines,
-    reference=value_residual_packed_reference_for_spec,
+    reference=value_residual_packed_reference_numpy,
 )
 class ValueResidualPackedKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -97,16 +97,22 @@ class ValueResidualPackedKernel(Kernel):
         return {"n_warps": [1, 2, 4, 8], "chunk_D": [256, 512, 1024, 2048, 4096]}
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = ValueResidualPackedSpec(**problem)
-        dt = spec.dtype.backend
+        rng = np.random.default_rng(seed)
         return {
-            "QKV_curr": PT.astype(PT.randn(spec.M, spec.D_full), dt),
-            "QKV_first": PT.astype(PT.randn(spec.M, spec.D_full), dt),
-            "lamb": PT.tensor([0.5], dtype=PT.float32),
-            "Out": PT.zeros(spec.M, spec.D_full, dtype=dt),
+            "QKV_curr": astype_numpy(
+                rng.standard_normal((spec.M, spec.D_full)).astype(np.float32), spec.dtype
+            ),
+            "QKV_first": astype_numpy(
+                rng.standard_normal((spec.M, spec.D_full)).astype(np.float32), spec.dtype
+            ),
+            "lamb": np.array([0.5], dtype=np.float32),
+            "Out": zeros_for_dtype((spec.M, spec.D_full), spec.dtype),
         }
 
     @classmethod

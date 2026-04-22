@@ -48,7 +48,7 @@ from popcorn.kernels.attn.baselines import attn_baselines
 from popcorn.kernels.attn.config import AttnConfig
 from popcorn.kernels.attn.online_softmax_block import OnlineSoftmax
 from popcorn.kernels.attn.problems import attn_problems
-from popcorn.kernels.attn.reference import attn_reference
+from popcorn.kernels.attn.reference import attn_reference_numpy
 from popcorn.kernels.attn.spec import AttnSpec
 from popcorn.kernels.base import Kernel
 from popcorn.kernels.decorator import kernel
@@ -61,7 +61,7 @@ from popcorn.kernels.gemm.mma_shapes import lookup_mma
     config=AttnConfig,
     problems=attn_problems,
     baselines=attn_baselines,
-    reference=attn_reference,
+    reference=attn_reference_numpy,
 )
 class AttnKernel(Kernel):
     # bf16 MMA accumulates drift ~2-3e-2 from the fp32 flex_attention
@@ -190,19 +190,27 @@ class AttnKernel(Kernel):
     # ── Registry classmethods ──
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = AttnSpec(**problem)
         B, nqh, nkvh = spec.B, spec.n_q_heads, spec.n_kv_heads
         sl, kvl, Dh = spec.seq_len, spec.kv_len, spec.Dh
-        a_dt = spec.a_dtype.backend
-
-        Q = PT.astype(PT.randn(B * nqh * sl, Dh) * 0.3, a_dt)
-        K = PT.astype(PT.randn(B * nkvh * kvl, Dh) * 0.3, a_dt)
-        V_t = PT.astype(PT.randn(B * nkvh * Dh, kvl) * 0.3, a_dt)
-        output = PT.zeros(B * nqh * sl, Dh, dtype=a_dt)
-        return {"Q": Q, "K": K, "V_t": V_t, "output": output}
+        rng = np.random.default_rng(seed)
+        return {
+            "Q": astype_numpy(
+                (rng.standard_normal((B * nqh * sl, Dh)) * 0.3).astype(np.float32), spec.a_dtype
+            ),
+            "K": astype_numpy(
+                (rng.standard_normal((B * nkvh * kvl, Dh)) * 0.3).astype(np.float32), spec.b_dtype
+            ),
+            "V_t": astype_numpy(
+                (rng.standard_normal((B * nkvh * Dh, kvl)) * 0.3).astype(np.float32), spec.b_dtype
+            ),
+            "output": zeros_for_dtype((B * nqh * sl, Dh), spec.a_dtype),
+        }
 
     @classmethod
     def spec_from_tensors(

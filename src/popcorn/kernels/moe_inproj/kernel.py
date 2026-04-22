@@ -36,7 +36,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.moe_inproj.baselines import moe_inproj_baselines
 from popcorn.kernels.moe_inproj.config import MoeInprojConfig
 from popcorn.kernels.moe_inproj.problems import moe_inproj_problems
-from popcorn.kernels.moe_inproj.reference import moe_inproj_reference_for_spec
+from popcorn.kernels.moe_inproj.reference import moe_inproj_reference_numpy
 from popcorn.kernels.moe_inproj.spec import MoeInprojSpec
 
 
@@ -47,7 +47,7 @@ from popcorn.kernels.moe_inproj.spec import MoeInprojSpec
     output_idx=2,
     problems=moe_inproj_problems,
     baselines=moe_inproj_baselines,
-    reference=moe_inproj_reference_for_spec,
+    reference=moe_inproj_reference_numpy,
 )
 class MoeInprojKernel(Kernel):
     # Relax the default ~0.9999 cos-sim threshold. bf16 MMA +
@@ -121,35 +121,33 @@ class MoeInprojKernel(Kernel):
     # ── Registry classmethods ──
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = MoeInprojSpec(**problem)
         M, D, H, n_experts, top_k = spec.M, spec.D, spec.H, spec.n_experts, spec.top_k
         total = M * top_k
         slots_per_expert = total // n_experts
 
-        a_dt = spec.a_dtype.backend
-        b_dt = spec.b_dtype.backend
-        o_dt = spec.out_dtype.backend
-
-        X = PT.astype(PT.randn(M, D), a_dt)
-        W_in = PT.astype(PT.randn(n_experts * H, D), b_dt)
-        H_out = PT.zeros(total, H, dtype=o_dt)
-        token_ids = PT.astype(PT.arange(total) % M, PT.int32)
-        # One work_list entry per BM=32 slot chunk, labelled with the
+        rng = np.random.default_rng(seed)
+        token_ids = (np.arange(total) % M).astype(np.int32)
+        # One work_list entry per BM=32 slot chunk, labeled with the
         # expert that owns the chunk. Full coverage: every output slot
-        # gets written (matters on Metal, where mx.fast.metal_kernel
+        # gets written (matters on Metal where mx.fast.metal_kernel
         # allocates outputs uninitialized and uncovered slots diverge
         # from the reference).
-        wl_entries = []
-        for grp_start in range(0, total, 32):
-            wl_entries.append([grp_start, grp_start // slots_per_expert])
-        work_list = PT.tensor(wl_entries, dtype=PT.int32).reshape(-1)
+        wl_entries = [
+            (grp_start, grp_start // slots_per_expert) for grp_start in range(0, total, 32)
+        ]
+        work_list = np.array(wl_entries, dtype=np.int32).reshape(-1)
         return {
-            "X": X,
-            "W_in": W_in,
-            "H_out": H_out,
+            "X": astype_numpy(rng.standard_normal((M, D)).astype(np.float32), spec.a_dtype),
+            "W_in": astype_numpy(
+                rng.standard_normal((n_experts * H, D)).astype(np.float32), spec.b_dtype
+            ),
+            "H_out": zeros_for_dtype((total, H), spec.out_dtype),
             "token_ids": token_ids,
             "work_list": work_list,
         }

@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import ClassVar
 
 import popcorn.lang as pop
-from popcorn.backend import PT
 from popcorn.blocks import (
     Accumulators,
     IterCtx,
@@ -35,7 +34,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.gemm.baselines import gemm_baselines
 from popcorn.kernels.gemm.config import GemmConfig
 from popcorn.kernels.gemm.problems import gemm_problems
-from popcorn.kernels.gemm.reference import gemm_reference_for_spec
+from popcorn.kernels.gemm.reference import gemm_reference_numpy
 from popcorn.kernels.gemm.spec import GemmSpec
 
 
@@ -45,7 +44,7 @@ from popcorn.kernels.gemm.spec import GemmSpec
     config=GemmConfig,
     problems=gemm_problems,
     baselines=lambda kernel, tensors: gemm_baselines(tensors),
-    reference=gemm_reference_for_spec,
+    reference=gemm_reference_numpy,
 )
 class GemmKernel(Kernel):
     # Parameter manifest — single source of truth for kernel tensor
@@ -144,16 +143,27 @@ class GemmKernel(Kernel):
     # ── Registry classmethods ──
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
+
         spec = GemmSpec(**problem)
-        a_dt = spec.a_dtype.backend
-        b_dt = spec.b_dtype.backend
-        o_dt = spec.out_dtype.backend
-        A = PT.astype(PT.randn(spec.M, spec.K), a_dt)
-        B = PT.astype(PT.randn(spec.N, spec.K), b_dt)
-        Bias = PT.astype(PT.randn(spec.N), o_dt) if spec.has_bias else PT.zeros(1, dtype=o_dt)
-        Out = PT.zeros(spec.M, spec.N, dtype=o_dt)
-        return {"A": A, "B": B, "Bias": Bias, "Out": Out}
+        rng = np.random.default_rng(seed)
+        if spec.has_bias:
+            bias_np = astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.out_dtype)
+        else:
+            bias_np = zeros_for_dtype((1,), spec.out_dtype)
+        return {
+            "A": astype_numpy(
+                rng.standard_normal((spec.M, spec.K)).astype(np.float32), spec.a_dtype
+            ),
+            "B": astype_numpy(
+                rng.standard_normal((spec.N, spec.K)).astype(np.float32), spec.b_dtype
+            ),
+            "Bias": bias_np,
+            "Out": zeros_for_dtype((spec.M, spec.N), spec.out_dtype),
+        }
 
     @classmethod
     def spec_from_tensors(

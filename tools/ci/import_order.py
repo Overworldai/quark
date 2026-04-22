@@ -92,7 +92,7 @@ STDLIB_MODULES = frozenset(
     }
 )
 
-THIRD_PARTY_KNOWN = frozenset({"torch", "numpy", "pytest"})
+THIRD_PARTY_KNOWN = frozenset({"mlx", "numpy", "pytest", "cv2", "huggingface_hub"})
 
 FIRST_PARTY_PREFIXES = ("popcorn", "popcorn")  # "popcorn" until rename
 

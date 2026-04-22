@@ -9,7 +9,7 @@ from popcorn.launcher.launcher import (
     CompiledKernel,
     Launcher,
     _check_contiguous,
-    _check_dtype,
+    _check_dtype_popcorn,
     _driver_for,
 )
 from popcorn.launcher.param_spec import (
@@ -27,6 +27,6 @@ __all__ = [
     "ProgramFootprint",
     "ScalarSpec",
     "_check_contiguous",
-    "_check_dtype",
+    "_check_dtype_popcorn",
     "_driver_for",
 ]

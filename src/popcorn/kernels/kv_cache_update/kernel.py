@@ -62,7 +62,7 @@ from popcorn.kernels.kv_cache_update.baselines import kv_cache_update_baselines
 from popcorn.kernels.kv_cache_update.config import KVCacheUpdateConfig
 from popcorn.kernels.kv_cache_update.problems import kv_cache_update_problems
 from popcorn.kernels.kv_cache_update.reference import (
-    kv_cache_update_reference_for_spec,
+    kv_cache_update_reference_numpy,
 )
 from popcorn.kernels.kv_cache_update.spec import KVCacheUpdateSpec
 
@@ -74,7 +74,7 @@ from popcorn.kernels.kv_cache_update.spec import KVCacheUpdateSpec
     output_idx=-1,
     problems=kv_cache_update_problems,
     baselines=kv_cache_update_baselines,
-    reference=kv_cache_update_reference_for_spec,
+    reference=kv_cache_update_reference_numpy,
 )
 class KVCacheUpdateKernel(Kernel):
     # Parameter manifest — all tensor shapes are pure functions of spec.
@@ -185,42 +185,41 @@ class KVCacheUpdateKernel(Kernel):
         return rope  # cache write is memory-bound; this is just the math floor.
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = KVCacheUpdateSpec(**problem)
-        in_dt = spec.in_dtype.backend
-        kv_dt = spec.kv_dtype.backend
         B, Hk, tpf, Dh = spec.B, spec.n_kv_heads, spec.tpf, spec.Dh
         cap = spec.capacity
+        rng = np.random.default_rng(seed)
 
         if spec.packed_qkv:
             qkv_dim = spec.qkv_dim
-            K = PT.astype(PT.randn(B * tpf, qkv_dim) * 0.3, in_dt)
-            V = K  # V is the same tensor (packed QKV)
+            K_arr = astype_numpy(
+                (rng.standard_normal((B * tpf, qkv_dim)) * 0.3).astype(np.float32), spec.in_dtype
+            )
+            # V is the same tensor as K when packed; share the buffer.
+            V_arr = K_arr
         else:
-            K = PT.astype(PT.randn(B * Hk * tpf, Dh) * 0.3, in_dt)
-            V = PT.astype(PT.randn(B * Hk * tpf, Dh) * 0.3, in_dt)
+            K_arr = astype_numpy(
+                (rng.standard_normal((B * Hk * tpf, Dh)) * 0.3).astype(np.float32), spec.in_dtype
+            )
+            V_arr = astype_numpy(
+                (rng.standard_normal((B * Hk * tpf, Dh)) * 0.3).astype(np.float32), spec.in_dtype
+            )
 
         test_frame_t = spec.num_buckets * spec.pinned_dilation
-        frame_t = PT.tensor([test_frame_t], dtype=PT.int32)
-
-        K_cache = PT.zeros(B * Hk * cap, Dh, dtype=kv_dt)
-        Vt_cache = PT.zeros(B * Hk * Dh, cap, dtype=kv_dt)
-        segments = PT.zeros(B * spec.max_segments * 2, dtype=PT.int32)
-        n_segments = PT.zeros(B, dtype=PT.int32)
-
-        frozen = PT.zeros(1, dtype=PT.int32)
-
         return {
-            "K": K,
-            "V": V,
-            "frame_t": frame_t,
-            "frozen": frozen,
-            "Vt_cache": Vt_cache,
-            "segments": segments,
-            "n_segments": n_segments,
-            "K_cache": K_cache,
+            "K": K_arr,
+            "V": V_arr,
+            "frame_t": np.array([test_frame_t], dtype=np.int32),
+            "frozen": np.zeros(1, dtype=np.int32),
+            "Vt_cache": zeros_for_dtype((B * Hk * Dh, cap), spec.kv_dtype),
+            "segments": np.zeros(B * spec.max_segments * 2, dtype=np.int32),
+            "n_segments": np.zeros(B, dtype=np.int32),
+            "K_cache": zeros_for_dtype((B * Hk * cap, Dh), spec.kv_dtype),
         }
 
     @classmethod

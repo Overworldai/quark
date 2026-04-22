@@ -45,10 +45,10 @@ def _load_saved_config(kernel_cls, problem):
 
 
 def _time_callable(fn, *, warmup_ms=10.0, bench_ms=50.0) -> float:
-    """Budget-based timing — dispatches through PT."""
-    from popcorn.backend import PT
+    """Budget-based timing — reuses the launcher's backend-neutral timer."""
+    from popcorn.launcher.launcher import _time_callable as _tc
 
-    return PT.time_callable(fn, warmup_ms=warmup_ms, bench_ms=bench_ms)
+    return _tc(fn, warmup_ms=warmup_ms, bench_ms=bench_ms)
 
 
 def _time_kernel(compiled, buffers, *, warmup_ms=10.0, bench_ms=50.0) -> float:
@@ -69,11 +69,17 @@ def main(argv=None):
     parser.add_argument("--warmup-ms", type=float, default=10.0)
     args = parser.parse_args(argv)
 
-    from popcorn.backend import IS_METAL, PT
+    import sys as _sys
+
     from popcorn.correctness import check_correctness
     from popcorn.device import current_device
     from popcorn.kernels import all_kernels, get
     from popcorn.launcher import Launcher
+    from popcorn.refs import ref_cache
+    from popcorn.runtime.device_tensors import numpy_to_device_dict
+    from popcorn.runtime.sync import ir_dtype_of, synchronize, zero_buffer
+
+    IS_METAL = _sys.platform == "darwin"
 
     kernels = [get(args.kernel)] if args.kernel else all_kernels()
     launcher = Launcher(device=current_device())
@@ -122,7 +128,8 @@ def main(argv=None):
                 continue
 
             try:
-                tensors = cls.make_tensors(problem.params)
+                inputs_np, outputs_np = ref_cache().get(cls, problem.params)
+                tensors = numpy_to_device_dict(cls, kernel.spec, inputs_np)
                 pspec = kernel.param_spec()
                 launch_tensors = kernel.prepare_launch_tensors(tensors)
                 buffers = [launch_tensors[b.name] for b in pspec.buffers]
@@ -130,8 +137,8 @@ def main(argv=None):
                 if out_idx < 0:
                     out_idx = len(buffers) + out_idx
                 output_buf = buffers[out_idx]
-                plain_buffers = [tensors[b.name] for b in pspec.buffers]
-                inputs = [plain_buffers[i] for i in range(len(plain_buffers)) if i != out_idx]
+                output_name = pspec.buffers[out_idx].name
+                ref_np = outputs_np[output_name]
             except Exception as e:
                 rec["state"] = "err"
                 full = f"tensors: {type(e).__name__}: {e}"
@@ -159,7 +166,7 @@ def main(argv=None):
 
             try:
                 launch_result = compiled.launch(buffers=buffers)
-                PT.synchronize()
+                synchronize()
                 if IS_METAL and launch_result:
                     # launch_result from MLX has one entry per non-
                     # readonly buffer in pspec order. Translate the
@@ -171,11 +178,10 @@ def main(argv=None):
                     actual_output = launch_result[out_pos]
                 else:
                     actual_output = output_buf
-                ref = kernel.reference(*inputs)
-                out_dtype = PT.backend_dtype_to_ir(actual_output.dtype)
+                out_dtype = ir_dtype_of(actual_output)
                 cr = check_correctness(
                     actual_output,
-                    ref,
+                    ref_np,
                     out_dtype=out_dtype,
                     threshold=cls.correctness_threshold(out_dtype),
                 )
@@ -192,7 +198,7 @@ def main(argv=None):
                 traceback.print_exc()
                 continue
 
-            output_buf = PT.zero_(output_buf)
+            output_buf = zero_buffer(output_buf)
             try:
                 us = _time_kernel(
                     compiled,

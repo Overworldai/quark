@@ -36,7 +36,7 @@ from popcorn.kernels.decorator import kernel
 from popcorn.kernels.patchify.baselines import patchify_baselines
 from popcorn.kernels.patchify.config import PatchifyConfig
 from popcorn.kernels.patchify.problems import patchify_problems
-from popcorn.kernels.patchify.reference import patchify_reference_for_spec
+from popcorn.kernels.patchify.reference import patchify_reference_numpy
 from popcorn.kernels.patchify.spec import PatchifySpec
 
 
@@ -47,7 +47,7 @@ from popcorn.kernels.patchify.spec import PatchifySpec
     output_idx=-1,
     problems=patchify_problems,
     baselines=patchify_baselines,
-    reference=patchify_reference_for_spec,
+    reference=patchify_reference_numpy,
 )
 class PatchifyKernel(Kernel):
     TENSORS: ClassVar[list[TensorDecl]] = [
@@ -105,17 +105,24 @@ class PatchifyKernel(Kernel):
         }
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from popcorn.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = PatchifySpec(**problem)
-        dt = spec.dtype.backend
-        # X stored as flat [B, C*H*W] — the kernel indexes into it with
-        # strided arithmetic.
-        X = PT.astype(PT.randn(spec.B, spec.C * spec.H * spec.W), dt)
-        W = PT.astype(PT.randn(spec.d_model, spec.K), dt)
-        Out = PT.zeros(spec.M, spec.N, dtype=dt)
-        return {"X": X, "W": W, "Out": Out}
+        rng = np.random.default_rng(seed)
+        return {
+            # X stored flat [B, C*H*W]; kernel indexes with strided arithmetic.
+            "X": astype_numpy(
+                rng.standard_normal((spec.B, spec.C * spec.H * spec.W)).astype(np.float32),
+                spec.dtype,
+            ),
+            "W": astype_numpy(
+                rng.standard_normal((spec.d_model, spec.K)).astype(np.float32), spec.dtype
+            ),
+            "Out": zeros_for_dtype((spec.M, spec.N), spec.dtype),
+        }
 
     @classmethod
     def spec_from_tensors(cls, X, W, *, C: int, H: int, W_spatial: int, ph: int = 2, pw: int = 2):
