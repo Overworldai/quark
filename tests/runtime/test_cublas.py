@@ -227,11 +227,23 @@ class TestDispatchGate:
                 pass
         assert calls == [], "b_shuffled=True should not route to cuBLAS"
 
-    def test_e4m3_out_falls_through(self, monkeypatch):
-        """cuBLAS fp8 path produces bf16 only — requesting e4m3 output
-        must stay on the custom kernel."""
+    def test_e4m3_out_uses_cublas(self, monkeypatch):
+        """e4m3×e4m3→e4m3 is wired with D_SCALE_POINTER and should
+        route to cuBLAS (not the custom kernel, whose store path
+        can't emit scalar fp8)."""
         A, B = _make_ab(32, 32, 64, "e4m3", "e4m3")
         calls = _patch_record_cublas_calls(monkeypatch)
         with _env("POPCORN_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="e4m3")
-        assert calls == [], "e4m3 output should not route to cuBLAS"
+        assert len(calls) == 1
+
+    def test_bias_uses_cublas(self, monkeypatch):
+        """cublasLt BIAS epilogue: a [N] bias vector routes to cuBLAS
+        rather than the custom kernel."""
+        M, N, K = 32, 64, 64
+        A, B = _make_ab(M, N, K, "bf16", "bf16")
+        bias = PopcornTensor.from_numpy(_rand_f32(N, seed=42), dtype="f32").astype("bf16")
+        calls = _patch_record_cublas_calls(monkeypatch)
+        with _env("POPCORN_DISABLE_CUBLAS", None):
+            pcf.gemm(A, B, out_dtype="bf16", bias=bias)
+        assert len(calls) == 1
