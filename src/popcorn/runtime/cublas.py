@@ -56,10 +56,17 @@ CUBLAS_COMPUTE_32F = 68
 # cublasLtMatmulDescAttributes_t (cublasLt.h)
 CUBLASLT_MATMUL_DESC_TRANSA = 3
 CUBLASLT_MATMUL_DESC_TRANSB = 4
+CUBLASLT_MATMUL_DESC_EPILOGUE = 7
+CUBLASLT_MATMUL_DESC_BIAS_POINTER = 8
 CUBLASLT_MATMUL_DESC_A_SCALE_POINTER = 17
 CUBLASLT_MATMUL_DESC_B_SCALE_POINTER = 18
 CUBLASLT_MATMUL_DESC_C_SCALE_POINTER = 19
 CUBLASLT_MATMUL_DESC_D_SCALE_POINTER = 20
+CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE = 32
+
+# cublasLtEpilogue_t
+CUBLASLT_EPILOGUE_DEFAULT = 1
+CUBLASLT_EPILOGUE_BIAS = 4
 
 # popcorn dtype string → cudaDataType_t
 _DTYPE_TO_CUDA: dict[str, int] = {
@@ -267,6 +274,8 @@ class CublasRuntime:
         a_dtype: str,
         b_dtype: str,
         c_dtype: str,
+        bias_ptr: int = 0,
+        bias_dtype: str | None = None,
         stream: int = 0,
     ) -> None:
         """Compute row-major ``C[M, N] = A[M, K] @ B[N, K]^T``.
@@ -276,6 +285,11 @@ class CublasRuntime:
         of the supported TN-shaped combos (bf16×bf16→bf16/f32 or
         e4m3×e4m3→bf16). alpha=1, beta=0.
 
+        ``bias_ptr`` (optional): device pointer to a ``[N]`` bias vector
+        in ``bias_dtype`` — cublasLt adds it row-broadcast via its BIAS
+        epilogue. ``bias_dtype`` defaults to ``c_dtype`` when the bias
+        lives in the same dtype as the output.
+
         ``stream`` is a ``CUstream`` pointer (as int); 0 uses the
         legacy default stream.
         """
@@ -284,6 +298,7 @@ class CublasRuntime:
         c_cuda = _DTYPE_TO_CUDA[c_dtype]
         is_fp8_input = a_dtype in ("e4m3", "e5m2") or b_dtype in ("e4m3", "e5m2")
         is_fp8_output = c_dtype in ("e4m3", "e5m2")
+        has_bias = bias_ptr != 0
 
         desc = ctypes.c_void_p(0)
         self._check(
@@ -341,6 +356,44 @@ class CublasRuntime:
                         ctypes.sizeof(d_scale_ptr),
                     )
                 )
+
+            if has_bias:
+                # BIAS epilogue: cublasLt adds a [N] vector row-
+                # broadcast to D before the narrow-cast to c_dtype. In
+                # col-major terms D_cm is [N, M] so the bias length N
+                # matches cublasLt's expected axis exactly — our row-
+                # major convention lands on the happy path.
+                epilogue = ctypes.c_uint32(CUBLASLT_EPILOGUE_BIAS)
+                self._check(
+                    self._lib.cublasLtMatmulDescSetAttribute(
+                        desc,
+                        CUBLASLT_MATMUL_DESC_EPILOGUE,
+                        ctypes.byref(epilogue),
+                        ctypes.sizeof(epilogue),
+                    )
+                )
+                bias_ptr_c = ctypes.c_uint64(bias_ptr)
+                self._check(
+                    self._lib.cublasLtMatmulDescSetAttribute(
+                        desc,
+                        CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                        ctypes.byref(bias_ptr_c),
+                        ctypes.sizeof(bias_ptr_c),
+                    )
+                )
+                # BIAS_DATA_TYPE lets the bias dtype diverge from
+                # c_dtype (e.g. bf16 bias on fp8 output). Default path
+                # (unset attr) assumes bias matches the output dtype.
+                if bias_dtype is not None and bias_dtype != c_dtype:
+                    bias_cuda = ctypes.c_int(_DTYPE_TO_CUDA[bias_dtype])
+                    self._check(
+                        self._lib.cublasLtMatmulDescSetAttribute(
+                            desc,
+                            CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                            ctypes.byref(bias_cuda),
+                            ctypes.sizeof(bias_cuda),
+                        )
+                    )
 
             # Layouts: see module docstring for the row-major → col-major
             # mapping. cublasLt_A = our B (op=T, K×N, ld=K), cublasLt_B =

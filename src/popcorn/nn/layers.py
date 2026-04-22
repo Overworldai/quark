@@ -187,15 +187,10 @@ class Linear(Module):
         # cuBLAS routing: cublasLt's fp8 matmul only takes fp8 A *and*
         # B — mixed bf16×e4m3 stays on the custom kernel. To land the
         # fp8-weight Linear on cuBLAS, narrow the activation to e4m3
-        # here (cached buffer, zero churn). Scalar shuffle / fused-
-        # activation / bias paths skip the cast and keep the custom
-        # kernel.
-        can_use_cublas = (
-            activation is None
-            and bias is None
-            and not self._has_bias
-            and not getattr(self, "_shuffled", False)
-        )
+        # here (packed_convert, no scalar cvt crash). Bias is fine:
+        # cublasLt has a BIAS epilogue. Only activation fusion and
+        # weight pre-shuffle still send us to the custom kernel.
+        can_use_cublas = activation is None and not getattr(self, "_shuffled", False)
         if is_fp8_weight and a_dtype not in ("e4m3", "e5m2") and can_use_cublas:
             x = self._cast_to_fp8(x, b_dtype)
             a_dtype = b_dtype
@@ -444,13 +439,18 @@ class EulerStep(Module):
 
 
 class MLP(Module):
-    """Two-layer MLP with fused SiLU on fc1: ``fc2(silu(fc1(x)))``.
+    """Two-layer MLP: ``fc2(silu(fc1(x)))``.
 
-    ``hidden_out_dtype``: optional override for fc1's output dtype, so
-    the mid activation can stay in e4m3 when both weights are fp8. When
-    ``None``, falls back to ``out_dtype`` (original behavior). fc2's
-    output dtype is always ``out_dtype`` so the MLP's return value
-    matches the residual stream.
+    SiLU runs as a separate ``pcf.silu`` call rather than fused into
+    fc1's GEMM epilogue. The custom kernel's fused-silu epilogue rules
+    out cuBLAS (cublasLtMatmul has no silu fusion) and cuBLAS beats
+    the custom GEMM on every shape we care about — the extra silu
+    launch is a rounding error vs. the GEMM gap. If perf ever pushes
+    us the other way, revive fusion behind a flag.
+
+    ``hidden_out_dtype``: optional override for fc1's output dtype.
+    Default tracks ``out_dtype``. fc2's output dtype is always
+    ``out_dtype`` so the return value matches the residual stream.
     """
 
     def __init__(
@@ -465,9 +465,10 @@ class MLP(Module):
         mid_dt = hidden_out_dtype if hidden_out_dtype is not None else out_dtype
         self.fc1 = Linear(d_in, d_mid, out_dtype=mid_dt)
         self.fc2 = Linear(d_mid, d_out, out_dtype=out_dtype)
+        self.silu = SiLU()
 
     def forward(self, x):
-        return self.fc2(self.fc1(x, activation="silu"))
+        return self.fc2(self.silu(self.fc1(x)))
 
 
 class ControllerInputEmbedding(Module):
@@ -494,6 +495,11 @@ class ControllerInputEmbedding(Module):
         self._padded_in = ((raw_in + 15) // 16) * 16
         self.fc1 = Linear(self._padded_in, d_mid, out_dtype=out_dtype, fp8_skip=fp8_skip)
         self.fc2 = Linear(d_mid, d_model, out_dtype=out_dtype, fp8_skip=fp8_skip)
+        # Silu standalone so fc1 is a plain GEMM that cuBLAS takes. The
+        # fused-silu custom kernel blocks cuBLAS routing entirely, and
+        # cuBLAS wins by enough on every shape we care about that the
+        # extra silu launch doesn't dent the budget.
+        self.silu = SiLU()
 
     def forward(self, ctrl_input):
         """``ctrl_input``: [1, padded_in] tensor."""
@@ -508,7 +514,7 @@ class ControllerInputEmbedding(Module):
         else:
             x = ctrl_input
 
-        h = self.fc1(x, activation="silu")
+        h = self.silu(self.fc1(x))
         out = self.fc2(h)
 
         if M < BM_MIN:
@@ -523,20 +529,21 @@ class MLPFusion(Module):
         self.fc1_x = Linear(d_model, d_model, out_dtype=out_dtype)
         self.fc1_c = Linear(d_model, d_model, out_dtype=out_dtype)
         self.fc2 = Linear(d_model, d_model, out_dtype=out_dtype)
+        self.silu = SiLU()
 
     def forward(self, x, cond):
-        """``x``: [M, d], ``cond``: [1, d] (broadcast-added via GEMM bias).
+        """``x``: [M, d], ``cond``: [1, d] (row-broadcast as GEMM bias).
 
         Math: ``h = silu(x @ Wx.T + cond @ Wc.T); y = h @ fc2.T``.
 
-        Fused so ``fc1_x``'s GEMM epilogue does ``silu(A @ B.T + bias)``
-        with ``bias = cond @ Wc.T`` as the ``[d]`` bias vector — the
-        broadcast-over-M is free inside the epilogue, and silu is fused
-        too. Collapses what used to be three extra kernel launches
-        (broadcast-cat + elementwise add + silu) into one.
+        ``fc1_x`` folds the cond projection in as a ``[d]`` bias vector
+        — cublasLt's BIAS epilogue row-broadcasts it for free — and
+        silu runs as a standalone kernel after the GEMM. This keeps
+        the three logical ops (fc1_x, add cond, silu) compressed to
+        two launches while staying on the cuBLAS path.
         """
         h_c = self.fc1_c(cond).reshape(-1)  # [d]
-        return self.fc2(self.fc1_x(x, bias=h_c, activation="silu"))
+        return self.fc2(self.silu(self.fc1_x(x, bias=h_c)))
 
 
 class ValueResidualPacked(Module):

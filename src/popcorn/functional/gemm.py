@@ -64,7 +64,7 @@ def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias,
         return None
     if os.environ.get("POPCORN_DISABLE_CUBLAS") == "1":
         return None
-    if b_shuffled or activation is not None or bias is not None:
+    if b_shuffled or activation is not None:
         return None
 
     from popcorn.runtime.tensor import PopcornTensor
@@ -73,6 +73,13 @@ def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias,
         return None
     if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
         return None
+
+    # cublasLt's BIAS epilogue requires a 1D [N] vector.
+    if bias is not None:
+        if not isinstance(bias, PopcornTensor):
+            return None
+        if bias.ndim != 1 or int(bias.shape[0]) != int(B.shape[0]):
+            return None
 
     a_dt = _dtype_str(A)
     b_dt = _dtype_str(B)
@@ -109,9 +116,12 @@ def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias,
     from popcorn.graph import active_stream
 
     stream = active_stream() or 0
+    bias_ptr = bias.data_ptr() if bias is not None else 0
+    bias_dt = _dtype_str(bias) if bias is not None else None
     if os.environ.get("POPCORN_CUBLAS_VERBOSE") == "1":
+        tag = f" bias={bias_dt}" if bias is not None else ""
         print(
-            f"[cublas] matmul M={M} N={N} K={K} a={a_dt} b={b_dt} c={c_dt} stream={stream}",
+            f"[cublas] matmul M={M} N={N} K={K} a={a_dt} b={b_dt} c={c_dt}{tag} stream={stream}",
             flush=True,
         )
     CublasRuntime.instance().matmul(
@@ -124,6 +134,8 @@ def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias,
         a_dtype=a_dt,
         b_dtype=b_dt,
         c_dtype=c_dt,
+        bias_ptr=bias_ptr,
+        bias_dtype=bias_dt,
         stream=stream,
     )
     return out
