@@ -56,11 +56,11 @@ def _build_copy_kernel(*, buf_dtype, vec_dtype, width, n_elems):
     """
     from dataclasses import dataclass
 
-    from popcorn.ir import BufferType, Builder, DType
-    from popcorn.ir.module import ParamAttrs
-    from popcorn.ir.tensor import GlobalTensor
-    from popcorn.kernels.base import Kernel
-    from popcorn.launcher import ParamSpec
+    from quark.ir import BufferType, Builder, DType
+    from quark.ir.module import ParamAttrs
+    from quark.ir.tensor import GlobalTensor
+    from quark.kernels.base import Kernel
+    from quark.launcher import ParamSpec
 
     # vec_dtype in BUFFER ELEMENT units — how many buf elems per vec elem.
     buf_bytes = buf_dtype.bytes
@@ -183,7 +183,7 @@ def _mxbf(t: torch.Tensor) -> mx.array:
 
 def _run_copy(K_cls, In_mx, n_elems):
     """Launch the kernel and return the output as an mlx.array."""
-    from popcorn.launcher.launcher import Launcher
+    from quark.launcher.launcher import Launcher
 
     if In_mx.dtype == mx.bfloat16:
         Out = mx.zeros((n_elems,), dtype=mx.bfloat16)
@@ -219,7 +219,7 @@ def test_vec_bf16_buf_b32_vec(width):
     This is THE path that failed before the fix (address advanced by
     1 bf16 per vec elem instead of 2).
     """
-    from popcorn.ir import DType
+    from quark.ir import DType
 
     n_elems = max(width * 2, 64)  # in bf16 elements, at least 1 warp × 2
     # Round n_elems up so n_threads is a valid block.
@@ -259,7 +259,7 @@ def test_vec_bf16_buf_b32_vec(width):
 def test_vec_bf16_buf_bf16_vec(width):
     """bf16 buf × bf16 vec — no dtype mismatch. Simple per-element
     load/store sequence; should have always worked."""
-    from popcorn.ir import DType
+    from quark.ir import DType
 
     n_elems = max(width * 4, 128)
     n_elems = (n_elems // width) * width
@@ -290,7 +290,7 @@ def test_vec_bf16_buf_bf16_vec(width):
 @pytest.mark.parametrize("width", [2, 4])
 def test_vec_f32_buf_f32_vec(width):
     """f32 buf × f32 vec — simple path at f32."""
-    from popcorn.ir import DType
+    from quark.ir import DType
 
     n_elems = max(width * 4, 64)
     n_elems = (n_elems // width) * width
@@ -321,7 +321,7 @@ def test_vec_bf16_buf_b64_vec(width):
     """bf16 buf × B64 vec. Each vec elem covers 4 bf16 elements.
     Rarely used by attn but needed for future 16-byte-per-elem
     cooperative stores."""
-    from popcorn.ir import DType
+    from quark.ir import DType
 
     buf_per_vec = 4  # B64 / BF16 = 8 / 2 = 4
     n_elems = max(width * buf_per_vec * 2, 64)

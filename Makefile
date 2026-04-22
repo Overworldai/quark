@@ -69,7 +69,7 @@ help:
 	@echo "Tunables (override on the command line):"
 	$(if $(_CUDA_ENV),@echo "  CUDA_PATH=$(CUDA_PATH)")
 	@echo ""
-	@echo "Adding a new kernel: drop a folder under src/popcorn/kernels/"
+	@echo "Adding a new kernel: drop a folder under src/quark/kernels/"
 	@echo "with a @register(\"name\")-decorated Kernel subclass. Zero"
 	@echo "Makefile edits required — every target above is registry-driven."
 
@@ -79,7 +79,7 @@ help:
 # wired up. From then on, every `git commit` runs the hook.
 setup: install install-hooks
 	@echo ""
-	@echo "✓ popcorn is set up. Try:"
+	@echo "✓ quark is set up. Try:"
 	@echo "    make probe-device   # confirm the GPU caps are sane"
 	@echo "    make test           # run the unit + smoke suite"
 
@@ -134,7 +134,7 @@ fuzz:
 	$(PY) tools/fuzz.py $(if $(KERNEL),--kernel $(KERNEL)) $(if $(PROBLEM),--problem $(PROBLEM)) $(if $(TAG),--tag $(TAG))
 
 # ── Bench ──
-# Registry-driven. The bench harness consults `popcorn.kernels
+# Registry-driven. The bench harness consults `quark.kernels
 # .all_kernels()` and runs each kernel × every problem unless
 # KERNEL= / PROBLEM= restrict the sweep.
 
@@ -144,7 +144,7 @@ bench:
 # ── Autotune ──
 # Registry-driven. Writes results into the bundled configs/ dir.
 # tools/autotune.py is the existing offline genetic search; the
-# runtime autotune cache (popcorn.autotune.AutotuneCache) is what
+# runtime autotune cache (quark.autotune.AutotuneCache) is what
 # Launcher.compile() consults at runtime per Bundle 5.
 
 autotune:
@@ -153,7 +153,7 @@ autotune:
 # ── Dev helpers ──
 
 probe-device:
-	$(PY) -c "from popcorn.device import current_device; d = current_device(); print(d.caps); print(d.fingerprint())"
+	$(PY) -c "from quark.device import current_device; d = current_device(); print(d.caps); print(d.fingerprint())"
 
 dump-ptx:
 	$(PY) -c "import sys; sys.exit(\"dump-ptx not yet wired (see Bundle 7)\")"
@@ -166,7 +166,7 @@ lint:
 	$(ENV_PREFIX) uvx ty check src tests
 
 repl:
-	$(PY) -m IPython -i -c "from popcorn import *; from popcorn.tensor import *"
+	$(PY) -m IPython -i -c "from quark import *; from quark.tensor import *"
 
 clean:
 	rm -rf .pytest_cache

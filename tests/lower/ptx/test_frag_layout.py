@@ -1,7 +1,7 @@
 """Regression tests for PTX mma.sync fragment per-lane layouts.
 
 The PTX backend's MMA lowering relies on the ``a_offsets`` /
-``b_offsets`` / ``cd_offsets`` tables in ``popcorn.kernels.gemm.mma_shapes``
+``b_offsets`` / ``cd_offsets`` tables in ``quark.kernels.gemm.mma_shapes``
 — those tables encode the per-register (row_offset, col_offset)
 positions each lane holds for a given ``mma.sync`` shape. PTX ISA
 §9.7.14.5 specifies these mappings as part of the instruction
@@ -22,7 +22,7 @@ frozen to match the PTX ISA revisions they target (sm_80+).
 
 from __future__ import annotations
 
-from popcorn.kernels.gemm.mma_shapes import (
+from quark.kernels.gemm.mma_shapes import (
     _BF16_K16,
     _E4M3_K16,
     _E4M3_K32,

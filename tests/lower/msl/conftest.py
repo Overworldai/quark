@@ -2,9 +2,9 @@
 
 import pytest
 
-from popcorn.device import DeviceCaps, DeviceFamily
-from popcorn.ir import Builder
-from popcorn.lower.msl import LoweredMslKernel, MslLowerer
+from quark.device import DeviceCaps, DeviceFamily
+from quark.ir import Builder
+from quark.lower.msl import LoweredMslKernel, MslLowerer
 
 # Fake Metal caps for tests that don't need a real device.
 METAL_CAPS_FAKE = DeviceCaps(

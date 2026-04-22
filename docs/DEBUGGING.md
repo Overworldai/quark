@@ -48,7 +48,7 @@ launch and tensor-setup failures; read it before starting recipes.
 ## Kernel fails to compile
 
 ```bash
-POPCORN_PRINT_FAILED_SOURCE=1 make fuzz KERNEL=name
+QUARK_PRINT_FAILED_SOURCE=1 make fuzz KERNEL=name
 ```
 
 Prints the lowered source (PTX or MSL) that the driver rejected.
@@ -84,7 +84,7 @@ Common errors:
 make bench KERNEL=name TAG=smoke
 ```
 
-- Tuned vs default: `POPCORN_FORCE_DEFAULT_CONFIG=1 make bench`
+- Tuned vs default: `QUARK_FORCE_DEFAULT_CONFIG=1 make bench`
   — if tuned is slower, re-autotune (kernel-emit refactors routinely
   invalidate old configs).
 - Occupancy: too much smem → fewer blocks / SM.
@@ -109,11 +109,11 @@ Run `make fuzz KERNEL=name` with the full sweep. If only certain
 
 | Variable | Effect |
 |---|---|
-| `POPCORN_ENABLE_PERF_WARNINGS=1` | enables validator `PerfWarning` (off by default) |
-| `POPCORN_DISABLE_CSE=1` | disables Builder CSE (debug only) |
-| `POPCORN_FORCE_DEFAULT_CONFIG=1` | skips tuned JSON lookup in bench/fuzz |
-| `POPCORN_PRINT_FAILED_SOURCE=1` | prints lowered text on compile failure |
-| `POPCORN_CONFIGS_DIR` | override `configs/` path |
+| `QUARK_ENABLE_PERF_WARNINGS=1` | enables validator `PerfWarning` (off by default) |
+| `QUARK_DISABLE_CSE=1` | disables Builder CSE (debug only) |
+| `QUARK_FORCE_DEFAULT_CONFIG=1` | skips tuned JSON lookup in bench/fuzz |
+| `QUARK_PRINT_FAILED_SOURCE=1` | prints lowered text on compile failure |
+| `QUARK_CONFIGS_DIR` | override `configs/` path |
 
 ## Bench / fuzz error surfacing
 

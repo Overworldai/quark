@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 def _configs_dir() -> Path:
-    env = os.environ.get("POPCORN_CONFIGS_DIR")
+    env = os.environ.get("QUARK_CONFIGS_DIR")
     if env:
         return Path(env)
     repo = Path(__file__).resolve().parents[1] / "configs"
@@ -51,7 +51,7 @@ def _make_ptx_error_hook():
     dumped: dict[tuple[str, str], str] = {}
 
     def _hook(kernel_cls, spec, cfg, exc, launcher):
-        from popcorn.utils.ptx_dump import classify_compile_error, write_ptx_for
+        from quark.utils.ptx_dump import classify_compile_error, write_ptx_for
 
         if classify_compile_error(exc) != "ptx":
             return None
@@ -87,13 +87,13 @@ def autotune_one(
     seed: int,
     max_workers: int | None,
 ) -> None:
-    from popcorn.utils.pretty import print_header, style
+    from quark.utils.pretty import print_header, style
 
     name = kernel_cls.NAME
     print_header(f"{name} / {problem.name}")
 
     spec_cls = kernel_cls.SPEC_CLS
-    from popcorn.device import current_device
+    from quark.device import current_device
 
     _device = current_device()
     _problem_spec = None
@@ -148,7 +148,7 @@ def autotune_one(
     cache.max_workers = max_workers
     cache._compile_error_hook = _make_ptx_error_hook()
 
-    os.environ["POPCORN_AUTOTUNE_VERBOSE"] = "1"
+    os.environ["QUARK_AUTOTUNE_VERBOSE"] = "1"
     try:
         seeds = cache._load_warm_seeds(kernel_cls, spec)
         result = cache._search_full_result(kernel_cls, spec, seeds, tune_space=tune_space)
@@ -225,10 +225,10 @@ def main(argv=None):
     parser.add_argument("--no-save", action="store_true", help="skip saving configs")
     args = parser.parse_args(argv)
 
-    from popcorn.device import current_device
-    from popcorn.kernels import all_kernels, get
-    from popcorn.launcher import Launcher
-    from popcorn.utils.pretty import print_header, print_kv
+    from quark.device import current_device
+    from quark.kernels import all_kernels, get
+    from quark.launcher import Launcher
+    from quark.utils.pretty import print_header, print_kv
 
     kernels = [get(args.kernel)] if args.kernel else all_kernels()
     launcher = Launcher(device=current_device())

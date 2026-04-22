@@ -1,4 +1,4 @@
-"""Cross-check popcorn.functional kernels against world_engine's CPU torch
+"""Cross-check quark.functional kernels against world_engine's CPU torch
 reference for each primitive they replace. This is the correctness harness
 for the Tier-1 kernel set.
 
@@ -27,7 +27,7 @@ import torch.nn.functional as F
 # so we don't pull in the engine's entry point.
 from model import nn as we_nn
 
-import popcorn.functional as pcf
+import quark.functional as pcf
 
 
 def _as_mlx(x: torch.Tensor):
@@ -101,7 +101,7 @@ def check_ada_rmsnorm():
 
     y_ref = we_nn.ada_rmsnorm(x_t, scale_t, bias_t)  # [b, n*m, d]
 
-    # popcorn accepts [B*M, D] and [G, D] where G=b*n, M=m.
+    # quark accepts [B*M, D] and [G, D] where G=b*n, M=m.
     x_mx = _as_mlx(x_t.reshape(b * n * m, d))
     scale_mx = _as_mlx(scale_t.reshape(b * n, d))
     bias_mx = _as_mlx(bias_t.reshape(b * n, d))
@@ -126,7 +126,7 @@ def check_ada_rmsnorm():
 
 
 # ---------------------------------------------------------------
-# 3. ada_gate (residual-fused popcorn form)
+# 3. ada_gate (residual-fused quark form)
 # ---------------------------------------------------------------
 
 
@@ -182,7 +182,7 @@ def check_noise_conditioner():
         sigma_t = torch.linspace(0.01, 1.0, 64).to(torch.float32)
         emb_ref = we_mod(sigma_t)  # [64, d_model] fp32
 
-    # Map the trained weights to MLX (bf16 for fc layers — matches popcorn).
+    # Map the trained weights to MLX (bf16 for fc layers — matches quark).
     W1 = we_mod.mlp.fc1.weight.detach().to(torch.bfloat16)  # [4*d, F]
     W2 = we_mod.mlp.fc2.weight.detach().to(torch.bfloat16)  # [d, 4*d]
     freqs = we_mod.freq.detach().to(torch.float32)  # [F/2]
@@ -214,7 +214,7 @@ def check_adaln_out_norm():
         cond_t = torch.randn(b, n, d, dtype=torch.bfloat16)
         y_ref = mod(x_t, cond_t)
 
-    # Reproduce in popcorn: silu + linear → (scale, bias) = chunk(ab, 2).
+    # Reproduce in quark: silu + linear → (scale, bias) = chunk(ab, 2).
     # silu is native; the linear uses the world_engine AdaLN.fc weight.
     W_fc = mod.fc.weight.detach().to(torch.bfloat16)  # [2d, d]
     # silu(cond) @ W_fc^T  — plain gemm.
@@ -254,7 +254,7 @@ def check_gemm_silu():
 
 # ---------------------------------------------------------------
 # 7. single-frame SDPA (plain causal attention, no KV cache / no flex_attn)
-#     This sanity-checks the popcorn QKV→attention→out_proj composition
+#     This sanity-checks the quark QKV→attention→out_proj composition
 #     against a pure-torch SDPA reference. owl_attn itself is exercised
 #     in its own kernel-level smoke test; here we just confirm the
 #     surrounding plumbing.
@@ -262,7 +262,7 @@ def check_gemm_silu():
 
 
 def check_attn_singlepass():
-    print("single-frame SDPA (popcorn Q/K/V via gemm+rmsnorm vs pure torch):")
+    print("single-frame SDPA (quark Q/K/V via gemm+rmsnorm vs pure torch):")
     torch.manual_seed(6)
     B, T = 1, 64
     n_heads, n_kv_heads, Dh = 32, 16, 64
@@ -296,7 +296,7 @@ def check_attn_singlepass():
     attn_ref = attn_ref.permute(0, 2, 1, 3).reshape(B, T, d)
     y_ref = torch.nn.functional.linear(attn_ref, W_out)
 
-    # ── popcorn: gemm → reshape → rmsnorm → torch SDPA (no owl_attn) → gemm ──
+    # ── quark: gemm → reshape → rmsnorm → torch SDPA (no owl_attn) → gemm ──
     # (We use torch SDPA because owl_attn needs the ring cache structure
     # and won't run in this stripped-down single-pass setup.)
     x_mx = _as_mlx(x_t.reshape(B * T, d))
@@ -307,7 +307,7 @@ def check_attn_singlepass():
     K_p = qkv_back[..., q_end:k_end].reshape(B, T, n_kv_heads, Dh)
     V_p = qkv_back[..., k_end:].reshape(B, T, n_kv_heads, Dh)
 
-    # rmsnorm on Q/K using popcorn.
+    # rmsnorm on Q/K using quark.
     Qn_p_flat = pcf.rmsnorm(_as_mlx(Q_p.reshape(-1, Dh)))
     Kn_p_flat = pcf.rmsnorm(_as_mlx(K_p.reshape(-1, Dh)))
     Qn_p = _as_torch(Qn_p_flat).reshape(B, T, n_heads, Dh)

@@ -14,13 +14,13 @@ import json
 import sys
 from pathlib import Path
 
-from popcorn.utils.pretty import Table, print_header, print_kv, style
+from quark.utils.pretty import Table, print_header, print_kv, style
 
 
 def _configs_dir() -> Path:
     import os
 
-    env = os.environ.get("POPCORN_CONFIGS_DIR")
+    env = os.environ.get("QUARK_CONFIGS_DIR")
     if env:
         return Path(env)
     repo = Path(__file__).resolve().parents[1] / "configs"
@@ -46,7 +46,7 @@ def _load_saved_config(kernel_cls, problem):
 
 def _time_callable(fn, *, warmup_ms=10.0, bench_ms=50.0) -> float:
     """Budget-based timing — reuses the launcher's backend-neutral timer."""
-    from popcorn.launcher.launcher import _time_callable as _tc
+    from quark.launcher.launcher import _time_callable as _tc
 
     return _tc(fn, warmup_ms=warmup_ms, bench_ms=bench_ms)
 
@@ -71,13 +71,13 @@ def main(argv=None):
 
     import sys as _sys
 
-    from popcorn.correctness import check_correctness
-    from popcorn.device import current_device
-    from popcorn.kernels import all_kernels, get
-    from popcorn.launcher import Launcher
-    from popcorn.refs import ref_cache
-    from popcorn.runtime.device_tensors import numpy_to_device_dict
-    from popcorn.runtime.sync import ir_dtype_of, synchronize, zero_buffer
+    from quark.correctness import check_correctness
+    from quark.device import current_device
+    from quark.kernels import all_kernels, get
+    from quark.launcher import Launcher
+    from quark.refs import ref_cache
+    from quark.runtime.device_tensors import numpy_to_device_dict
+    from quark.runtime.sync import ir_dtype_of, synchronize, zero_buffer
 
     IS_METAL = _sys.platform == "darwin"
 
@@ -149,7 +149,7 @@ def main(argv=None):
             try:
                 compiled = launcher.compile(cls, kernel.spec, kernel.config)
             except Exception as e:
-                from popcorn.utils.ptx_dump import classify_compile_error, write_ptx_for
+                from quark.utils.ptx_dump import classify_compile_error, write_ptx_for
 
                 rec["state"] = "err"
                 if classify_compile_error(e) == "ptx":

@@ -4,8 +4,8 @@ import re
 
 import pytest
 
-from popcorn.ir import Builder
-from popcorn.lower.ptx import LoweredKernel, PtxLowerer
+from quark.ir import Builder
+from quark.lower.ptx import LoweredKernel, PtxLowerer
 
 
 @pytest.fixture

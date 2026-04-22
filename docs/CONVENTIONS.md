@@ -11,7 +11,7 @@
   the exemption.
 - `blocks/dsl/` is a package split across concern-specific submodules
   (context, tensors, accumulators, carry, smem_tile, block_context,
-  kernel_context) — kernel authors import from `popcorn.blocks`, not
+  kernel_context) — kernel authors import from `quark.blocks`, not
   the submodules directly.
 - One class per file for L1 / L2 blocks.
 - Kernel folders split into `spec.py` / `config.py` / `kernel.py` /
@@ -30,14 +30,14 @@
 | Per-lane view | `A_lane` / `q_lane` |
 | L0 emit functions | `emit_*` |
 | Block classes | CamelCase: `MmaBody`, `SmemPlan`, `PipelineBody`, `Accumulators`, `Stage`, `Carry` |
-| `pop.*` helpers | snake_case: `pop.store_acc`, `pop.work_list_load`, `pop.index_cache`, `pop.q_register_load`, `pop.silu`, `pop.cast` |
+| `qk.*` helpers | snake_case: `qk.store_acc`, `qk.work_list_load`, `qk.index_cache`, `qk.q_register_load`, `qk.silu`, `qk.cast` |
 | Dtype | `DType` enum (str + IR + backend bridge). `spec.a_dtype.backend` → torch/mlx dtype; `DType("bf16") is DType.BF16`. |
 
 ## Imports
 
 Order: stdlib → `torch` (only in baselines/ci-only code; otherwise
-route through `PT`) → `popcorn.lang` → `popcorn.ir` → `popcorn.backend`
-→ `popcorn.blocks` → `popcorn.kernels.*`.
+route through `PT`) → `quark.lang` → `quark.ir` → `quark.backend`
+→ `quark.blocks` → `quark.kernels.*`.
 
 ```python
 from __future__ import annotations
@@ -45,15 +45,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-import popcorn.lang as pop
-from popcorn.backend import PT
-from popcorn.blocks import (
+import quark.lang as qk
+from quark.backend import PT
+from quark.blocks import (
     Accumulators, IterCtx, MmaBody, PipelineBody, SmemPlan, SmemTile, Stage, TensorDecl,
 )
-from popcorn.ir import Builder, DType, Module
-from popcorn.ir.mma_registry import ALL_SHAPES, lookup_mma
-from popcorn.kernels.base import Kernel, MmaSite
-from popcorn.kernels.decorator import kernel
+from quark.ir import Builder, DType, Module
+from quark.ir.mma_registry import ALL_SHAPES, lookup_mma
+from quark.kernels.base import Kernel, MmaSite
+from quark.kernels.decorator import kernel
 ```
 
 ## Type hints
@@ -92,20 +92,20 @@ from popcorn.kernels.decorator import kernel
 | Star imports | explicit names |
 | Mutable default values on dataclass fields | `field(default_factory=...)` |
 | `TODO` with no context | `TODO(issue #N): …` |
-| Raw `torch.*` / `mlx.*` in references / make_tensors | `popcorn.backend.PT` |
+| Raw `torch.*` / `mlx.*` in references / make_tensors | `quark.backend.PT` |
 | `getattr(cls, "CORRECTNESS_THRESHOLD", None)` | `cls.correctness_threshold(out_dtype)` |
 | `spec_from_tensors` | retired; don't add new callers |
 | `global_tensors() -> []` stubs | omit; base default is fine |
 | Per-kernel `from_problem` for trivial cases | override `CONFIG_CLS.default_for(spec)` instead |
-| `bctx.bld.*` direct calls in `build()` | `import popcorn.lang as pop`; use `pop.mul`, `pop.for_range`, `pop.barrier`, … |
+| `bctx.bld.*` direct calls in `build()` | `import quark.lang as qk`; use `qk.mul`, `qk.for_range`, `qk.barrier`, … |
 | `KLoop` / `Pipeline` (retired) | `PipelineBody(stages=…, produce=…, consume=…, carry=…).run(n_iters=…, n_stages=…)` |
-| Retired dataclass wrappers (`WorkListLoad`, `IndexCache`, `QRegisterLoad`, `GatheredTileLoad`, `NormalizeAndStore`, `Gemm1QK`/`Gemm2PV`) | `pop.work_list_load`, `pop.index_cache`, `pop.q_register_load`, `SmemTile.gather_from`, `pop.store_acc(per_warp=, row_scale=)`, `MmaBody(a=, b=, acc=)` |
+| Retired dataclass wrappers (`WorkListLoad`, `IndexCache`, `QRegisterLoad`, `GatheredTileLoad`, `NormalizeAndStore`, `Gemm1QK`/`Gemm2PV`) | `qk.work_list_load`, `qk.index_cache`, `qk.q_register_load`, `SmemTile.gather_from`, `qk.store_acc(per_warp=, row_scale=)`, `MmaBody(a=, b=, acc=)` |
 | Hardcoded `mma_k` / shape names in config | declare `MmaSite`s on the kernel; autotuner fills per-site `<site>_shape` |
 
 ## Performance rules
 
 - Epilogue: **always** frag → smem → max-width `vec_store` (16 B =
-  v4.b32 = 8×bf16) for large output tiles. `pop.store_acc(...,
+  v4.b32 = 8×bf16) for large output tiles. `qk.store_acc(...,
   stage_in_smem=True, staging_smem=...)` is the fast path; direct
   scalar stores stay for tiny per-warp tiles.
 - Prefer `smem_tile.load_from(gmem_tensor, row=, col=, cast=)` for

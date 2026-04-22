@@ -63,7 +63,7 @@ Output: microseconds per launch. TFLOPS = `flops() / us / 1e6`.
 Default budgets: `WARMUP_MS=10`, `BENCH_MS=50`. Override on the CLI.
 
 Timing is backend-agnostic — it goes through
-`popcorn.backend.time_callable`.
+`quark.backend.time_callable`.
 
 ## Config resolution
 
@@ -71,7 +71,7 @@ Launch order:
 
 1. Tuned JSON at `configs/{KERNEL}_{problem.name}.json`.
 2. Fall back to `cls.CONFIG_CLS.default_for(spec)` (the `Kernel.from_problem` path).
-3. `POPCORN_FORCE_DEFAULT_CONFIG=1` skips the JSON lookup.
+3. `QUARK_FORCE_DEFAULT_CONFIG=1` skips the JSON lookup.
 
 Bench output marks each row `[tuned]` or `[default]`.
 
@@ -118,7 +118,7 @@ stale; perf comparisons vs. stale configs lie.
 CLI knobs: `--pop 64 --gens 16 --mutate-prob 0.2 --early-stop 3
 --seed 0 --max-workers N`.
 
-`POPCORN_CONFIGS_DIR` overrides the save path (default
+`QUARK_CONFIGS_DIR` overrides the save path (default
 `<repo>/configs/`).
 
 Saved JSON:

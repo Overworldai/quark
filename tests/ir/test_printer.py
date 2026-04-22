@@ -1,6 +1,6 @@
 """Tests for the human-readable IR printer."""
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,

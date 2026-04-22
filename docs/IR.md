@@ -4,7 +4,7 @@ SSA, typed, structured control flow. Every kernel's `build()` body
 emits ops into a `Module` via the `Builder`.
 
 ```python
-from popcorn.ir import Builder, DType, BufferType
+from quark.ir import Builder, DType, BufferType
 
 b = Builder("my_module")
 fn = b.begin_function("kern")
@@ -47,7 +47,7 @@ implements `__floordiv__`, so use `//`.
 
 ### Tensor types
 
-Three backend-neutral tensor abstractions in `popcorn.ir.tensor`:
+Three backend-neutral tensor abstractions in `quark.ir.tensor`:
 
 | Type | Memory | Creation |
 |---|---|---|
@@ -73,7 +73,7 @@ tile = A.tile(row=m_base, col=0, shape=(BM, K))
 
 ### SharedRegion
 
-Smem region. See the full API in `popcorn.ir.tensor`:
+Smem region. See the full API in `quark.ir.tensor`:
 
 ```python
 # Allocation — goes through Builder
@@ -111,7 +111,7 @@ q_region.copy_from(
 )
 ```
 
-`Lifetime` kinds (from `popcorn.ir.lifetime`):
+`Lifetime` kinds (from `quark.ir.lifetime`):
 
 | Kind | Semantics |
 |---|---|
@@ -121,7 +121,7 @@ q_region.copy_from(
 | `BEFORE_REGION(region)` | alive up to (but not entering) a region |
 | `AFTER_REGION(region)` | alive from region exit onwards |
 
-The `smem_layout` pass (`popcorn/lower/smem_layout.py`) builds an
+The `smem_layout` pass (`quark/lower/smem_layout.py`) builds an
 interval graph from lifetimes and colors regions onto smem slots.
 Lifetime-disjoint regions alias automatically — no manual
 `aliasable=True` pool.
@@ -167,29 +167,29 @@ tile.for_each(
 
 The sole IR construction interface. `build()` bodies don't call
 `Builder` methods directly — instead they go through
-`popcorn.lang as pop`, which exposes every Builder op as a
+`quark.lang as qk`, which exposes every Builder op as a
 free function that reads the active builder from a contextvar:
 
 ```python
-import popcorn.lang as pop
+import quark.lang as qk
 
-c = pop.add(a, b)                           # == bld.add(a, b)
-with pop.for_range(lo, hi, step) as (i,):   # == bld.for_loop
+c = qk.add(a, b)                           # == bld.add(a, b)
+with qk.for_range(lo, hi, step) as (i,):   # == bld.for_loop
     ...
-with pop.if_(pred):
+with qk.if_(pred):
     ...
-pop.barrier("block")
+qk.barrier("block")
 ```
 
 `Builder.begin_function()` publishes the active builder; inside any
-`@kernel.build()` body `pop.*` just works. For tests or scripts that
-emit ops outside a kernel, wrap in `with pop.kernel_scope(bld):`.
+`@kernel.build()` body `qk.*` just works. For tests or scripts that
+emit ops outside a kernel, wrap in `with qk.kernel_scope(bld):`.
 Module setup (`begin_function`, `param`, `register_shape`) stays on
 the `Builder` — those aren't part of the kernel-authoring surface.
 
 The DSL free-function helpers (`tid`, `barrier`, `c`, `block_base`,
 …) resolve the active `BlockContext`. See
-[ARCHITECTURE.md](ARCHITECTURE.md#authoring-surface--popcornlang).
+[ARCHITECTURE.md](ARCHITECTURE.md#authoring-surface--quarklang).
 
 ### Arithmetic / logic
 
@@ -265,7 +265,7 @@ B_frag = bld.load_matrix(B_smem, "m16n8k16_bf16", which="b", ...)
 C = bld.mma("m16n8k16_bf16", A_frag, B_frag, C_prev)   # fma
 ```
 
-Shape registry lives in `popcorn.ir.mma_registry`. Each `MmaConfig`
+Shape registry lives in `quark.ir.mma_registry`. Each `MmaConfig`
 carries the `MmaShape` descriptor, per-register `(row, col)` offsets,
 and `min_ptx_cc` / `min_metal_gen` chip gates. `shapes_for_chip(gen)`
 filters the list to the set a given `ChipGeneration` supports — this
@@ -392,7 +392,7 @@ all threads; don't place inside a divergent `if_`.
 - Perf warnings (bank conflicts, unvectorized stores, unpadded strides)
   emitted via `PerfWarning`
 
-Perf warnings are off by default; enable with `POPCORN_ENABLE_PERF_WARNINGS=1`.
+Perf warnings are off by default; enable with `QUARK_ENABLE_PERF_WARNINGS=1`.
 
 ## See also
 

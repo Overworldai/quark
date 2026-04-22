@@ -1,15 +1,15 @@
 # Backend (PT polymorphic tensor)
 
-One file — `src/popcorn/backend.py` — owns every torch-vs-mlx branch.
-The runtime inference path (`popcorn.nn`, `popcorn.models`, most
-`pcf.*` call sites on CUDA) uses `PopcornTensor` directly and never
+One file — `src/quark/backend.py` — owns every torch-vs-mlx branch.
+The runtime inference path (`quark.nn`, `quark.models`, most
+`pcf.*` call sites on CUDA) uses `QuarkTensor` directly and never
 touches `PT`. `PT` is the **reference / baseline** surface: kernel
 `reference.py` and `baselines.py` use it to write their correctness
 oracles once and run on either backend, and the autotune correctness
 gate routes through `PT.cosine_sim`.
 
 ```python
-from popcorn.backend import PT, IS_METAL
+from quark.backend import PT, IS_METAL
 ```
 
 - `IS_METAL` — platform dispatch flag. Decided at import time from
@@ -25,9 +25,9 @@ and the lowerer drivers (`drivers/cuda.py`, `drivers/mlx.py`).**
 
 If `reference.py` or `baselines.py` finds itself reaching for
 `import torch` or `import mlx.core`, the right move is to add the
-primitive to `PT`. Runtime code (`popcorn.nn`, models,
-`functional/_dispatch.py`) should reach for `PopcornTensor`
-operations and `popcorn.runtime.kernels` utility kernels instead.
+primitive to `PT`. Runtime code (`quark.nn`, models,
+`functional/_dispatch.py`) should reach for `QuarkTensor`
+operations and `quark.runtime.kernels` utility kernels instead.
 
 ## Dtype constants
 
@@ -184,8 +184,8 @@ block. A new backend requires:
 2. Add dtype aliases to the top of `PT` (the class body is a cascade
    of `if / elif` that defines them).
 3. Walk the op table and add the new branch to each.
-4. Add a driver under `src/popcorn/drivers/` and a lowerer under
-   `src/popcorn/lower/` targeting the backend ISA.
+4. Add a driver under `src/quark/drivers/` and a lowerer under
+   `src/quark/lower/` targeting the backend ISA.
 5. Wire dispatch in `Launcher.compile`.
 
 For reference the CUDA path is ~200 lines (driver) + ~800 lines

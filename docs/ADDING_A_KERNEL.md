@@ -10,7 +10,7 @@ see the [examples/](../examples/) walk-through.
 ## Folder
 
 ```
-src/popcorn/kernels/my_kernel/
+src/quark/kernels/my_kernel/
     __init__.py            imports kernel.py to trigger @kernel registration
     spec.py                frozen KernelSpec — problem definition
     config.py              frozen KernelConfig — tuning knobs + default_for(spec)
@@ -27,12 +27,12 @@ subfolder; the `@kernel` decorator registers the class.
 
 Frozen dataclass. Fields are the problem dimensions. Must be
 hashable (enforced by autotune cache). DTypes are first-class
-`popcorn.ir.DType` values — no parallel `*_ir_dtype` properties.
+`quark.ir.DType` values — no parallel `*_ir_dtype` properties.
 
 ```python
 from dataclasses import dataclass
-from popcorn.ir import DType
-from popcorn.kernels.base import KernelSpec
+from quark.ir import DType
+from quark.kernels.base import KernelSpec
 
 _VALID_AB = frozenset({DType.BF16, DType.F16, DType.E4M3, DType.E5M2})
 
@@ -64,7 +64,7 @@ class MySpec(KernelSpec):
 
 Guidelines:
 
-- DTypes are `popcorn.ir.DType` directly. Problem dicts may pass
+- DTypes are `quark.ir.DType` directly. Problem dicts may pass
   strings (`"bf16"`); the `__post_init__` coerces.
 - Property-derived fields (`compute_dtype_resolved`, `total_slots`)
   stay out of the dataclass footprint so frozen+hashable stays clean.
@@ -76,7 +76,7 @@ Frozen dataclass with `default_for(spec)` classmethod.
 
 ```python
 from dataclasses import dataclass
-from popcorn.kernels.base import KernelConfig
+from quark.kernels.base import KernelConfig
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ For each MMA call site the kernel emits, add one
 Backend-agnostic torch-or-mlx reference via `PT`.
 
 ```python
-from popcorn.backend import PT
+from quark.backend import PT
 
 
 def my_reference(kernel, A, B):
@@ -140,7 +140,7 @@ Production and regression problems. Tag them so tag-filtered bench
 sweeps pull the right ones.
 
 ```python
-from popcorn.kernels.base import Problem
+from quark.kernels.base import Problem
 
 
 def my_problems() -> list[Problem]:
@@ -169,8 +169,8 @@ Canonical tag scheme (see [BENCHMARKING.md](BENCHMARKING.md#tags)):
 ## 5. baselines.py
 
 ```python
-from popcorn.backend import IS_METAL, PT
-from popcorn.kernels.base import Baseline
+from quark.backend import IS_METAL, PT
+from quark.kernels.base import Baseline
 
 
 def my_baselines(kernel, tensors: dict) -> list[Baseline]:
@@ -196,18 +196,18 @@ route.
 ```python
 from typing import ClassVar
 
-import popcorn.lang as pop
-from popcorn.blocks import (
+import quark.lang as qk
+from quark.blocks import (
     Accumulators, IterCtx, MmaBody, PipelineBody, SmemPlan, TensorDecl,
 )
-from popcorn.ir import DType
-from popcorn.kernels.base import Kernel, MmaSite
-from popcorn.kernels.decorator import kernel
-from popcorn.kernels.my_kernel.baselines import my_baselines
-from popcorn.kernels.my_kernel.config import MyConfig
-from popcorn.kernels.my_kernel.problems import my_problems
-from popcorn.kernels.my_kernel.reference import my_reference
-from popcorn.kernels.my_kernel.spec import MySpec
+from quark.ir import DType
+from quark.kernels.base import Kernel, MmaSite
+from quark.kernels.decorator import kernel
+from quark.kernels.my_kernel.baselines import my_baselines
+from quark.kernels.my_kernel.config import MyConfig
+from quark.kernels.my_kernel.problems import my_problems
+from quark.kernels.my_kernel.reference import my_reference
+from quark.kernels.my_kernel.spec import MySpec
 
 
 @kernel(
@@ -272,7 +272,7 @@ class MyKernel(Kernel):
 
     @classmethod
     def make_tensors(cls, problem: dict) -> dict:
-        from popcorn.backend import PT
+        from quark.backend import PT
         spec = MySpec(**problem)
         return {
             "A":   PT.astype(PT.randn(spec.M, spec.K), spec.a_dtype.backend),
@@ -316,7 +316,7 @@ class MyKernel(Kernel):
         ).run(n_iters=s.K // c.BK, n_stages=c.n_stages)
 
         BN_per_warp = (c.BN // mma_cfg.shape.n // c.n_warps) * mma_cfg.shape.n
-        pop.store_acc(
+        qk.store_acc(
             g.Out, acc,
             row=m_base,
             col=n_base + bctx.warp_id * BN_per_warp,
@@ -338,13 +338,13 @@ Notes:
   fields exist — kernels whose grid follows the `(N/BN, M/BM, 1)`
   convention get these for free. Kernels with custom grids compute
   their own bases inside `build()` and leave `BM/BN` off the config.
-- Author IR via `pop.*` (`pop.add`, `pop.mul`, `pop.for_range`,
-  `pop.barrier`, `pop.store_acc`, …) rather than `bctx.bld.*`
+- Author IR via `qk.*` (`qk.add`, `qk.mul`, `qk.for_range`,
+  `qk.barrier`, `qk.store_acc`, …) rather than `bctx.bld.*`
   directly. The `Builder` stays for module-setup calls
   (`begin_function`, `param`, `register_shape`).
-- Kernel-authoring helpers (`pop.work_list_load`, `pop.index_cache`,
-  `pop.q_register_load`, `pop.silu`, `pop.cast`) live in
-  `popcorn.lang`; see [BLOCKS.md](BLOCKS.md#retired-classes-use-the-free-function-replacement).
+- Kernel-authoring helpers (`qk.work_list_load`, `qk.index_cache`,
+  `qk.q_register_load`, `qk.silu`, `qk.cast`) live in
+  `quark.lang`; see [BLOCKS.md](BLOCKS.md#retired-classes-use-the-free-function-replacement).
 - `MmaBody(acc=acc)` without more args is the usual shape — `shape`
   defaults to `active_bctx().mma_cfg` and `K_inner` is inferred from
   the B tile's shape[1] at call time. Only override when those
@@ -353,7 +353,7 @@ Notes:
 ## 7. __init__.py
 
 ```python
-from popcorn.kernels.my_kernel.kernel import MyKernel  # noqa: F401
+from quark.kernels.my_kernel.kernel import MyKernel  # noqa: F401
 ```
 
 That's it — the `@kernel` decorator handles the registry wiring.

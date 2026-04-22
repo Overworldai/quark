@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-import popcorn.lang as pop
-from popcorn.blocks.dsl import BlockContext
-from popcorn.blocks.l2.run_pipeline import IterCtx, PipelineBody, run_pipeline
-from popcorn.ir import DType, Value
-from popcorn.ir.builder import Builder
-from popcorn.ir.module import BufferType
+import quark.lang as qk
+from quark.blocks.dsl import BlockContext
+from quark.blocks.l2.run_pipeline import IterCtx, PipelineBody, run_pipeline
+from quark.ir import DType, Value
+from quark.ir.builder import Builder
+from quark.ir.module import BufferType
 
 
 def _new_bctx(name: str = "t") -> tuple[Builder, BlockContext]:
@@ -32,14 +32,14 @@ def test_single_stage_emits_expected_ops() -> None:
 
     def produce(ictx: IterCtx) -> None:
         produce_calls.append((ictx.stage_idx, ictx.is_tail))
-        pop.barrier("block")  # stand-in for a load
+        qk.barrier("block")  # stand-in for a load
 
     def consume(ictx: IterCtx) -> tuple[Value, ...]:
         consume_calls.append((ictx.stage_idx, ictx.is_tail, ictx.carry))
         return ictx.carry
 
     def init_carry(_bctx: BlockContext) -> tuple[Value, ...]:
-        return (pop.const(DType.F32, 0.0),)
+        return (qk.const(DType.F32, 0.0),)
 
     body = PipelineBody(
         stages=["stage0"],
@@ -69,7 +69,7 @@ def test_double_buffer_fires_prologue_and_epilogue() -> None:
         # epilogue these are compile-time consts. Record stage_idx
         # order instead, which is deterministic.
         produce_iters.append(ictx.stage_idx)
-        pop.barrier("block")
+        qk.barrier("block")
 
     def consume(ictx: IterCtx) -> tuple[Value, ...]:
         consume_iters.append((ictx.stage_idx, ictx.is_tail))
@@ -79,7 +79,7 @@ def test_double_buffer_fires_prologue_and_epilogue() -> None:
         stages=["s0", "s1"],
         produce=produce,
         consume=consume,
-        carry=lambda _: (pop.const(DType.F32, 0.0),),
+        carry=lambda _: (qk.const(DType.F32, 0.0),),
     )
     run_pipeline(bctx, n_iters=8, body=body, n_stages=2)
     b.end_function()
@@ -98,7 +98,7 @@ def test_double_buffer_falls_back_to_single_stage_for_small_n() -> None:
     consume_invocations = 0
 
     def produce(_ictx: IterCtx) -> None:
-        pop.barrier("block")
+        qk.barrier("block")
 
     def consume(ictx: IterCtx) -> tuple[Value, ...]:
         nonlocal consume_invocations
@@ -143,7 +143,7 @@ def test_epilogue_called_with_final_carry() -> None:
         stages=["s"],
         produce=lambda _i: None,
         consume=lambda i: i.carry,
-        carry=lambda _b: (pop.const(DType.F32, 7.0),),
+        carry=lambda _b: (qk.const(DType.F32, 7.0),),
         epilogue=epilogue,
     )
     final = run_pipeline(bctx, n_iters=3, body=body, n_stages=1)

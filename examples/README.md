@@ -1,6 +1,6 @@
 # examples — from vector add to flash attention
 
-A progression that walks you through popcorn's abstractions, one step
+A progression that walks you through quark's abstractions, one step
 at a time. Each example is a minimal, working kernel; each file
 introduces one or two new ideas on top of the last.
 
@@ -15,7 +15,7 @@ introduces one or two new ideas on top of the last.
 
 The examples aren't in the `@kernel` registry (they're teaching
 material); the full registered kernels live in
-[`src/popcorn/kernels/`](../src/popcorn/kernels/) and use the same
+[`src/quark/kernels/`](../src/quark/kernels/) and use the same
 patterns. Once you've read through the examples, look at
 `kernels/gemm/kernel.py` — it's almost exactly example 5 with a
 production-grade config / baselines / reference attached.

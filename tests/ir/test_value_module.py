@@ -2,7 +2,7 @@
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     DType,
     Function,
@@ -76,7 +76,7 @@ class TestModule:
         assert m.get_function("missing") is None
 
     def test_shape_registry_dedup(self):
-        from popcorn.ir import MmaShape
+        from quark.ir import MmaShape
 
         m = Module()
         s = MmaShape(

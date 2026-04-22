@@ -1,6 +1,6 @@
 """Tests for vector build/extract/split/merge MSL lowering."""
 
-from popcorn.ir import DType
+from quark.ir import DType
 from tests.lower.msl.conftest import lower
 
 

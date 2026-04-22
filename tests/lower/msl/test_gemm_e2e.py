@@ -28,9 +28,9 @@ pytestmark = pytest.mark.skipif(not HAS_METAL, reason="no Metal device")
 def test_gemm_bf16_compile_and_lower():
     """Compile the GEMM kernel for a small bf16 problem and verify
     the MSL source contains expected patterns."""
-    from popcorn.device import DeviceFamily, current_device
-    from popcorn.kernels.gemm import GemmConfig, GemmKernel, GemmSpec
-    from popcorn.lower.msl import MslLowerer
+    from quark.device import DeviceFamily, current_device
+    from quark.kernels.gemm import GemmConfig, GemmKernel, GemmSpec
+    from quark.lower.msl import MslLowerer
 
     device = current_device()
     if device.family is not DeviceFamily.METAL:
@@ -60,9 +60,9 @@ def test_gemm_bf16_compile_and_lower():
 def test_gemm_bf16_launch():
     """Full end-to-end: compile + launch + correctness check."""
 
-    from popcorn.device import DeviceFamily, current_device
-    from popcorn.kernels.gemm import GemmConfig, GemmKernel, GemmSpec
-    from popcorn.launcher.launcher import Launcher
+    from quark.device import DeviceFamily, current_device
+    from quark.kernels.gemm import GemmConfig, GemmKernel, GemmSpec
+    from quark.launcher.launcher import Launcher
 
     device = current_device()
     if device.family is not DeviceFamily.METAL:

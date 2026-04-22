@@ -11,7 +11,7 @@ diagnose) to catch via owl_attn cos-sim regressions.
 
 If this file ever starts failing, DO NOT adjust the expected values
 — run the probe manually, confirm the new Apple mapping makes sense,
-update both the test and ``popcorn.ir.frag_tile._MSL_ACC_LANE_MAP``
+update both the test and ``quark.ir.frag_tile._MSL_ACC_LANE_MAP``
 together.
 """
 
@@ -141,7 +141,7 @@ def test_apple_8x8_acc_layout_f32():
             f"  got {observed}\n"
             f"If Apple's mapping has genuinely changed, update both the\n"
             f"EXPECTED_APPLE_8x8_LAYOUT here AND the LANE_MAP table in\n"
-            f"popcorn.ir.frag_tile — together."
+            f"quark.ir.frag_tile — together."
         )
 
 
@@ -158,7 +158,7 @@ def test_apple_8x8_acc_layout_bf16():
 
 
 def test_lane_map_formula_matches_probe():
-    """The closed-form used in ``popcorn.ir.frag_tile`` must match the
+    """The closed-form used in ``quark.ir.frag_tile`` must match the
     measured table. Any drift means the formula is wrong, not the
     table — fix the formula."""
     for lane in range(32):

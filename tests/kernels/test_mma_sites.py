@@ -7,9 +7,9 @@ and the GEMM pilot. Bench-time perf deltas between shapes live in
 
 from __future__ import annotations
 
-from popcorn.device import ChipGeneration, make_test_device
-from popcorn.ir import DType
-from popcorn.kernels.base import Kernel, MmaSite
+from quark.device import ChipGeneration, make_test_device
+from quark.ir import DType
+from quark.kernels.base import Kernel, MmaSite
 
 
 class _DummyKernel(Kernel):
@@ -124,10 +124,10 @@ def test_gemm_pilot_explicit_main_shape_emits_correctly():
     """GEMM accepts every bf16 shape in the registry — the tile math
     derives MT / NT / acc_width from mma_cfg.shape.m / n / c_regs
     after the M3 generalization."""
-    from popcorn.ir.validator import validate_module
-    from popcorn.kernels.gemm.config import GemmConfig
-    from popcorn.kernels.gemm.kernel import GemmKernel
-    from popcorn.kernels.gemm.spec import GemmSpec
+    from quark.ir.validator import validate_module
+    from quark.kernels.gemm.config import GemmConfig
+    from quark.kernels.gemm.kernel import GemmKernel
+    from quark.kernels.gemm.spec import GemmSpec
 
     spec = GemmSpec(M=128, N=128, K=128, a_dtype="bf16", b_dtype="bf16", out_dtype="bf16")
     for shape_id in ("m16n8k16_bf16", "m16n8k8_bf16", "m8n8k8_bf16"):
@@ -142,9 +142,9 @@ def test_gemm_pilot_legacy_mma_k_fallback_still_works():
     """main_shape='' falls back to lookup_mma(compute, compute, mma_k).
     Preserves behaviour for callers (tuned JSONs, tests) that haven't
     migrated to main_shape yet — removed in M4."""
-    from popcorn.kernels.gemm.config import GemmConfig
-    from popcorn.kernels.gemm.kernel import GemmKernel
-    from popcorn.kernels.gemm.spec import GemmSpec
+    from quark.kernels.gemm.config import GemmConfig
+    from quark.kernels.gemm.kernel import GemmKernel
+    from quark.kernels.gemm.spec import GemmSpec
 
     spec = GemmSpec(M=128, N=128, K=128, a_dtype="bf16", b_dtype="bf16", out_dtype="bf16")
     cfg = GemmConfig(BM=32, BN=32, BK=16, n_warps=4, n_stages=1)  # main_shape default ""

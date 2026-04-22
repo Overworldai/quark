@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from popcorn.weight_shuffle import shuffle_b_for_frag_load
+from quark.weight_shuffle import shuffle_b_for_frag_load
 
 
 def _compute_frag_from_shuffled(

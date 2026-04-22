@@ -1,12 +1,12 @@
-# popcorn — consolidated brief
+# quark — consolidated brief
 
-A guided tour of what popcorn is, how a kernel flows through it, and
+A guided tour of what quark is, how a kernel flows through it, and
 what it takes to bring up a new backend. Read this first when getting
 oriented.
 
-## What popcorn is
+## What quark is
 
-popcorn is a GPU kernel compiler. Authors describe a kernel once as
+quark is a GPU kernel compiler. Authors describe a kernel once as
 typed SSA IR, the compiler lowers it to a target's native source form
 (today: PTX for NVIDIA, MSL for Apple Metal), hands that text to the
 vendor runtime for JIT compile, and the resulting GPU function plugs
@@ -91,12 +91,12 @@ Instead they use a free-function namespace that reads the active
 builder from a context variable:
 
 ```
-pop.add(a, b)                  # a + b as an IR op
-pop.for_range(0, n, 1)         # context manager; Python ints auto-lifted
-pop.if_(pred)                  # context manager
-pop.barrier("block")           # sync across a workgroup
-pop.yield_(carry)              # terminator; auto-flattens a named carry
-pop.store_acc(dst, acc, ...)   # tile-level epilogue with optional activation
+qk.add(a, b)                  # a + b as an IR op
+qk.for_range(0, n, 1)         # context manager; Python ints auto-lifted
+qk.if_(pred)                  # context manager
+qk.barrier("block")           # sync across a workgroup
+qk.yield_(carry)              # terminator; auto-flattens a named carry
+qk.store_acc(dst, acc, ...)   # tile-level epilogue with optional activation
 ```
 
 A composition layer above that provides `Accumulators`, `SmemTile`,

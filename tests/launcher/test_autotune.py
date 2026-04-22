@@ -1,4 +1,4 @@
-"""Tests for popcorn.autotune.AutotuneCache.
+"""Tests for quark.autotune.AutotuneCache.
 
 Pure-python tests — no real CUDA needed. The compile-and-time hook
 is mocked via a callable injected onto the cache, mirroring how the
@@ -20,24 +20,24 @@ from pathlib import Path
 
 import pytest
 
-from popcorn.autotune import AutotuneCache
-from popcorn.autotune.cache import _cartesian
-from popcorn.autotune.io import (
+from quark.autotune import AutotuneCache
+from quark.autotune.cache import _cartesian
+from quark.autotune.io import (
     autotune_disabled as _autotune_disabled,
 )
-from popcorn.autotune.io import (
+from quark.autotune.io import (
     default_cache_dir as _default_cache_dir,
 )
-from popcorn.autotune.io import (
+from quark.autotune.io import (
     format_spec_label as _format_spec_label,
 )
-from popcorn.autotune.io import (
+from quark.autotune.io import (
     source_hash as _source_hash,
 )
-from popcorn.autotune.io import (
+from quark.autotune.io import (
     spec_fingerprint as _spec_fingerprint,
 )
-from popcorn.device import make_test_device
+from quark.device import make_test_device
 
 # ---------------------------------------------------------------------------
 # Toy spec / config / kernel for the cache to operate on
@@ -172,35 +172,35 @@ class TestSpecLabel:
 
 class TestDefaultCacheDir:
     def test_env_override_wins(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("POPCORN_CACHE_DIR", str(tmp_path / "explicit"))
+        monkeypatch.setenv("QUARK_CACHE_DIR", str(tmp_path / "explicit"))
         assert _default_cache_dir() == tmp_path / "explicit"
 
     def test_xdg_fallback(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("POPCORN_CACHE_DIR", raising=False)
+        monkeypatch.delenv("QUARK_CACHE_DIR", raising=False)
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-        assert _default_cache_dir() == tmp_path / "xdg" / "popcorn"
+        assert _default_cache_dir() == tmp_path / "xdg" / "quark"
 
     def test_home_fallback(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("POPCORN_CACHE_DIR", raising=False)
+        monkeypatch.delenv("QUARK_CACHE_DIR", raising=False)
         monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
         # Path.home() reads HOME on POSIX; we trust the stdlib here.
-        assert _default_cache_dir() == Path(tmp_path) / ".cache" / "popcorn"
+        assert _default_cache_dir() == Path(tmp_path) / ".cache" / "quark"
 
 
 class TestKillSwitch:
     def test_unset_is_false(self, monkeypatch):
-        monkeypatch.delenv("POPCORN_DISABLE_AUTOTUNE", raising=False)
+        monkeypatch.delenv("QUARK_DISABLE_AUTOTUNE", raising=False)
         assert _autotune_disabled() is False
 
     @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
     def test_truthy(self, monkeypatch, val):
-        monkeypatch.setenv("POPCORN_DISABLE_AUTOTUNE", val)
+        monkeypatch.setenv("QUARK_DISABLE_AUTOTUNE", val)
         assert _autotune_disabled() is True
 
     @pytest.mark.parametrize("val", ["", "0", "false", "no"])
     def test_falsy(self, monkeypatch, val):
-        monkeypatch.setenv("POPCORN_DISABLE_AUTOTUNE", val)
+        monkeypatch.setenv("QUARK_DISABLE_AUTOTUNE", val)
         assert _autotune_disabled() is False
 
 
@@ -253,7 +253,7 @@ class TestLookupDiskTier:
         # The disk loader needs the registry to know CONFIG_CLS;
         # mock that out via patching ``resolve_config_cls`` in the io
         # module.
-        from popcorn.autotune import io as io_module
+        from quark.autotune import io as io_module
 
         io_module.resolve_config_cls = lambda qname: (
             _Config if qname and "ToyKernel" in qname else None
@@ -270,7 +270,7 @@ class TestLookupDiskTier:
         cfg = _Config()
         cache.store(_ToyKernel, spec, cfg)
         # The temp file should not survive the write.
-        leftover_tmp = list((tmp_path / "cache").glob(".popcorn_cache_*.tmp"))
+        leftover_tmp = list((tmp_path / "cache").glob(".quark_cache_*.tmp"))
         assert leftover_tmp == []
         # And there should be exactly one .json file.
         jsons = list((tmp_path / "cache").glob("*.json"))
@@ -286,7 +286,7 @@ class TestLookupDiskTier:
         # the io module so subsequent reads build a different cache key.
         # The on-disk file's source_hash field no longer matches, so
         # the load fails.
-        from popcorn.autotune import io as io_module
+        from quark.autotune import io as io_module
 
         monkeypatch.setattr(io_module, "source_hash", lambda cls: "deadbeef" + ("0" * 8))
         cache.clear_hot()
@@ -383,14 +383,14 @@ class TestSearch:
 
 class TestLookupOrSearch:
     def test_kill_switch_short_circuits_to_default(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("POPCORN_DISABLE_AUTOTUNE", "1")
+        monkeypatch.setenv("QUARK_DISABLE_AUTOTUNE", "1")
         cache = _fresh_cache(tmp_path)
         cfg = cache.lookup_or_search(_ToyKernel, _Spec(M=64, N=128))
         # Falls back to _pick_default_cfg → BM=32 BN=32 n_warps=4.
         assert cfg == _Config(BM=32, BN=32, n_warps=4)
 
     def test_search_result_persists_to_hot_and_disk(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("POPCORN_DISABLE_AUTOTUNE", raising=False)
+        monkeypatch.delenv("QUARK_DISABLE_AUTOTUNE", raising=False)
         cache = _fresh_cache(tmp_path)
         cache._compile_and_time = lambda *_: 1.0
         spec = _Spec(M=64, N=128)
@@ -412,7 +412,7 @@ class TestLauncherWiring:
 
         if not torch.cuda.is_available():
             pytest.skip("Launcher autotune wiring requires CUDA")
-        from popcorn.launcher import Launcher
+        from quark.launcher import Launcher
 
         launcher = Launcher()
         assert isinstance(launcher._autotune, AutotuneCache)

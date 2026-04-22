@@ -1,28 +1,28 @@
 # Loading weights
 
-`popcorn.nn.io` loads `.safetensors` files directly into
-`PopcornTensor` without numpy, torch, or mlx in the middle. The loader
+`quark.nn.io` loads `.safetensors` files directly into
+`QuarkTensor` without numpy, torch, or mlx in the middle. The loader
 mmap's the file, page-locks the data region via `cuMemHostRegister`,
 and DMAs each tensor straight to device at pinned-memory speeds
 (~6× the pageable path).
 
 ```python
-from popcorn.nn.io import load_safetensors, load_from_hub
+from quark.nn.io import load_safetensors, load_from_hub
 
 sd = load_safetensors("model.safetensors")        # local file
 sd = load_from_hub("Overworld/Waypoint-1.5-1B")   # HF Hub — uses huggingface_hub
 ```
 
-Both return `dict[str, PopcornTensor]`. Hand that to an
+Both return `dict[str, QuarkTensor]`. Hand that to an
 `nn.Module.load_state_dict(sd)` and the module's parameters are
 populated in-place.
 
 ## The full inference path
 
 ```python
-import popcorn.nn as nn
-from popcorn.nn.io import load_from_hub
-from popcorn.models.waypoint_15 import Waypoint15, Waypoint15Config
+import quark.nn as nn
+from quark.nn.io import load_from_hub
+from quark.models.waypoint_15 import Waypoint15, Waypoint15Config
 
 cfg   = Waypoint15Config()
 model = Waypoint15(cfg)
@@ -34,12 +34,12 @@ out = model(x, sigma_idx=0, frame_t=0)
 
 ## `nn.Parameter` / `nn.Module`
 
-PyTorch-shaped, inference-only. Parameters hold `PopcornTensor`s
+PyTorch-shaped, inference-only. Parameters hold `QuarkTensor`s
 (CUDA) or `mx.array`s (Metal). No autograd, no optimizer.
 
 ```python
-import popcorn.nn as nn
-from popcorn.nn.module import _randn, _zeros
+import quark.nn as nn
+from quark.nn.module import _randn, _zeros
 
 class Linear(nn.Module):
     def __init__(self, d_in, d_out):
@@ -51,7 +51,7 @@ class Linear(nn.Module):
 ```
 
 `_randn` / `_zeros` / `_tensor` in `nn.module` are the backend-aware
-allocation helpers — they emit `PopcornTensor` on CUDA and `mx.array`
+allocation helpers — they emit `QuarkTensor` on CUDA and `mx.array`
 on Metal. Parameters are discovered by attribute name; nested
 `nn.Module` and `nn.ModuleList` children are walked recursively by
 `state_dict()` / `load_state_dict()` / `parameters()`.
@@ -106,7 +106,7 @@ materializing the whole model on device.
    Otherwise mmap the file.
 3. `cuMemHostRegister` the entire data region once — pins it for
    DMA without per-tensor registration overhead.
-4. For each tensor: `PopcornTensor.from_bytes(view, shape, dtype)`
+4. For each tensor: `QuarkTensor.from_bytes(view, shape, dtype)`
    issues a `cuMemcpyHtoD` straight from the pinned region.
 5. `cuMemHostUnregister` at the end — weights live on device,
    not in host RAM.
@@ -117,7 +117,7 @@ first subsequent `pcf.*` call) before touching the tensors.
 
 ## See also
 
-- [src/popcorn/nn/io.py](../src/popcorn/nn/io.py) — the loader
-- [src/popcorn/nn/module.py](../src/popcorn/nn/module.py) —
+- [src/quark/nn/io.py](../src/quark/nn/io.py) — the loader
+- [src/quark/nn/module.py](../src/quark/nn/module.py) —
   `Module` / `Parameter` / `state_dict` / `load_state_dict`
 - [docs/WAYPOINT_15.md](WAYPOINT_15.md) — end-to-end worked example

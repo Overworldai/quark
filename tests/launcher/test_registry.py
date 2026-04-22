@@ -1,4 +1,4 @@
-"""Tests for popcorn.kernels.registry.
+"""Tests for quark.kernels.registry.
 
 Pure-python — no real kernels needed. We construct minimal Kernel
 subclasses on the fly to exercise the registration validation
@@ -11,8 +11,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from popcorn.kernels.base import Kernel, KernelConfig, KernelSpec
-from popcorn.kernels.registry import (
+from quark.kernels.base import Kernel, KernelConfig, KernelSpec
+from quark.kernels.registry import (
     _REGISTRY,
     _REQUIRED_OVERRIDES,
     all_kernels,
@@ -86,7 +86,7 @@ class _CompleteKernel(Kernel):
         return {"block": [8, 16, 32]}
 
     def param_spec(self):
-        from popcorn.launcher import ParamSpec
+        from quark.launcher import ParamSpec
 
         return ParamSpec()
 

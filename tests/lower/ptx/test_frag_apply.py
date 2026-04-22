@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import re
 
-from popcorn.ir import (
+from quark.ir import (
     Builder,
     DType,
     FragApplyOp,
     MmaShape,
     validate_module,
 )
-from popcorn.lower.ptx import PtxLowerer
+from quark.lower.ptx import PtxLowerer
 
 _M16N8K16_BF16 = MmaShape(
     name="m16n8k16_bf16",

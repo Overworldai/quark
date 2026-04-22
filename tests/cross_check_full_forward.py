@@ -1,5 +1,5 @@
 """Full single-frame forward comparison: world_engine.WorldModel vs a
-popcorn re-implementation of the same ``forward``. Both use the *same*
+quark re-implementation of the same ``forward``. Both use the *same*
 weights and the *same* Attn module (flex_attn monkey-patched to plain
 SDPA so it runs on CPU). What differs is every other op in the forward:
 
@@ -13,7 +13,7 @@ SDPA so it runs on CPU). What differs is every other op in the forward:
     unpatchify           torch Linear            pcf.gemm + bias add
 
 The Attn path is identical (world_engine's own module, monkey-patched
-flex_attn) so any output difference is attributable to the popcorn
+flex_attn) so any output difference is attributable to the quark
 replacements.
 
 Uses a small config (~50M params) so CPU runtime is bearable.
@@ -39,7 +39,7 @@ from model import world_model as _we_world
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
-import popcorn.functional as pcf
+import quark.functional as pcf
 
 # ── Monkey-patch flex_attention → plain SDPA BEFORE importing world_engine ──
 # flex_attention is CUDA-only in this torch build; SDPA gives us the
@@ -122,7 +122,7 @@ def make_config():
 
 
 # ---------------------------------------------------------------
-# popcorn reimplementation of WorldModel.forward
+# quark reimplementation of WorldModel.forward
 # ---------------------------------------------------------------
 
 
@@ -195,8 +195,8 @@ def _pcf_ada_gate_residual_torch(x: torch.Tensor, y: torch.Tensor, gate: torch.T
     return _as_torch(out).reshape(b, nm, d).to(x.dtype)
 
 
-def popcorn_forward(we_model, x, sigma, frame_timestamp, mouse, button, scroll):
-    """Mirror of WorldModel.forward using popcorn ops."""
+def quark_forward(we_model, x, sigma, frame_timestamp, mouse, button, scroll):
+    """Mirror of WorldModel.forward using quark ops."""
     cfg = we_model.config
     B, N, C, H, W = x.shape
     ph, pw = we_model.patch
@@ -218,7 +218,7 @@ def popcorn_forward(we_model, x, sigma, frame_timestamp, mouse, button, scroll):
         batch_size=[1, T],
     )
 
-    # 1) Noise embedding via popcorn (world_engine expects [B, N, D]).
+    # 1) Noise embedding via quark (world_engine expects [B, N, D]).
     cond = pcf.noise_cond_mlp(
         _as_mlx(sigma.to(torch.float32)),
         _as_mlx(we_model.denoise_step_emb.freq),
@@ -227,7 +227,7 @@ def popcorn_forward(we_model, x, sigma, frame_timestamp, mouse, button, scroll):
     )
     cond = _as_torch(cond).reshape(B, N, cfg.d_model).to(x.dtype)
 
-    # 2) Patchify via popcorn: [B, N, C, H, W] → [B, N*Hp*Wp, D]
+    # 2) Patchify via quark: [B, N, C, H, W] → [B, N*Hp*Wp, D]
     patched = pcf.patchify_2x2(
         _as_mlx(x.reshape(B * N, C, H, W)),
         _as_mlx(we_model.patchify.weight),
@@ -273,7 +273,7 @@ def popcorn_forward(we_model, x, sigma, frame_timestamp, mouse, button, scroll):
     h = _pcf_ada_rmsnorm_torch(h, s_on, b_on)
     h = F.silu(h)
 
-    # 6) Unpatchify via popcorn gemm + bias add.
+    # 6) Unpatchify via quark gemm + bias add.
     # we_model.unpatchify is a Linear; after state_dict fixup its weight
     # is [C*ph*pw, D] with bias [C*ph*pw].
     W_up = we_model.unpatchify.weight  # [C*ph*pw, D]
@@ -335,13 +335,13 @@ def main():
         )
     print(f"reference output shape: {tuple(y_ref.shape)}")
 
-    # ── popcorn path ──
+    # ── quark path ──
     # Reset the KV cache for a clean second run (cache state is stateful).
     _kv.reset()
     _kv.set_frozen(False)
     with torch.no_grad():
-        y_mine = popcorn_forward(model, x, sigma, frame_timestamp, mouse, button, scroll)
-    print(f"popcorn   output shape: {tuple(y_mine.shape)}")
+        y_mine = quark_forward(model, x, sigma, frame_timestamp, mouse, button, scroll)
+    print(f"quark   output shape: {tuple(y_mine.shape)}")
 
     # Compare.
     a = y_ref.to(torch.float32).flatten()
@@ -350,7 +350,7 @@ def main():
     mae = float((a - b).abs().mean())
     rel = mae / (a.abs().mean().clamp_min(1e-9))
     print(f"cos_sim={cos:.6f}  mae={mae:.4e}  rel_mae={rel:.4e}")
-    # With 2 layers of popcorn replacements, expect cos_sim > 0.999.
+    # With 2 layers of quark replacements, expect cos_sim > 0.999.
     threshold = 0.999
     if cos >= threshold:
         print(f"[PASS] full forward matches reference (threshold={threshold})")

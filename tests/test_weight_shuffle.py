@@ -1,6 +1,6 @@
 """Tests for the weight pre-shuffling.
 
-The shuffle layout must match what popcorn.mma.bfrag_load_shuffled_e4m3_k16
+The shuffle layout must match what quark.mma.bfrag_load_shuffled_e4m3_k16
 expects to read. We verify by reconstructing each lane's expected fragment
 data from the shuffled output and comparing to the original.
 """
@@ -8,7 +8,7 @@ data from the shuffled output and comparing to the original.
 import numpy as np
 import pytest
 
-from popcorn.weight_shuffle import shuffle_weights_e4m3_k16, verify_shuffled_layout
+from quark.weight_shuffle import shuffle_weights_e4m3_k16, verify_shuffled_layout
 
 
 def _make_distinct_weights(N: int, K: int) -> np.ndarray:

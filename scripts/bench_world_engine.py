@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Benchmark world_engine's bf16 baseline with the same NFE / LFPS / FPS
-numbers that ``scripts/generate.py`` prints for popcorn.
+numbers that ``scripts/generate.py`` prints for quark.
 
     python scripts/bench_world_engine.py
     python scripts/bench_world_engine.py --preset 360p --n-frames 128
     python scripts/bench_world_engine.py --quant intw8a8   # quantized baseline
 
 world_engine's ``gen_frame`` = one ``_denoise_pass`` (``len(sigmas)-1``
-steps) plus one ``_cache_pass`` (commit) — matches popcorn's
+steps) plus one ``_cache_pass`` (commit) — matches quark's
 ``n_denoise + 1`` NFE accounting exactly.
 
 Pass ``--return-img`` to include the VAE decode in the timing; by
 default we run DiT-only (``return_img=False``) which matches the
 ``dit_only=True`` configuration in world_engine's
-``examples/benchmark.py`` and is what popcorn's generate.py measures.
+``examples/benchmark.py`` and is what quark's generate.py measures.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def _build_ctrl_sequence(n_frames: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bench world_engine vs popcorn generate.py")
+    parser = argparse.ArgumentParser(description="Bench world_engine vs quark generate.py")
     parser.add_argument("--repo", default="Overworld/Waypoint-1.5-1B")
     parser.add_argument("--preset", choices=["360p", "720p"], default="720p")
     parser.add_argument("--n-frames", type=int, default=64)
@@ -87,7 +87,7 @@ def main():
 
     import torch
 
-    # Match popcorn's environment — cudnn is a known perf/correctness footgun
+    # Match quark's environment — cudnn is a known perf/correctness footgun
     # on the CUDA box per user's standing guidance.
     torch.backends.cudnn.enabled = False
 

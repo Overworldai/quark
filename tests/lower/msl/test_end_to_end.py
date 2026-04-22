@@ -18,8 +18,8 @@ pytestmark = pytest.mark.skipif(not HAS_METAL, reason="no Metal device")
 def test_vecadd_end_to_end():
     """Build a 256-element vec-add kernel via the IR, lower to MSL,
     compile via MLX, launch, and verify correctness."""
-    from popcorn.device import DeviceFamily, current_device
-    from popcorn.ir import BufferType, Builder, DType, ParamAttrs
+    from quark.device import DeviceFamily, current_device
+    from quark.ir import BufferType, Builder, DType, ParamAttrs
 
     device = current_device()
     if device.family is not DeviceFamily.METAL:
@@ -33,7 +33,7 @@ def test_vecadd_end_to_end():
     b.param("B", BufferType(DType.F32), attrs=ParamAttrs(readonly=True))
     b.param("C", BufferType(DType.F32))
 
-    from popcorn.ir import GlobalTensor
+    from quark.ir import GlobalTensor
 
     g_a = GlobalTensor(
         dtype=DType.F32,
@@ -65,7 +65,7 @@ def test_vecadd_end_to_end():
     b.end_function()
 
     # Lower to MSL
-    from popcorn.lower.msl import MslLowerer
+    from quark.lower.msl import MslLowerer
 
     lowered = MslLowerer(device.caps).lower_module(b.module)
     assert "thread_position_in_threadgroup" in lowered.source
@@ -73,7 +73,7 @@ def test_vecadd_end_to_end():
     assert lowered.output_names == ["C"]
 
     # Compile via MLX driver
-    from popcorn.drivers.mlx import MlxDriver
+    from quark.drivers.mlx import MlxDriver
 
     driver = MlxDriver(device=device)
     compiled = driver.compile(lowered, entry_name="vecadd_kernel", smem_bytes=0)
@@ -104,10 +104,10 @@ def test_vecadd_end_to_end():
 
 def test_vecadd_via_launcher():
     """Same vec-add but through the full Launcher → CompiledKernel path."""
-    from popcorn.device import DeviceFamily, current_device
-    from popcorn.ir import BufferType, Builder, DType, ParamAttrs
-    from popcorn.launcher.launcher import CompiledKernel, Launcher
-    from popcorn.launcher.param_spec import ParamSpec, ProgramFootprint
+    from quark.device import DeviceFamily, current_device
+    from quark.ir import BufferType, Builder, DType, ParamAttrs
+    from quark.launcher.launcher import CompiledKernel, Launcher
+    from quark.launcher.param_spec import ParamSpec, ProgramFootprint
 
     device = current_device()
     if device.family is not DeviceFamily.METAL:
@@ -122,7 +122,7 @@ def test_vecadd_via_launcher():
     b.param("B", BufferType(DType.F32), attrs=ParamAttrs(readonly=True))
     b.param("C", BufferType(DType.F32))
 
-    from popcorn.ir import GlobalTensor
+    from quark.ir import GlobalTensor
 
     g_a = GlobalTensor(
         dtype=DType.F32,
@@ -153,7 +153,7 @@ def test_vecadd_via_launcher():
     b.end_function()
 
     # Lower + compile through the launcher's internal path
-    from popcorn.lower.msl import MslLowerer
+    from quark.lower.msl import MslLowerer
 
     lowered = MslLowerer(device.caps).lower_module(b.module)
     driver = Launcher(device=device).driver

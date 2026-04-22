@@ -2,7 +2,7 @@
 
 > `C[M, N] = A[M, K] @ B^T[N, K]^T`, one block per `(BM, BN)` output
 > tile, MMA tensor cores for the inner product. This is the first
-> kernel where popcorn's L1 / L2 abstractions pay off.
+> kernel where quark's L1 / L2 abstractions pay off.
 
 ## New ideas
 
@@ -16,7 +16,7 @@
 * `PipelineBody(stages, produce, consume, carry).run(n_iters=,
   n_stages=)` — the closure-body K-loop. Single code path covers
   `n_stages ∈ {1, 2}`.
-* `pop.store_acc(dst, acc, row=, col=, cast=)` — unified epilogue.
+* `qk.store_acc(dst, acc, row=, col=, cast=)` — unified epilogue.
   Stages through smem + cooperative vec_store by default.
 
 ## Shape
@@ -74,11 +74,11 @@ class GemmConfig(KernelConfig):
 ## build()
 
 ```python
-import popcorn.lang as pop
-from popcorn.blocks import (
+import quark.lang as qk
+from quark.blocks import (
     Accumulators, IterCtx, MmaBody, PipelineBody, SmemPlan, TensorDecl,
 )
-from popcorn.kernels.base import Kernel, MmaSite
+from quark.kernels.base import Kernel, MmaSite
 
 
 @kernel("gemm_basic", spec=GemmSpec, config=GemmConfig)
@@ -157,7 +157,7 @@ class GemmBasic(Kernel):
         # After .run: acc.results is populated with the loop-final Values.
         # Per-warp N offset — each warp owns a BN/n_warps stripe of N.
         BN_per_warp = (c.BN // mma_cfg.shape.n // c.n_warps) * mma_cfg.shape.n
-        pop.store_acc(
+        qk.store_acc(
             g.Out, acc,
             row=m_base,
             col=n_base + self.bctx.warp_id * BN_per_warp,
@@ -170,7 +170,7 @@ class GemmBasic(Kernel):
 * **`self.m_base` / `self.n_base`** — the `@kernel` decorator binds
   these from `config.BM` / `config.BN` since grid uses the `(N/BN,
   M/BM, 1)` convention. Equivalent to
-  `pop.block_base("y", BM)` / `pop.block_base("x", BN)`.
+  `qk.block_base("y", BM)` / `qk.block_base("x", BN)`.
 * **`SmemPlan.staged_pairs(...)`** — collapses `n_stages` stage
   constructions + per-lane B view fixups into one call. Each
   returned `SmemPlan` has `.a` / `.b` `SmemTile`s and `.a_lane[0]` /
@@ -196,7 +196,7 @@ class GemmBasic(Kernel):
 * **`produce` runs every iteration** at `n_stages=1`: prefetch →
   barrier → compute → barrier → yield. The barriers are implicit;
   `run_pipeline` adds them.
-* **`pop.store_acc`** — takes the `Accumulators` by identity; pulls
+* **`qk.store_acc`** — takes the `Accumulators` by identity; pulls
   the tile values from `acc.results` and writes them to gmem.
   Defaults to the staged-smem fast path — scalar scatter only fires
   for problems too small to vectorize.
@@ -205,7 +205,7 @@ class GemmBasic(Kernel):
 
 ```python
 # Additions from steps 01-03:
-from popcorn.blocks import (
+from quark.blocks import (
     Accumulators, IterCtx, MmaBody, PipelineBody, SmemPlan,
 )
 
@@ -213,7 +213,7 @@ SmemPlan.staged_pairs(dtype, a_shape=, b_shape=, ..., n_stages=)
 Accumulators.from_mma(mma_cfg, BM=, BN=, n_warps=)
 MmaBody(acc=)                                   # shape + K_inner inferred
 PipelineBody(stages=, produce=, consume=, carry=).run(n_iters=, n_stages=)
-pop.store_acc(dst, acc, row=, col=, cast=)
+qk.store_acc(dst, acc, row=, col=, cast=)
 ```
 
 Next: flip `n_stages` to 2 and see the produce/consume contract pay

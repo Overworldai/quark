@@ -8,9 +8,9 @@ override it when they need richer cap-based gating.
 
 from dataclasses import dataclass
 
-from popcorn.device import make_test_device
-from popcorn.ir import Builder, DType
-from popcorn.kernels.base import Kernel, KernelConfig, KernelSpec
+from quark.device import make_test_device
+from quark.ir import Builder, DType
+from quark.kernels.base import Kernel, KernelConfig, KernelSpec
 
 
 @dataclass(frozen=True)

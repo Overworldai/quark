@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # tools/hooks/pre-commit
 #
-# Popcorn git pre-commit hook. Install via `make install-hooks` (or
+# Quark git pre-commit hook. Install via `make install-hooks` (or
 # `make setup`, which also creates the venv). This script is also
 # run by `make ci` for on-demand checking.
 #
-# Per popcorn cleanup proposal §8.2.
+# Per quark cleanup proposal §8.2.
 #
 # Design:
 #   - Native git hook, no framework (no husky, no pre-commit Python
@@ -85,7 +85,7 @@ if (unset VIRTUAL_ENV; uvx "$TY_PIN" --help) >/dev/null 2>&1; then
     if [ -d ".venv" ]; then
         # Check everything except the isolated megakernel reference
         (unset VIRTUAL_ENV; uvx "$TY_PIN" check --python .venv \
-            --exclude 'src/popcorn/kernels/row_stationary_megakernel.py' \
+            --exclude 'src/quark/kernels/row_stationary_megakernel.py' \
             src/ \
             2>&1)
     else

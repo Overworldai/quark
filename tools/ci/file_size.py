@@ -38,28 +38,28 @@ EXEMPTION_PHRASE = "EXEMPT FROM 500-LINE RULE"
 EXCLUDED: frozenset[str] = frozenset(
     {
         # Legacy code, slated for migration post-universal-GEMM.
-        "src/popcorn/compiler.py",
-        "src/popcorn/program.py",
-        "src/popcorn/cost_model.py",
-        "src/popcorn/blocks/flash_attn.py",
-        "src/popcorn/kernels/base.py",
-        "src/popcorn/kernels/owl_attn.py",
-        "src/popcorn/kernels/owl_attn_phase.py",
-        "src/popcorn/kernels/row_stationary_megakernel.py",
-        "src/popcorn/kernels/moe/inproj.py",
-        "src/popcorn/kernels/moe/outproj.py",
-        "src/popcorn/mma/frag.py",
-        "src/popcorn/mma/store.py",
+        "src/quark/compiler.py",
+        "src/quark/program.py",
+        "src/quark/cost_model.py",
+        "src/quark/blocks/flash_attn.py",
+        "src/quark/kernels/base.py",
+        "src/quark/kernels/owl_attn.py",
+        "src/quark/kernels/owl_attn_phase.py",
+        "src/quark/kernels/row_stationary_megakernel.py",
+        "src/quark/kernels/moe/inproj.py",
+        "src/quark/kernels/moe/outproj.py",
+        "src/quark/mma/frag.py",
+        "src/quark/mma/store.py",
         # Authored as monolithic modules for cohesion. The op
         # catalog, builder, and PTX lowerer each have ~40 op
         # classes / visit methods that need to live next to each
         # other for the dispatch table to read top-to-bottom. The
         # split-by-dtype-family path the proposal sketches for
         # mma/frag.py would just fragment them.
-        "src/popcorn/ir/builder.py",
-        "src/popcorn/ir/op.py",
-        "src/popcorn/lower/ptx/lower.py",
-        "src/popcorn/autotune.py",
+        "src/quark/ir/builder.py",
+        "src/quark/ir/op.py",
+        "src/quark/lower/ptx/lower.py",
+        "src/quark/autotune.py",
         # Test fixtures with offset tables and verbose parametrize
         # blocks that don't decompose well.
         "tests/lower/ptx/test_matmul.py",

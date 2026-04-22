@@ -7,7 +7,7 @@ cover the happy paths end-to-end.
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     ArithOp,
     BitcastOp,
     CmpOp,
@@ -19,8 +19,8 @@ from popcorn.ir import (
     ValueShape,
     YieldOp,
 )
-from popcorn.ir.op import MergeB32Op, SplitB32Op, VecBuildOp, VecExtractOp
-from popcorn.ir.value import ValueAllocator
+from quark.ir.op import MergeB32Op, SplitB32Op, VecBuildOp, VecExtractOp
+from quark.ir.value import ValueAllocator
 
 
 def _v(alloc: ValueAllocator, dt: DType, w: int = 1) -> Value:

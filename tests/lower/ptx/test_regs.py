@@ -2,8 +2,8 @@
 
 import pytest
 
-from popcorn.ir import DType, Value, ValueShape
-from popcorn.lower.ptx.regs import RegAllocator, arith_suffix, reg_class
+from quark.ir import DType, Value, ValueShape
+from quark.lower.ptx.regs import RegAllocator, arith_suffix, reg_class
 
 
 def _val(dtype: DType, vid: int = 0) -> Value:

@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from popcorn.kernels import all_kernels
+from quark.kernels import all_kernels
 
 IS_METAL = sys.platform == "darwin"
 
@@ -115,7 +115,7 @@ def test_spec_from_tensors_round_trip(kernel_cls):
     try:
         inputs_np = kernel_cls.make_tensors_numpy(problem.params)
         spec = kernel_cls.SPEC_CLS(**problem.params)
-        from popcorn.runtime.device_tensors import numpy_to_device_dict
+        from quark.runtime.device_tensors import numpy_to_device_dict
 
         tensors = numpy_to_device_dict(kernel_cls, spec, inputs_np)
     except Exception as e:

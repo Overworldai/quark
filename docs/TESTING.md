@@ -67,10 +67,10 @@ which stage broke.
 **Cosine similarity only.** No `max_abs`, no `torch.allclose`.
 
 `check_correctness(out, ref, out_dtype)`:
-- Accepts `PopcornTensor`, raw torch, or mlx tensors (any device).
+- Accepts `QuarkTensor`, raw torch, or mlx tensors (any device).
 - `cos_sim = dot(out, ref) / (|out| * |ref|)`.
 - Threshold from a `(out_dtype, accum_dtype)` table
-  (`popcorn/correctness.py:_THRESHOLD_TABLE`).
+  (`quark/correctness.py:_THRESHOLD_TABLE`).
 - NaN in reference → `ValueError` (fix your reference).
 - NaN / Inf in output → hard fail with flat index of first bad elem.
 

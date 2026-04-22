@@ -4,8 +4,8 @@ import re
 
 import pytest
 
-from popcorn.ir import BufferType, Builder, DType, ScalarType
-from popcorn.lower.ptx import LoweredKernel, PtxLowerer
+from quark.ir import BufferType, Builder, DType, ScalarType
+from quark.lower.ptx import LoweredKernel, PtxLowerer
 
 
 def _lower(module):

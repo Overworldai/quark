@@ -1,6 +1,6 @@
 """Tests for memory (load/store/smem) MSL lowering."""
 
-from popcorn.ir import BufferType, DType, GlobalTensor, ParamAttrs
+from quark.ir import BufferType, DType, GlobalTensor, ParamAttrs
 from tests.lower.msl.conftest import lower, lower_full
 
 

@@ -1,25 +1,25 @@
-# popcorn
+# quark
 
 GPU kernel compiler. Typed IR → PTX (CUDA) / MSL (Metal) → GPU binary.
-Runtime inference path uses `PopcornTensor` (ctypes → libcuda) on CUDA
+Runtime inference path uses `QuarkTensor` (ctypes → libcuda) on CUDA
 and `mx.array` (MLX) on Metal — no torch dependency in the hot path.
-`popcorn.backend.PT` still exists as the polymorphic wrapper for
+`quark.backend.PT` still exists as the polymorphic wrapper for
 kernel `reference.py` / `baselines.py` (torch optional dev extra).
 
 ## Orientation
 
 ```python
-import popcorn.lang as pop                       # pop.add/mul/..., pop.store_acc, pop.silu, pop.cast,
-                                                 # pop.work_list_load, pop.index_cache, pop.q_register_load
-from popcorn.backend import PT
-from popcorn.ir import Builder, DType            # DType is str+IR+backend bridge (DType.BF16.backend → mx/torch dtype)
-from popcorn.blocks import (
+import quark.lang as qk                       # qk.add/mul/..., qk.store_acc, qk.silu, qk.cast,
+                                                 # qk.work_list_load, qk.index_cache, qk.q_register_load
+from quark.backend import PT
+from quark.ir import Builder, DType            # DType is str+IR+backend bridge (DType.BF16.backend → mx/torch dtype)
+from quark.blocks import (
     Accumulators, SmemTile, SmemTileSpec, Stage, Carry, TensorDecl,
     MmaBody, SmemPlan,                           # MmaBody(acc=...), SmemPlan.staged_pairs
     PipelineBody, IterCtx, run_pipeline,         # PipelineBody(...).run(n_iters=..., n_stages=...)
 )
-from popcorn.kernels.base import Kernel, MmaSite
-from popcorn.kernels.decorator import kernel
+from quark.kernels.base import Kernel, MmaSite
+from quark.kernels.decorator import kernel
 ```
 
 Kernel `build()` bodies open with `s, c, g = self.spec, self.config,
@@ -27,8 +27,8 @@ self.g`; `self.bctx` / `self.m_base` / `self.n_base` are auto-bound
 by the decorator. Tile loads go through
 `smem_tile.load_from(gmem_tensor, row=, col=, cast=)` (or
 `smem_tile.gather_from(gmem, index=, col=)` for indirect loads).
-Epilogues use `pop.store_acc(dst, acc, row=, col=, cast=, activation=)`
-or `pop.atomic_store_acc(...)`. Stages are built via
+Epilogues use `qk.store_acc(dst, acc, row=, col=, cast=, activation=)`
+or `qk.atomic_store_acc(...)`. Stages are built via
 `Stage.staged(n, **SmemTileSpec(...))`; loop carry is a `Carry(**slots)`
 with attribute access (`ictx.carry.o`, `carry.l`, …).
 
@@ -52,7 +52,7 @@ n_stages)` replaces the separate `body = PipelineBody(...)` +
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | Timing, tags, autotune cache |
 | [docs/WEIGHTS.md](docs/WEIGHTS.md) | Safetensors loader, HF Hub, `nn.Module` state dict |
 | [docs/WAYPOINT_15.md](docs/WAYPOINT_15.md) | Waypoint-1.5 model + 5090 / 4090 benchmarks |
-| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `popcorn.functional` call surface (PopcornTensor / MLX) |
+| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `quark.functional` call surface (QuarkTensor / MLX) |
 | [docs/TESTING.md](docs/TESTING.md) | Test structure, correctness metric |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | Symptom → recipe |
 | [docs/CONVENTIONS.md](docs/CONVENTIONS.md) | Naming, style, forbidden patterns |
@@ -74,16 +74,16 @@ make dump-ptx KERNEL=name              # print PTX
 ## Layout
 
 ```
-src/popcorn/
+src/quark/
     backend.py            PT (polymorphic tensor) — every torch-vs-mlx branch
     correctness.py        cos_sim check (accepts raw PT tensors)
     autotune.py           3-level cache (hot / disk / bundled)
     device.py             Device, DeviceCaps, ChipGeneration (typed per-chip key)
-    lang/                 popcorn.lang — free-function authoring surface
-        __init__.py       pop.add / pop.mul / pop.for_range / pop.kernel_scope / …
+    lang/                 quark.lang — free-function authoring surface
+        __init__.py       qk.add / qk.mul / qk.for_range / qk.kernel_scope / …
                           (for_range auto-lifts Python ints; yield_ auto-flattens a Carry)
-        epilogue.py       pop.store_acc / pop.atomic_store_acc / pop.silu / pop.cast
-        memory.py         pop.work_list_load / pop.index_cache / pop.q_register_load
+        epilogue.py       qk.store_acc / qk.atomic_store_acc / qk.silu / qk.cast
+        memory.py         qk.work_list_load / qk.index_cache / qk.q_register_load
     ir/                   Builder, Value, Op, Tensor, Module, validator
         types.py          DType (str+IR+backend), MemSpace, ValueShape, ScalarType
         frag_tile.py      FragLayout + RegisterTile + per-backend lane maps
@@ -116,15 +116,15 @@ src/popcorn/
         decorator.py      @kernel(…, problems=, baselines=, reference=)
         registry.py       @register + get / all_kernels / names
         gemm/             attn/ owl_attn/ kv_cache_update/ moe_inproj/ moe_outproj/
-    functional/           popcorn.functional — per-kernel callables; dispatch
-                          by input type (PopcornTensor → CUDA, mx.array → MLX).
+    functional/           quark.functional — per-kernel callables; dispatch
+                          by input type (QuarkTensor → CUDA, mx.array → MLX).
                           Offline shuffle_b_for_* helpers for b_shuffle=True
                           fast paths
     nn/                   inference-only Module / Parameter / ModuleList;
                           io.py = pure-python safetensors loader (mmap + pinned
                           DMA); layers.py = Linear / MLP / OwlAttn / KVCacheUpdate / …
     models/               waypoint_15.py — 24-layer DiT reference model
-    runtime/              PopcornTensor (tensor.py), libcuda ctypes binding
+    runtime/              QuarkTensor (tensor.py), libcuda ctypes binding
                           (cuda.py), on-device PTX utility kernels (kernels.py)
     launcher/             Launcher, CompiledKernel, ParamSpec
     drivers/              cuda.py (ctypes), mlx.py

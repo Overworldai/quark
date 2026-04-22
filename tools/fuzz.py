@@ -8,7 +8,7 @@ Usage:
 
 numpy-refs flow: ``RefCache`` returns ``(inputs_np, outputs_np)``
 per (kernel, problem) — cached in-memory + on disk at
-``~/.cache/popcorn/refs``. Launch consumes numpy-staged device tensors
+``~/.cache/quark/refs``. Launch consumes numpy-staged device tensors
 via ``numpy_to_device_dict``; the output is compared against the numpy
 reference by ``check_correctness`` (which normalizes both sides to
 f32 numpy internally).
@@ -22,12 +22,12 @@ import traceback
 from dataclasses import dataclass
 from typing import Optional
 
-from popcorn.correctness import check_correctness
-from popcorn.device import current_device
-from popcorn.ir import DType
-from popcorn.refs import ref_cache
-from popcorn.runtime.device_tensors import numpy_to_device_dict
-from popcorn.utils.pretty import Table, print_header, style
+from quark.correctness import check_correctness
+from quark.device import current_device
+from quark.ir import DType
+from quark.refs import ref_cache
+from quark.runtime.device_tensors import numpy_to_device_dict
+from quark.utils.pretty import Table, print_header, style
 
 
 @dataclass
@@ -99,15 +99,15 @@ def _run_one(kernel_cls, problem, launcher) -> _FuzzResult:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="popcorn correctness fuzzer")
+    parser = argparse.ArgumentParser(description="quark correctness fuzzer")
     parser.add_argument("--kernel", help="restrict to one kernel name")
     parser.add_argument("--problem", help="restrict to one problem name")
     parser.add_argument("--tag", help="only run problems with this tag")
     parser.add_argument("--exclude-tag", help="skip problems with this tag")
     args = parser.parse_args(argv)
 
-    from popcorn.kernels import all_kernels, get
-    from popcorn.launcher import Launcher
+    from quark.kernels import all_kernels, get
+    from quark.launcher import Launcher
 
     kernels = [get(args.kernel)] if args.kernel else all_kernels()
     if not kernels:

@@ -7,8 +7,8 @@ Apple's lane-dependent row/col formulas. No smem round-trip.
 
 from __future__ import annotations
 
-from popcorn.ir import BufferType, Builder, DType, MmaShape, validate_module
-from popcorn.lower.msl import MslLowerer
+from quark.ir import BufferType, Builder, DType, MmaShape, validate_module
+from quark.lower.msl import MslLowerer
 from tests.lower.msl.conftest import METAL_CAPS_FAKE
 
 _M16N8K16_BF16 = MmaShape(

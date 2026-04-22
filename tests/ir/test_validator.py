@@ -7,7 +7,7 @@ implicitly by the builder tests (which call validate_module).
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     ArithOp,
     Builder,
     DType,
@@ -51,7 +51,7 @@ def test_ssa_out_of_scope_detected():
     # Hand-construct an ArithOp that references the leaked Value. We
     # bypass builder.add so we don't get stopped at op construction
     # time (the Builder doesn't check dominance, only shapes).
-    from popcorn.ir.value import ValueShape as _Shape
+    from quark.ir.value import ValueShape as _Shape
 
     out = b.function.fresh_value(_Shape(DType.F32))
     bad_op = ArithOp(
@@ -71,7 +71,7 @@ def test_unregistered_mma_shape_detected():
     b.begin_function("f")
     A = b.smem_alloc("A", DType.BF16, (16, 16))
     b.register_shape(
-        __import__("popcorn.ir", fromlist=["MmaShape"]).MmaShape(
+        __import__("quark.ir", fromlist=["MmaShape"]).MmaShape(
             name="known",
             m=16,
             n=8,
@@ -127,7 +127,7 @@ def test_shared_tensor_backing_not_in_function_rejected():
 def test_yield_must_be_last_op_in_region():
     """If someone directly appends a YieldOp not at the end of a region,
     validation flags it."""
-    from popcorn.ir.op import YieldOp
+    from quark.ir.op import YieldOp
 
     b = Builder("m")
     b.begin_function("f")
@@ -135,7 +135,7 @@ def test_yield_must_be_last_op_in_region():
     # by hand.
     term = YieldOp()
     extra = b.function.fresh_value(ValueShape(DType.F32))
-    from popcorn.ir.op import ConstOp
+    from quark.ir.op import ConstOp
 
     const_op = ConstOp(results=(extra,), attrs={"dtype": DType.F32, "value": 0.0})
     b.current_region.append(term)

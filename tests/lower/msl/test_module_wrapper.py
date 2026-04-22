@@ -1,6 +1,6 @@
 """Tests for module-level lowering wrapper and metadata."""
 
-from popcorn.ir import BufferType, DType, ParamAttrs, ScalarType
+from quark.ir import BufferType, DType, ParamAttrs, ScalarType
 from tests.lower.msl.conftest import lower_full
 
 
@@ -8,7 +8,7 @@ class TestKernelName:
     def test_kernel_name_has_prefix(self, fresh_builder):
         b = fresh_builder
         result = lower_full(b)
-        assert result.kernel_name == "popcorn_f"
+        assert result.kernel_name == "quark_f"
 
 
 class TestInputOutputSplit:

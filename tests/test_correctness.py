@@ -1,4 +1,4 @@
-"""Tests for popcorn.correctness — cosine similarity gating helper."""
+"""Tests for quark.correctness — cosine similarity gating helper."""
 
 import pytest
 
@@ -12,14 +12,14 @@ import math
 import pytest
 import torch
 
-from popcorn.correctness import (
+from quark.correctness import (
     _THRESHOLD_TABLE,
     CorrectnessResult,
     _threshold_for,
     check_correctness,
     threshold_for_kernel,
 )
-from popcorn.ir import DType
+from quark.ir import DType
 
 # ---------------------------------------------------------------------------
 # Threshold table + lookup

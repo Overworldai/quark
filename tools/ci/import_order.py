@@ -2,7 +2,7 @@
 """Check import order and grouping in src/, tests/, tools/.
 
 DORMANT — see tools/ci/README.md. Can be activated after the
-rename so the 'from popcorn ...' patterns stabilize.
+rename so the 'from quark ...' patterns stabilize.
 
 Rule: imports follow this grouping, with blank lines between groups:
 
@@ -15,10 +15,10 @@ Rule: imports follow this grouping, with blank lines between groups:
     import torch
 
     # 3. first-party absolute
-    from popcorn.ir import DType, Module
-    from popcorn.kernels.base import Kernel
+    from quark.ir import DType, Module
+    from quark.kernels.base import Kernel
 
-No 'from X import *'. No 'import popcorn.ir as ir'. No private-name
+No 'from X import *'. No 'import quark.ir as ir'. No private-name
 cross-module imports (from X import _y).
 
 This checker is intentionally simpler than ruff's 'I' (isort) rule —
@@ -38,7 +38,7 @@ SCAN_ROOTS = ("src", "tests", "tools")
 STDLIB_MODULES = frozenset(
     {
         # A short stdlib list is enough for detecting obvious violations.
-        # Not exhaustive — but covers what popcorn uses.
+        # Not exhaustive — but covers what quark uses.
         "abc",
         "argparse",
         "ast",
@@ -94,7 +94,7 @@ STDLIB_MODULES = frozenset(
 
 THIRD_PARTY_KNOWN = frozenset({"mlx", "numpy", "pytest", "cv2", "huggingface_hub"})
 
-FIRST_PARTY_PREFIXES = ("popcorn", "popcorn")  # "popcorn" until rename
+FIRST_PARTY_PREFIXES = ("quark", "quark")  # "quark" until rename
 
 
 def classify(module: str) -> str:
@@ -124,7 +124,7 @@ def check_file(path: Path) -> list[str]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.append((node.lineno, classify(alias.name), alias.name))
-                # Ban 'import popcorn.ir as ir' (rename-style)
+                # Ban 'import quark.ir as ir' (rename-style)
                 if alias.asname and alias.name.split(".")[0] in FIRST_PARTY_PREFIXES:
                     fails.append(
                         f"{path.as_posix()}:{node.lineno}: "
@@ -144,7 +144,7 @@ def check_file(path: Path) -> list[str]:
                 # Ban 'from X import _y' (private cross-module import)
                 elif alias.name.startswith("_") and classify(module) == "first_party":
                     # Same-package imports are fine; cross-package aren't.
-                    # We conservatively flag all private imports from popcorn.*
+                    # We conservatively flag all private imports from quark.*
                     fails.append(
                         f"{path.as_posix()}:{node.lineno}: "
                         f"private import '{alias.name}' from '{module}' — "

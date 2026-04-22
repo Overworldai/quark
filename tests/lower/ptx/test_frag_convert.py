@@ -11,14 +11,14 @@ import re
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     Builder,
     DType,
     FragConvertOp,
     MmaShape,
     validate_module,
 )
-from popcorn.lower.ptx import PtxLowerer
+from quark.lower.ptx import PtxLowerer
 
 _M16N8K16_BF16 = MmaShape(
     name="m16n8k16_bf16",

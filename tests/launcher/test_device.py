@@ -1,8 +1,8 @@
-"""Tests for popcorn.device — DeviceFamily / DeviceCaps / Device."""
+"""Tests for quark.device — DeviceFamily / DeviceCaps / Device."""
 
 import pytest
 
-from popcorn.device import (
+from quark.device import (
     ChipGeneration,
     DeviceCaps,
     DeviceFamily,
@@ -12,7 +12,7 @@ from popcorn.device import (
     chip_gen_from_cuda_cc,
     make_test_device,
 )
-from popcorn.ir.mma_registry import shapes_for_chip
+from quark.ir.mma_registry import shapes_for_chip
 
 
 class TestDeviceFamily:
@@ -127,51 +127,51 @@ class TestDevice:
 
 class TestForceBackend:
     def test_no_env_returns_none(self, monkeypatch):
-        monkeypatch.delenv("POPCORN_FORCE_BACKEND", raising=False)
+        monkeypatch.delenv("QUARK_FORCE_BACKEND", raising=False)
         assert _forced_family() is None
 
     def test_valid_value(self, monkeypatch):
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "cuda")
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "cuda")
         assert _forced_family() is DeviceFamily.CUDA
 
     def test_case_insensitive(self, monkeypatch):
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "METAL")
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "METAL")
         assert _forced_family() is DeviceFamily.METAL
 
     def test_invalid_raises(self, monkeypatch):
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "vulkan")
-        with pytest.raises(ValueError, match="POPCORN_FORCE_BACKEND"):
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "vulkan")
+        with pytest.raises(ValueError, match="QUARK_FORCE_BACKEND"):
             _forced_family()
 
 
 class TestDetectFamily:
     def test_force_overrides_detection(self, monkeypatch):
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "cpu")
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "cpu")
         assert _detect_family() is DeviceFamily.CPU
 
     def test_returns_cpu_when_no_torch(self, monkeypatch):
         # We can't truly remove torch, but the fallback path is tested
         # via a forced env override.
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "cpu")
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "cpu")
         assert _detect_family() is DeviceFamily.CPU
 
 
 class TestCurrentDevice:
     def test_metal_family_probes_successfully(self, monkeypatch):
         pytest.importorskip("mlx")
-        from popcorn import device
+        from quark import device
 
         # Metal is now a supported backend (MLX probe).
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "metal")
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "metal")
         device.current_device.cache_clear()
         d = device.current_device()
         assert d.family is device.DeviceFamily.METAL
         device.current_device.cache_clear()
 
     def test_cpu_force_path_raises_not_implemented(self, monkeypatch):
-        from popcorn import device
+        from quark import device
 
-        monkeypatch.setenv("POPCORN_FORCE_BACKEND", "cpu")
+        monkeypatch.setenv("QUARK_FORCE_BACKEND", "cpu")
         device.current_device.cache_clear()
         with pytest.raises(NotImplementedError, match="cpu"):
             device.current_device()

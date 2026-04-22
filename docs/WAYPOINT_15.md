@@ -1,12 +1,12 @@
 # Waypoint-1.5
 
 A 24-layer DiT for autoregressive video generation, implemented end to
-end as a `popcorn.nn.Module` with every leaf lowering to a `pcf.*`
+end as a `quark.nn.Module` with every leaf lowering to a `pcf.*`
 kernel. Target weights: `Overworld/Waypoint-1.5-1B` on HF Hub.
 
 ```python
-from popcorn.models.waypoint_15 import Waypoint15, Waypoint15Config
-from popcorn.nn.io import load_from_hub
+from quark.models.waypoint_15 import Waypoint15, Waypoint15Config
+from quark.nn.io import load_from_hub
 
 cfg   = Waypoint15Config()                          # 720p defaults
 model = Waypoint15(cfg)
@@ -85,14 +85,14 @@ global attention; the rest run local. Both paths go through the same
   total: 8.44 s
 ```
 
-Same model definition, same weights, same NFE schedule. popcorn on
+Same model definition, same weights, same NFE schedule. quark on
 the same GPU delivers **1.8× NFE throughput and 1.8× LFPS** over the
 bf16 `world_engine` torch reference, driven by fp8+shuffle GEMMs
 end-to-end and the fused segment-sparse `owl_attn` kernel.
 
 Reproduce with `scripts/bench_world_engine.py` for the baseline and
 `scripts/generate.py --profile` for a per-module breakdown of the
-popcorn path.
+quark path.
 
 ## What the numbers do NOT include
 
@@ -100,7 +100,7 @@ popcorn path.
   `scripts/generate.py` just to produce an mp4. Excluded from the
   NFE/LFPS numbers above.
 - **First-frame warmup** — autotune search on cold caches takes
-  ~10–30 s. Subsequent runs read `~/.cache/popcorn/*.json` and
+  ~10–30 s. Subsequent runs read `~/.cache/quark/*.json` and
   start in milliseconds.
 - **Safetensors load** — timed separately in generate.py output. On
   a warm page cache with pinned-DMA path: ~0.3 s for the 1 B
@@ -125,7 +125,7 @@ See [WEIGHTS.md](WEIGHTS.md) for the loader path and
 
 ## Source
 
-- [src/popcorn/models/waypoint_15.py](../src/popcorn/models/waypoint_15.py) — model + config + generate-one-frame
-- [src/popcorn/nn/layers.py](../src/popcorn/nn/layers.py) — leaf `nn.Module`s
+- [src/quark/models/waypoint_15.py](../src/quark/models/waypoint_15.py) — model + config + generate-one-frame
+- [src/quark/nn/layers.py](../src/quark/nn/layers.py) — leaf `nn.Module`s
 - [scripts/generate.py](../scripts/generate.py) — end-to-end video generator
 - [scripts/bench_world_engine.py](../scripts/bench_world_engine.py) — world-engine torch baseline

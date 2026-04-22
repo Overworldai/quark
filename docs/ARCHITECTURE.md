@@ -13,7 +13,7 @@
                 ┌──────────────────────┼──────────────────────┐
                 ▼                                             ▼
          PtxLowerer                                      MslLowerer
-    (src/popcorn/lower/ptx)                       (src/popcorn/lower/msl)
+    (src/quark/lower/ptx)                       (src/quark/lower/msl)
                 │                                             │
                 ▼                                             ▼
           PTX text                                       MSL source
@@ -31,7 +31,7 @@
 ```
 
 Backend dispatch is decided at **import time** by `sys.platform`
-(`popcorn.backend.IS_METAL`). Apple → MSL / MLX. Everything else →
+(`quark.backend.IS_METAL`). Apple → MSL / MLX. Everything else →
 PTX / CUDA. No runtime branching in user code.
 
 ## IR
@@ -43,7 +43,7 @@ Static-single-assignment, strongly typed, structured control flow.
 - **Structured control flow** — `ForLoopOp`, `IfRegionOp`,
   `WhileLoopOp`. Bodies are `Region`s. Never labels + bra at the IR
   level; lowerers emit those.
-- **Tensor types** (`popcorn.ir.tensor`):
+- **Tensor types** (`quark.ir.tensor`):
   - `GlobalTensor` — gmem param. Shape, stride, dtype.
   - `SharedRegion` — smem allocation. Typed, with `Lifetime`.
   - `FragTensor` — MMA register layout. Per-lane slots.
@@ -55,48 +55,48 @@ Static-single-assignment, strongly typed, structured control flow.
   `DType("bf16")` from a string, `DType.BF16.backend` gives the
   `mx.bfloat16` / `torch.bfloat16` matching the active backend (the
   torch resolution is baseline-only; the runtime path maps `DType` to
-  the string keys `PopcornTensor` uses — `"bf16"`, `"e4m3"`, etc.).
+  the string keys `QuarkTensor` uses — `"bf16"`, `"e4m3"`, etc.).
 - **Fragment primitives**:
   - `FragApplyOp` — per-element transform with a body region.
   - `FragReduceOp` — cross-lane row/col reduction (max/min/add/mul).
   - `FragConvertOp` — layout/dtype conversion (e.g. ACC f32 → A_FRAG bf16).
   - `FragForEachOp` — side-effect walk (store-per-element epilogues).
 
-### Authoring surface — `popcorn.lang`
+### Authoring surface — `quark.lang`
 
-Kernels author IR via the `popcorn.lang` namespace (not `Builder`
+Kernels author IR via the `quark.lang` namespace (not `Builder`
 methods directly). Every `Builder` op is exposed as a free function
 that reads the active builder from `_ACTIVE_BUILDER`:
 
 ```python
-import popcorn.lang as pop
+import quark.lang as qk
 
-pop.mul(a, b)                 # == bld.mul(a, b); or just a * b (Value op overloading)
-pop.for_range(0, n, 1)        # context manager; Python ints auto-lifted to U32
-pop.if_(pred)                 # context manager
-pop.const(DType.F32, 1.0)
-pop.barrier("block")
-pop.yield_(carry)             # auto-flattens a Carry; else pass Values explicitly
+qk.mul(a, b)                 # == bld.mul(a, b); or just a * b (Value op overloading)
+qk.for_range(0, n, 1)        # context manager; Python ints auto-lifted to U32
+qk.if_(pred)                 # context manager
+qk.const(DType.F32, 1.0)
+qk.barrier("block")
+qk.yield_(carry)             # auto-flattens a Carry; else pass Values explicitly
 ```
 
-Higher-level authoring helpers in `popcorn.lang` compose the DSL
+Higher-level authoring helpers in `quark.lang` compose the DSL
 primitives:
 
 ```python
 # Epilogues.
-pop.store_acc(dst, acc, row=, col=, cast=, activation=)
-pop.atomic_store_acc(dst, acc, col=, index=, weight=)
-pop.silu(values) / pop.cast(values, dtype)
+qk.store_acc(dst, acc, row=, col=, cast=, activation=)
+qk.atomic_store_acc(dst, acc, col=, index=, weight=)
+qk.silu(values) / qk.cast(values, dtype)
 
 # Memory.
-grp_start, expert = pop.work_list_load(work_list, work_idx)
-toks_smem         = pop.index_cache("toks", g.token_ids, count=c.BM, base=grp_start)
-q_frags           = pop.q_register_load(g_q, smem=q_tile, q_row=..., warp_id=..., MT=..., Dh=..., kv_pad=...)
+grp_start, expert = qk.work_list_load(work_list, work_idx)
+toks_smem         = qk.index_cache("toks", g.token_ids, count=c.BM, base=grp_start)
+q_frags           = qk.q_register_load(g_q, smem=q_tile, q_row=..., warp_id=..., MT=..., Dh=..., kv_pad=...)
 ```
 
 `Builder.begin_function()` publishes the active builder; inside any
-`@kernel`'s `build()` body `pop.*` just works. For tests and scripts
-that emit ops outside a kernel, wrap in `with pop.kernel_scope(bld):`.
+`@kernel`'s `build()` body `qk.*` just works. For tests and scripts
+that emit ops outside a kernel, wrap in `with qk.kernel_scope(bld):`.
 
 Module setup (`begin_function`, `param`, `register_shape`) stays on
 the `Builder` — those aren't part of the kernel-authoring surface.
@@ -134,7 +134,7 @@ Optional overrides (hookable via decorator kwargs):
 ## Kernel layout
 
 ```
-src/popcorn/kernels/my_kernel/
+src/quark/kernels/my_kernel/
     __init__.py        triggers @kernel registration
     spec.py            frozen KernelSpec dataclass (M, N, K, dtypes, ...)
     config.py          frozen KernelConfig with default_for(spec)
@@ -158,7 +158,7 @@ compiled.launch(buffers=[A, B, Out])
 - `compile()`: `emit()` → `validate_module` → lower → driver. Cached.
 - `ParamSpec` splits IR params into buffers (pointer + dtype + align)
   and scalars. `.launch(buffers=...)` extracts `data_ptr()` on
-  `PopcornTensor` (CUDA) or `torch.Tensor` (baselines), and routes
+  `QuarkTensor` (CUDA) or `torch.Tensor` (baselines), and routes
   through MLX kernel args on Metal.
 - `prepare_launch_tensors(tensors)` — optional per-kernel hook for
   pre-launch transforms (GEMM uses this to cache weight shuffles).
@@ -166,10 +166,10 @@ compiled.launch(buffers=[A, B, Out])
 ## Correctness metric
 
 Cosine similarity only. Threshold from a dtype × accumulator table
-(`popcorn/correctness.py:_THRESHOLD_TABLE`). Override per-kernel by
+(`quark/correctness.py:_THRESHOLD_TABLE`). Override per-kernel by
 setting `CORRECTNESS_THRESHOLD: float` on the class.
 
-`check_correctness(out, ref, out_dtype)` accepts `PopcornTensor`,
+`check_correctness(out, ref, out_dtype)` accepts `QuarkTensor`,
 torch, or mlx tensors — internally routes through `PT.cosine_sim`.
 No detach-to-cpu ritual at call sites.
 
@@ -179,13 +179,13 @@ NaN / Inf in output → hard fail regardless of cos_sim.
 
 Two tensor types, two audiences:
 
-- **Runtime path** — `PopcornTensor` (`popcorn.runtime.tensor`).
+- **Runtime path** — `QuarkTensor` (`quark.runtime.tensor`).
   Owns a `cuMemAlloc`'d device pointer, supports shape / stride /
   offset metadata, arithmetic / slicing / reshape / permute via
   on-device PTX utility kernels (`runtime/kernels.py`). This is
-  what `popcorn.nn.Module` parameters hold and what `pcf.*` calls
+  what `quark.nn.Module` parameters hold and what `pcf.*` calls
   consume on CUDA. **Zero torch dependency.**
-- **Reference / baseline path** — `popcorn.backend.PT`. Polymorphic
+- **Reference / baseline path** — `quark.backend.PT`. Polymorphic
   wrapper over torch (CUDA) and MLX (Metal). Used exclusively by
   `reference.py` / `baselines.py` in each kernel folder and by
   tests that need framework-native semantics (e.g. a
@@ -194,12 +194,12 @@ Two tensor types, two audiences:
 
 ```python
 # Runtime
-from popcorn.runtime.tensor import PopcornTensor
-A = PopcornTensor.randn(M, K, dtype="bf16")
-C = pcf.gemm(A, B)                     # PopcornTensor in, PopcornTensor out
+from quark.runtime.tensor import QuarkTensor
+A = QuarkTensor.randn(M, K, dtype="bf16")
+C = pcf.gemm(A, B)                     # QuarkTensor in, QuarkTensor out
 
 # Baseline / reference (test / autotune correctness gate)
-from popcorn.backend import PT
+from quark.backend import PT
 A_ref = PT.randn(M, K, dtype=PT.bfloat16)
 C_ref = PT.matmul(A_ref, PT.transpose(B_ref))
 ```
@@ -208,16 +208,16 @@ On Metal the two collapse to a single `mx.array` path — MLX is the
 only half-precision device tensor available. See
 [BACKEND.md](BACKEND.md) for the full `PT` surface and
 [WEIGHTS.md](WEIGHTS.md) for how parameters reach device via the
-`PopcornTensor` path.
+`QuarkTensor` path.
 
 ## Autotune
 
 `tune_space()` / `tune_space_resolved(spec, device)` declare a
 cartesian product of knob values. `AutotuneCache` (one per `Launcher`,
-lives in `src/popcorn/autotune.py`) implements a three-level lookup:
+lives in `src/quark/autotune.py`) implements a three-level lookup:
 
 ```
-hot dict → ~/.cache/popcorn/<hash>.json → configs/<kernel>_<problem>.json
+hot dict → ~/.cache/quark/<hash>.json → configs/<kernel>_<problem>.json
 ```
 
 On a miss the cache runs an inline **search** (blocking, on the calling
@@ -227,8 +227,8 @@ thread) and persists the winner to disk. Two depths:
   pass. Seeded from existing on-disk configs for this (kernel, device)
   pair so new shapes start from known-good neighbours.
 - **`"full"`** — full genetic search (population × generations, same
-  warm seeding). Triggered by `POPCORN_MAX_AUTOTUNE=1`, the
-  `with popcorn.max_autotune():` context manager, or the per-op
+  warm seeding). Triggered by `QUARK_MAX_AUTOTUNE=1`, the
+  `with quark.max_autotune():` context manager, or the per-op
   `.autotune()` warmup API (`pcf.gemm.autotune(A, B)`).
 
 `tools/autotune.py` is a thin CLI wrapper over the same

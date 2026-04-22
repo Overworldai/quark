@@ -1,9 +1,9 @@
 """Auto-parameterized smoke test over the kernel registry.
 
-Per popcorn cleanup proposal §5.2. One smoke test per registered
+Per quark cleanup proposal §5.2. One smoke test per registered
 kernel: build it from `problems()[0]`, compile via the Launcher,
 launch with `make_tensors(problem)`, and gate the result against
-`reference()` via `popcorn.correctness.check_correctness` (cosine
+`reference()` via `quark.correctness.check_correctness` (cosine
 similarity, the only correctness metric per §7).
 
 This file replaces the per-kernel `tests/test_<kernel>.py` files
@@ -28,11 +28,11 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("smoke tests need a GPU", allow_module_level=True)
 
-from popcorn.correctness import check_correctness  # noqa: E402
-from popcorn.device import current_device  # noqa: E402
-from popcorn.ir import DType  # noqa: E402
-from popcorn.kernels import all_kernels  # noqa: E402
-from popcorn.launcher import Launcher  # noqa: E402
+from quark.correctness import check_correctness  # noqa: E402
+from quark.device import current_device  # noqa: E402
+from quark.ir import DType  # noqa: E402
+from quark.kernels import all_kernels  # noqa: E402
+from quark.launcher import Launcher  # noqa: E402
 
 # Module-level singletons so the parametrize fixture and the test
 # share the same Device + Launcher (so the autotune cache is shared

@@ -37,7 +37,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from popcorn.ir import BufferType, Builder, DType, GlobalTensor, MmaShape
+from quark.ir import BufferType, Builder, DType, GlobalTensor, MmaShape
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -1136,7 +1136,7 @@ def _(b):
 
 
 def _build_msl_caps():
-    from popcorn.device import DeviceCaps, DeviceFamily
+    from quark.device import DeviceCaps, DeviceFamily
 
     return DeviceCaps(
         family=DeviceFamily.METAL,
@@ -1168,11 +1168,11 @@ def lower_case(case: Case, backend: str) -> str:
         b.end_function()
 
     if backend == "ptx":
-        from popcorn.lower.ptx import PtxLowerer
+        from quark.lower.ptx import PtxLowerer
 
         return PtxLowerer().lower_module(b.module).ptx
     elif backend == "msl":
-        from popcorn.lower.msl import MslLowerer
+        from quark.lower.msl import MslLowerer
 
         return MslLowerer(_build_msl_caps()).lower_module(b.module).source
     else:

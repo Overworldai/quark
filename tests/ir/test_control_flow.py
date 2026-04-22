@@ -7,7 +7,7 @@ mirrors the proposal's §8 example.
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,

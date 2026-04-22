@@ -19,7 +19,7 @@ Timed region per forward pass (24 layers):
 Excluded from the timing: kv_cache_update (cache is primed in a
 warmup pass and held frozen during the timed passes).
 
-Autotune runs under ``with popcorn.max_autotune()`` for every distinct
+Autotune runs under ``with quark.max_autotune()`` for every distinct
 (spec, config) encountered. First pass includes the autotune cost.
 """
 
@@ -29,8 +29,8 @@ import time
 
 import mlx.core as mx
 
-import popcorn
-import popcorn.functional as pcf
+import quark
+import quark.functional as pcf
 
 # ---------------------------------------------------------------
 # Config — mirrors waypoint-1.5 yaml, tokens_per_frame scaled for 360p.
@@ -305,7 +305,7 @@ def main():
     # ── Autotune every distinct kernel call on this workload ──
     print("\nautotuning (max_autotune, full genetic search) …")
     t0 = time.perf_counter()
-    with popcorn.max_autotune():
+    with quark.max_autotune():
         out = forward(weights, caches, x, 0.7, skip_kv_update=False)
         mx.eval(out)
     print(f"  first-pass (autotune + prime cache): {time.perf_counter() - t0:.2f}s")

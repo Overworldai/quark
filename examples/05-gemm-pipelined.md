@@ -136,7 +136,7 @@ At this point you've got the full GEMM authoring surface. The real
 * Real `problems` / `baselines` / `reference` for bench / fuzz /
   autotune.
 
-Look at `src/popcorn/kernels/gemm/kernel.py` — it's under 220 lines
+Look at `src/quark/kernels/gemm/kernel.py` — it's under 220 lines
 with all of that on top. The primitives we just covered do the
 lifting.
 

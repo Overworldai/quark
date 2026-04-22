@@ -2,7 +2,7 @@
 
 import re
 
-from popcorn.ir import BufferType, DType, GlobalTensor
+from quark.ir import BufferType, DType, GlobalTensor
 from tests.lower.ptx.conftest import lower, lower_full
 
 

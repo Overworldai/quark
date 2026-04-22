@@ -2,7 +2,7 @@
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     Builder,
     DType,
     MmaShape,

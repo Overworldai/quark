@@ -1,10 +1,10 @@
-# `popcorn.functional` — call surface
+# `quark.functional` — call surface
 
-Every popcorn production kernel is exposed as a callable that accepts
+Every quark production kernel is exposed as a callable that accepts
 backend-native tensors. Dispatch is decided per-call from the input
 type:
 
-- `PopcornTensor` (from `popcorn.runtime.tensor`) → CUDA path.
+- `QuarkTensor` (from `quark.runtime.tensor`) → CUDA path.
 - `mx.array` (MLX) → Metal path.
 
 No torch runtime dep on either leg. Torch is only pulled in if a test
@@ -12,11 +12,11 @@ baseline or reference implementation reaches for it (optional dev
 extra).
 
 ```python
-import popcorn.functional as pcf
-from popcorn.runtime.tensor import PopcornTensor
+import quark.functional as pcf
+from quark.runtime.tensor import QuarkTensor
 
-A = PopcornTensor.randn(M, K, dtype="bf16")
-B = PopcornTensor.randn(N, K, dtype="bf16")
+A = QuarkTensor.randn(M, K, dtype="bf16")
+B = QuarkTensor.randn(N, K, dtype="bf16")
 
 C   = pcf.gemm(A, B)                                           # matmul
 out = pcf.attention(Q, K, V_t, B=..., n_kv_heads=..., ...)     # flash attention
@@ -53,7 +53,7 @@ Every functional call resolves its config through a single path —
 resolution. The three lookup levels are:
 
 1. **Hot** — in-memory dict; sub-microsecond.
-2. **Disk** — `~/.cache/popcorn/<hash>.json`; loaded and validated once,
+2. **Disk** — `~/.cache/quark/<hash>.json`; loaded and validated once,
    then promoted to hot.
 3. **Bundled** — `configs/<kernel>_<problem>.json` checked in to the repo.
 
@@ -69,11 +69,11 @@ On a **miss**, the cache runs an inline search on the calling thread
 
 ```python
 # 1. env var — forces "full" for the entire process
-POPCORN_MAX_AUTOTUNE=1 python serve.py
+QUARK_MAX_AUTOTUNE=1 python serve.py
 
 # 2. context manager — scoped to one block
-import popcorn
-with popcorn.max_autotune():
+import quark
+with quark.max_autotune():
     pcf.gemm(A, B)   # cache miss → full genetic search
 
 # 3. per-op .autotune() warmup API — always "full", recommended at server startup
@@ -83,7 +83,7 @@ pcf.gemm.autotune(A_example, B_example)   # blocks ~10–30 s, then cached forev
 **Server-startup pattern:**
 
 ```python
-import popcorn.functional as pcf
+import quark.functional as pcf
 
 # Tune once at startup — blocks while the genetic search runs.
 # On subsequent restarts the disk cache is hit immediately.
@@ -94,7 +94,7 @@ for batch in dataloader:
     out = pcf.gemm(batch, W)   # hot-dict hit every call
 ```
 
-Winner configs are persisted to `~/.cache/popcorn/` automatically.
+Winner configs are persisted to `~/.cache/quark/` automatically.
 Run `make autotune KERNEL=<name>` to populate the bundled `configs/` dir
 for shipping pre-tuned configs with the package.
 
@@ -105,7 +105,7 @@ happen once offline (at model-load time) and the per-step call uses
 the pre-shuffled buffer:
 
 ```python
-from popcorn.functional import shuffle_b_for_gemm
+from quark.functional import shuffle_b_for_gemm
 
 B_shuf = shuffle_b_for_gemm(A, B)                             # call once
 C      = pcf.gemm(A, B_shuf, b_shuffled=True)                 # per step
@@ -118,17 +118,17 @@ the shuffle layout always matches the kernel's fragment loader.
 `nn.Linear` exposes the same shuffle via `.prepare(...)` at module
 init — recommended for `nn.Module`-based models.
 
-## PopcornTensor path (CUDA)
+## QuarkTensor path (CUDA)
 
 Allocations, reductions, slicing, reshape, permute, and arithmetic
-all live on `PopcornTensor` itself — no torch needed:
+all live on `QuarkTensor` itself — no torch needed:
 
 ```python
-from popcorn.runtime.tensor import PopcornTensor
+from quark.runtime.tensor import QuarkTensor
 
-A = PopcornTensor.randn(M, K, dtype="bf16")
-B = PopcornTensor.zeros(N, K, dtype="bf16")
-C = PopcornTensor.zeros(M, N, dtype="bf16")
+A = QuarkTensor.randn(M, K, dtype="bf16")
+B = QuarkTensor.zeros(N, K, dtype="bf16")
+C = QuarkTensor.zeros(M, N, dtype="bf16")
 pcf.gemm(A, B, out=C)                     # in-place write into C
 C = C.reshape(M // 2, 2, N)
 ```
@@ -143,7 +143,7 @@ avoid the per-call `cuMemAllocAsync` that `auto_alloc` would
 otherwise pay:
 
 ```python
-C = PopcornTensor.zeros(M, N, dtype="bf16")
+C = QuarkTensor.zeros(M, N, dtype="bf16")
 for batch in loader:
     pcf.gemm(batch, W, out=C)             # writes into C, no fresh allocation
 ```
@@ -160,7 +160,7 @@ follow-up.
 
 Every launch path is capture-safe: `data_ptr()` extraction, no
 `.item()` host syncs, no allocator-allocated scratch during the
-launch. `nn.Module` forward passes over `PopcornTensor` inputs
+launch. `nn.Module` forward passes over `QuarkTensor` inputs
 capture cleanly — see `scripts/generate.py` for the end-to-end
 Waypoint-1.5 capture+replay loop.
 

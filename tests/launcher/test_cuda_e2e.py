@@ -18,17 +18,17 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
 
-from popcorn.drivers.cuda import CudaCompiledModule, CudaDriver
-from popcorn.ir import (
+from quark.drivers.cuda import CudaCompiledModule, CudaDriver
+from quark.ir import (
     BufferType,
     Builder,
     DType,
     GlobalTensor,
     Module,
 )
-from popcorn.kernels.base import Kernel, KernelConfig, KernelSpec
-from popcorn.launcher import Launcher
-from popcorn.runtime.cuda import CudaRuntime
+from quark.kernels.base import Kernel, KernelConfig, KernelSpec
+from quark.launcher import Launcher
+from quark.runtime.cuda import CudaRuntime
 
 # ---------------------------------------------------------------------------
 # CudaRuntime — direct API

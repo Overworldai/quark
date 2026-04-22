@@ -25,15 +25,15 @@ IS_METAL = sys.platform == "darwin"
 if IS_METAL:
     pytest.skip("e4m3 ops are CUDA-only", allow_module_level=True)
 
-from popcorn.runtime.cuda import CudaRuntime
+from quark.runtime.cuda import CudaRuntime
 
 if not CudaRuntime.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
 
-import popcorn.functional as pcf
-from popcorn.correctness import check_correctness
-from popcorn.ir import DType
-from popcorn.runtime.tensor import PopcornTensor
+import quark.functional as pcf
+from quark.correctness import check_correctness
+from quark.ir import DType
+from quark.runtime.tensor import QuarkTensor
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -50,7 +50,7 @@ def _quantized_pair(shape, seed=0, scale=0.5):
     values — so differences between the two runs come only from how
     each kernel loads / casts, not from input jitter.
     """
-    f32 = PopcornTensor.from_numpy(_rand(*shape, seed=seed, scale=scale), dtype="f32")
+    f32 = QuarkTensor.from_numpy(_rand(*shape, seed=seed, scale=scale), dtype="f32")
     e4m3 = f32.astype("e4m3")
     bf16 = e4m3.astype("bf16")
     return bf16, e4m3
@@ -75,7 +75,7 @@ def test_silu_accepts_e4m3():
 
 
 # ---------------------------------------------------------------------------
-# Elementwise Add (via PopcornTensor __add__)
+# Elementwise Add (via QuarkTensor __add__)
 # ---------------------------------------------------------------------------
 
 
@@ -145,7 +145,7 @@ def test_ada_gate_residual_accepts_e4m3():
     x_bf16, x_e4m3 = _quantized_pair((G * M, D), seed=9, scale=0.3)
     y_bf16, y_e4m3 = _quantized_pair((G * M, D), seed=10, scale=0.3)
     # gate is a small scaling; keep it in f32 on host and feed as bf16.
-    gate = PopcornTensor.from_numpy(_rand(G, D, seed=11, scale=0.1), dtype="f32").astype("bf16")
+    gate = QuarkTensor.from_numpy(_rand(G, D, seed=11, scale=0.1), dtype="f32").astype("bf16")
     out_e4m3 = pcf.ada_gate_residual(x_e4m3, y_e4m3, gate)
     out_bf16 = pcf.ada_gate_residual(x_bf16, y_bf16, gate)
     assert out_e4m3.dtype == "e4m3"
@@ -162,7 +162,7 @@ def test_value_residual_packed_accepts_e4m3():
     v_col_offset, v_width = 256, 128
     curr_bf16, curr_e4m3 = _quantized_pair((M, D_full), seed=12, scale=0.3)
     first_bf16, first_e4m3 = _quantized_pair((M, D_full), seed=13, scale=0.3)
-    lamb = PopcornTensor.from_numpy(np.array([0.5], dtype=np.float32), dtype="f32")
+    lamb = QuarkTensor.from_numpy(np.array([0.5], dtype=np.float32), dtype="f32")
     out_e4m3 = pcf.value_residual_packed(
         curr_e4m3, first_e4m3, lamb, v_col_offset=v_col_offset, v_width=v_width
     )

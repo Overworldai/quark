@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,
     GlobalTensor,
     validate_module,
 )
-from popcorn.ir.validator import ValidationError
+from quark.ir.validator import ValidationError
 
 
 def _builder() -> Builder:

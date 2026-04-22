@@ -1,4 +1,4 @@
-"""End-to-end smoke tests for every ``popcorn.functional`` wrapper.
+"""End-to-end smoke tests for every ``quark.functional`` wrapper.
 
 For each kernel we:
 1. Pull the first dtype-compatible ``Problem``.
@@ -26,9 +26,9 @@ pytest.importorskip(
     ),
 )
 
-import popcorn.functional as pcf
-from popcorn.correctness import check_correctness
-from popcorn.kernels import get
+import quark.functional as pcf
+from quark.correctness import check_correctness
+from quark.kernels import get
 
 IS_METAL = _sys.platform == "darwin"
 
@@ -54,8 +54,8 @@ def _first_valid_problem(kernel_cls):
 
 
 def _check(out, ref, out_dtype, kernel_cls):
-    from popcorn.ir import DType
-    from popcorn.runtime.sync import ir_dtype_of
+    from quark.ir import DType
+    from quark.runtime.sync import ir_dtype_of
 
     try:
         out_ir = ir_dtype_of(out)
@@ -181,7 +181,7 @@ def test_moe_outproj_smoke():
         tensors["work_list"],
     )
     # moe_outproj output is always f32
-    from popcorn.ir import DType
+    from quark.ir import DType
 
     _check(out, ref, DType.F32, cls)
 

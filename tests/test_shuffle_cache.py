@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from popcorn.weight_shuffle import cached_shuffle_b, shuffle_b_for_frag_load
+from quark.weight_shuffle import cached_shuffle_b, shuffle_b_for_frag_load
 
 
 def _make_bf16_u16(N: int, K: int, seed: int = 0) -> np.ndarray:

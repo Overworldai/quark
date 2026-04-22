@@ -1,7 +1,7 @@
 """Correctness tests for the cublasLt dispatch.
 
 Strategy: for each supported combo, run ``pcf.gemm`` twice — once with
-``POPCORN_DISABLE_CUBLAS=1`` to force the custom kernel, once without
+``QUARK_DISABLE_CUBLAS=1`` to force the custom kernel, once without
 to take the cuBLAS path — and compare via cos_sim. The custom kernel
 is exercised nightly by the full test suite, so using it as the
 reference keeps this file self-contained.
@@ -26,20 +26,20 @@ IS_METAL = sys.platform == "darwin"
 if IS_METAL:
     pytest.skip("cuBLAS is CUDA-only", allow_module_level=True)
 
-from popcorn.runtime.cuda import CudaRuntime
+from quark.runtime.cuda import CudaRuntime
 
 if not CudaRuntime.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
 
-from popcorn.runtime.cublas import CublasRuntime
+from quark.runtime.cublas import CublasRuntime
 
 if not CublasRuntime.is_available():
     pytest.skip("libcublasLt not available", allow_module_level=True)
 
-import popcorn.functional as pcf
-from popcorn.correctness import check_correctness
-from popcorn.ir import DType
-from popcorn.runtime.tensor import PopcornTensor
+import quark.functional as pcf
+from quark.correctness import check_correctness
+from quark.ir import DType
+from quark.runtime.tensor import QuarkTensor
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -74,12 +74,12 @@ def _rand_f32(*shape, seed=0, scale=0.05):
 
 
 def _make_ab(M, N, K, a_dtype, b_dtype):
-    """Build (A, B) PopcornTensors in the requested dtypes from the same
+    """Build (A, B) QuarkTensors in the requested dtypes from the same
     random seed pair, routed through e4m3 quantization when needed so
     both dispatch paths see identical inputs.
     """
-    a_f32 = PopcornTensor.from_numpy(_rand_f32(M, K, seed=1), dtype="f32")
-    b_f32 = PopcornTensor.from_numpy(_rand_f32(N, K, seed=2), dtype="f32")
+    a_f32 = QuarkTensor.from_numpy(_rand_f32(M, K, seed=1), dtype="f32")
+    b_f32 = QuarkTensor.from_numpy(_rand_f32(N, K, seed=2), dtype="f32")
     A = a_f32.astype(a_dtype)
     B = b_f32.astype(b_dtype)
     return A, B
@@ -87,7 +87,7 @@ def _make_ab(M, N, K, a_dtype, b_dtype):
 
 def _run(A, B, out_dtype, *, disable_cublas: bool):
     """Run ``pcf.gemm`` with cuBLAS toggled via env var."""
-    with _env("POPCORN_DISABLE_CUBLAS", "1" if disable_cublas else None):
+    with _env("QUARK_DISABLE_CUBLAS", "1" if disable_cublas else None):
         return pcf.gemm(A, B, out_dtype=out_dtype)
 
 
@@ -114,7 +114,7 @@ class TestCublasRuntime:
     def test_matmul_bf16_small(self):
         M, N, K = 16, 16, 32
         A, B = _make_ab(M, N, K, "bf16", "bf16")
-        out = PopcornTensor.empty(M, N, dtype="bf16")
+        out = QuarkTensor.empty(M, N, dtype="bf16")
         CublasRuntime.instance().matmul(
             a_ptr=A.data_ptr(),
             b_ptr=B.data_ptr(),
@@ -182,42 +182,42 @@ class TestDispatchGate:
     def test_env_disables_cublas(self, monkeypatch):
         A, B = _make_ab(16, 16, 32, "bf16", "bf16")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", "1"):
+        with _env("QUARK_DISABLE_CUBLAS", "1"):
             pcf.gemm(A, B, out_dtype="bf16")
-        assert calls == [], "POPCORN_DISABLE_CUBLAS=1 did not suppress cuBLAS dispatch"
+        assert calls == [], "QUARK_DISABLE_CUBLAS=1 did not suppress cuBLAS dispatch"
 
     def test_bf16_bf16_bf16_uses_cublas(self, monkeypatch):
         A, B = _make_ab(16, 16, 32, "bf16", "bf16")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="bf16")
         assert len(calls) == 1
 
     def test_e4m3_e4m3_bf16_uses_cublas(self, monkeypatch):
         A, B = _make_ab(32, 32, 64, "e4m3", "e4m3")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="bf16")
         assert len(calls) == 1
 
     def test_mixed_bf16_e4m3_falls_through(self, monkeypatch):
         A, B = _make_ab(32, 32, 64, "bf16", "e4m3")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="bf16", compute_dtype="e4m3")
         assert calls == [], "mixed bf16×e4m3 should not route to cuBLAS"
 
     def test_activation_falls_through(self, monkeypatch):
         A, B = _make_ab(32, 32, 64, "bf16", "bf16")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="bf16", activation="silu")
         assert calls == [], "fused activation should not route to cuBLAS"
 
     def test_b_shuffled_falls_through(self, monkeypatch):
         A, B = _make_ab(32, 32, 64, "bf16", "bf16")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             try:
                 pcf.gemm(A, B, out_dtype="bf16", b_shuffled=True)
             except Exception:
@@ -233,7 +233,7 @@ class TestDispatchGate:
         can't emit scalar fp8)."""
         A, B = _make_ab(32, 32, 64, "e4m3", "e4m3")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="e4m3")
         assert len(calls) == 1
 
@@ -242,8 +242,8 @@ class TestDispatchGate:
         rather than the custom kernel."""
         M, N, K = 32, 64, 64
         A, B = _make_ab(M, N, K, "bf16", "bf16")
-        bias = PopcornTensor.from_numpy(_rand_f32(N, seed=42), dtype="f32").astype("bf16")
+        bias = QuarkTensor.from_numpy(_rand_f32(N, seed=42), dtype="f32").astype("bf16")
         calls = _patch_record_cublas_calls(monkeypatch)
-        with _env("POPCORN_DISABLE_CUBLAS", None):
+        with _env("QUARK_DISABLE_CUBLAS", None):
             pcf.gemm(A, B, out_dtype="bf16", bias=bias)
         assert len(calls) == 1

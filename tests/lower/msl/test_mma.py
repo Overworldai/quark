@@ -1,7 +1,7 @@
 """Tests for MMA (simdgroup_matrix) MSL lowering."""
 
-from popcorn.ir import Builder, DType, MmaShape
-from popcorn.lower.msl import MslLowerer
+from quark.ir import Builder, DType, MmaShape
+from quark.lower.msl import MslLowerer
 from tests.lower.msl.conftest import METAL_CAPS_FAKE
 
 
@@ -146,12 +146,12 @@ class TestMmaBf16M8n8k8:
     as the hypothesized perf win over the m16n8k16 two-tile path."""
 
     def _m8n8k8_shape(self) -> MmaShape:
-        from popcorn.ir.mma_registry import _BF16_M8N8K8
+        from quark.ir.mma_registry import _BF16_M8N8K8
 
         return _BF16_M8N8K8.shape
 
     def test_emits_one_simdgroup_multiply_accumulate(self):
-        from popcorn.ir.mma_registry import _BF16_M8N8K8
+        from quark.ir.mma_registry import _BF16_M8N8K8
 
         shape = self._m8n8k8_shape()
         result = _lower_mma_module(

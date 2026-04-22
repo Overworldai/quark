@@ -3,7 +3,7 @@ and stride-from-shape helpers."""
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,
@@ -12,7 +12,7 @@ from popcorn.ir import (
     SharedRegion,
     Tensor,
 )
-from popcorn.ir.builder import _rowmajor_stride
+from quark.ir.builder import _rowmajor_stride
 
 
 class TestStrideHelper:

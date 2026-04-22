@@ -1,10 +1,10 @@
 """Unit tests for the RegisterTile / FragLayout machinery in
-``popcorn.ir.frag_tile``. Verifies:
+``quark.ir.frag_tile``. Verifies:
   * Forward lane→position + inverse position→lane_slot formulas agree.
   * Full coverage: iterating all 32 lanes × 2 elements visits every
     (row, col) in the 8×8 tile exactly once.
   * PTX C/D + A-frag per-lane formulas round-trip against the existing
-    offset tables in ``popcorn.kernels.gemm.mma_shapes``.
+    offset tables in ``quark.kernels.gemm.mma_shapes``.
 
 These tests don't require a device — they're pure closed-form / table
 checks. Runtime layout probes (which DO need a device) live in
@@ -13,7 +13,7 @@ checks. Runtime layout probes (which DO need a device) live in
 
 from __future__ import annotations
 
-from popcorn.ir.frag_tile import (
+from quark.ir.frag_tile import (
     FragLayout,
     RegisterTile,
     apple_lane_to_tile_position,
@@ -21,7 +21,7 @@ from popcorn.ir.frag_tile import (
     ptx_lane_to_a_frag_positions,
     ptx_lane_to_acc_position,
 )
-from popcorn.kernels.gemm.mma_shapes import _BF16_K16
+from quark.kernels.gemm.mma_shapes import _BF16_K16
 
 # ---------------------------------------------------------------------------
 # Apple simdgroup_matrix<T, 8, 8> lane map
@@ -198,7 +198,7 @@ def test_frag_layout_enum_distinct_values():
 # RegisterTile.map — fluent API hooking into Builder.frag_apply
 # ---------------------------------------------------------------------------
 
-from popcorn.ir import Builder, DType, FragApplyOp, MmaShape  # noqa: E402
+from quark.ir import Builder, DType, FragApplyOp, MmaShape  # noqa: E402
 
 _M16N8K16_BF16 = MmaShape(
     name="m16n8k16_bf16",
@@ -358,7 +358,7 @@ def test_reduce_along_cols_nt_greater_than_one_folds_first():
     """For ``tile_grid=(1, 3)`` (three n-tiles sharing the row), reduce
     should element-wise fold the three tiles into one before emitting
     the frag_reduce — not raise NotImplementedError as it used to."""
-    from popcorn.ir.op import FragReduceOp, VecBuildOp
+    from quark.ir.op import FragReduceOp, VecBuildOp
 
     b = Builder("test")
     tile = _live_multi_n_tile(b, nt=3)
@@ -377,7 +377,7 @@ def test_reduce_along_cols_nt_greater_than_one_folds_first():
 def test_reduce_along_cols_nt_one_unchanged():
     """Single-n-tile path is the common case — no fold, one FragReduceOp
     per m-tile, matching the pre-fix behavior."""
-    from popcorn.ir.op import FragReduceOp
+    from quark.ir.op import FragReduceOp
 
     b = Builder("test")
     tile, _ = _live_acc_tile(b)
@@ -391,7 +391,7 @@ def test_reduce_along_cols_nt_one_unchanged():
 def test_reduce_along_cols_mt_and_nt_both_greater_than_one():
     """``tile_grid=(2, 2)`` produces one fold + one reduce per m-tile
     row; returned flat tuple is (mt0_rc0, mt0_rc1, mt1_rc0, mt1_rc1)."""
-    from popcorn.ir.op import FragReduceOp
+    from quark.ir.op import FragReduceOp
 
     b = Builder("test")
     b.register_shape(_M16N8K16_BF16)

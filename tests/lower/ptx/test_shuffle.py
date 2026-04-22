@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from popcorn.ir import DType
+from quark.ir import DType
 from tests.lower.ptx.conftest import lower
 
 

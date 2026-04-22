@@ -8,7 +8,7 @@ rejects — vec Values need per-component movs.
 
 import re
 
-from popcorn.ir import DType
+from quark.ir import DType
 from tests.lower.ptx.conftest import body, lower
 
 

@@ -6,7 +6,7 @@ code until the AI coding assistant proposal's §4 (docstring
 expansion) lands alongside the IR migration's file decomposition.
 
 Rule: every public (non-underscore) class and top-level function
-under src/popcorn/ (or src/popcorn/) has a docstring. Private
+under src/quark/ (or src/quark/) has a docstring. Private
 helpers (leading underscore) are exempt.
 
 This is the minimum form of the rule. A stricter version would
@@ -22,7 +22,7 @@ import ast
 import sys
 from pathlib import Path
 
-SCAN_ROOTS = ("src/popcorn", "src/popcorn")
+SCAN_ROOTS = ("src/quark", "src/quark")
 
 
 def is_public(name: str) -> bool:

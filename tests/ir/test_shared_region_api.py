@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,
@@ -212,8 +212,8 @@ def test_global_tensor_subscript_load():
 def test_copy_from_emits_loads_and_stores():
     """Unified tile-load wraps ``emit_tile_load`` — emits per-thread
     scalar loads + stores for the scalar path."""
-    from popcorn.ir.op import LoadOp as _Load
-    from popcorn.ir.op import StoreOp as _Store
+    from quark.ir.op import LoadOp as _Load
+    from quark.ir.op import StoreOp as _Store
 
     b = _builder()
     g_x = _gtensor(b, "X", DType.F32, (64, 64))
@@ -241,7 +241,7 @@ def test_copy_from_rejects_3d_region():
 def test_copy_from_respects_stage_view():
     """``region.stage(i).copy_from(gmem_tile)`` is the pipeline-stage
     tile-load pattern."""
-    from popcorn.ir.op import StoreOp as _Store
+    from quark.ir.op import StoreOp as _Store
 
     b = _builder()
     g_x = _gtensor(b, "X", DType.F32, (64, 64))

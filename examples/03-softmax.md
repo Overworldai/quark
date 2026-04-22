@@ -11,7 +11,7 @@
 * `smem_tile.load_from(gmem, row=, col=, cast=)` — cooperative
   gmem→smem load. Dispatches cp.async (CUDA) or synchronous
   vec_load (Metal) automatically.
-* `pop.store_acc(...)` — unified epilogue helper (we'll see the
+* `qk.store_acc(...)` — unified epilogue helper (we'll see the
   MMA-driven form in step 4; here we use the scalar path).
 
 ## Shape
@@ -51,9 +51,9 @@ class SoftmaxConfig(KernelConfig):
 
 ```python
 import math
-import popcorn.lang as pop
-from popcorn.blocks import SmemTile, TensorDecl
-from popcorn.ir import DType
+import quark.lang as qk
+from quark.blocks import SmemTile, TensorDecl
+from quark.ir import DType
 
 
 _LOG2E = math.log2(math.e)
@@ -79,55 +79,55 @@ class Softmax(Kernel):
         bctx = self.bctx
         n_threads = c.n_warps * 32
         per_thread = s.K // n_threads
-        row = pop.block_idx("x")
+        row = qk.block_idx("x")
 
         # Stage A[row, :] in smem so we can pass over it multiple times.
         row_tile = SmemTile("row", s.dtype, (1, s.K))
         row_tile.load_from(g.A, row=row, col=0)
-        pop.barrier("block")
+        qk.barrier("block")
 
         # Scratch for the warp-level partials (max then sum).
-        scratch = pop.smem_alloc("scratch", s.dtype, (c.n_warps,))
+        scratch = qk.smem_alloc("scratch", s.dtype, (c.n_warps,))
 
         # ── Pass 1: row max ──
-        local_max = pop.const(s.dtype, -1e30)
-        with pop.for_range(0, per_thread, 1, iv_name="j") as (j, _):
+        local_max = qk.const(s.dtype, -1e30)
+        with qk.for_range(0, per_thread, 1, iv_name="j") as (j, _):
             col = bctx.tid * per_thread + j
-            local_max = pop.max(local_max, row_tile.smem[0, col])
+            local_max = qk.max(local_max, row_tile.smem[0, col])
 
-        warp_max = pop.subgroup_reduce(local_max, op="max")
-        with pop.if_(bctx.lane_id == 0) as _:
+        warp_max = qk.subgroup_reduce(local_max, op="max")
+        with qk.if_(bctx.lane_id == 0) as _:
             scratch[bctx.warp_id] = warp_max
-        pop.barrier("block")
+        qk.barrier("block")
 
         # Every thread reads the n_warps values from smem and reduces.
-        row_max = pop.const(s.dtype, -1e30)
-        with pop.for_range(0, c.n_warps, 1, iv_name="w") as (w, _):
-            row_max = pop.max(row_max, scratch[w])
+        row_max = qk.const(s.dtype, -1e30)
+        with qk.for_range(0, c.n_warps, 1, iv_name="w") as (w, _):
+            row_max = qk.max(row_max, scratch[w])
 
         # ── Pass 2: exp(x - max) and sum ──
-        log2e = pop.const(s.dtype, _LOG2E)
-        local_sum = pop.const(s.dtype, 0.0)
-        with pop.for_range(0, per_thread, 1, iv_name="j") as (j, _):
+        log2e = qk.const(s.dtype, _LOG2E)
+        local_sum = qk.const(s.dtype, 0.0)
+        with qk.for_range(0, per_thread, 1, iv_name="j") as (j, _):
             col = bctx.tid * per_thread + j
             # exp(x) = exp2(x * log2(e)); ex2_approx is fast-math.
-            e = pop.ex2_approx((row_tile.smem[0, col] - row_max) * log2e)
+            e = qk.ex2_approx((row_tile.smem[0, col] - row_max) * log2e)
             row_tile.smem[0, col] = e     # overwrite smem with exp values
             local_sum = local_sum + e
 
-        warp_sum = pop.subgroup_reduce(local_sum, op="add")
-        with pop.if_(bctx.lane_id == 0) as _:
+        warp_sum = qk.subgroup_reduce(local_sum, op="add")
+        with qk.if_(bctx.lane_id == 0) as _:
             scratch[bctx.warp_id] = warp_sum
-        pop.barrier("block")
+        qk.barrier("block")
 
-        row_sum = pop.const(s.dtype, 0.0)
-        with pop.for_range(0, c.n_warps, 1, iv_name="w") as (w, _):
+        row_sum = qk.const(s.dtype, 0.0)
+        with qk.for_range(0, c.n_warps, 1, iv_name="w") as (w, _):
             row_sum = row_sum + scratch[w]
 
-        inv_sum = pop.rcp_approx(row_sum)
+        inv_sum = qk.rcp_approx(row_sum)
 
         # ── Pass 3: normalize and store ──
-        with pop.for_range(0, per_thread, 1, iv_name="j") as (j, _):
+        with qk.for_range(0, per_thread, 1, iv_name="j") as (j, _):
             col = bctx.tid * per_thread + j
             g.Out[row, col] = row_tile.smem[0, col] * inv_sum
 ```
@@ -143,11 +143,11 @@ class Softmax(Kernel):
   `simdgroup_load`/`vec_load` (Metal), spreads the work across the
   block's threads, handles the ragged tail. Barrier after is your
   responsibility.
-* **`pop.ex2_approx(x)` / `pop.rcp_approx(x)`** — fast-math
+* **`qk.ex2_approx(x)` / `qk.rcp_approx(x)`** — fast-math
   approximations. Lower to `ex2.approx.f32` on PTX and `fast::exp2`
   / `1.0f / x` on MSL.
-* **`pop.max(a, b)`** — two-arg scalar max. (There's also
-  `pop.max(frag, dim=)` sugar we'll use in the attention example
+* **`qk.max(a, b)`** — two-arg scalar max. (There's also
+  `qk.max(frag, dim=)` sugar we'll use in the attention example
   that routes to `frag_reduce` over an MMA fragment.)
 * **`row_tile.smem[0, col] = ...`** — we overwrite the smem tile
   with the exp values in-place to save one more barrier + register
@@ -162,8 +162,8 @@ class Softmax(Kernel):
 SmemTile(name, dtype, shape, pad=)           # DSL primitive
 smem_tile.load_from(gmem, row=, col=, cast=) # cooperative gmem→smem
 smem_tile.smem[row, col]                     # subscript R/W
-pop.ex2_approx(x)  /  pop.rcp_approx(x)
-pop.max(a, b) / pop.min(a, b)                # scalar; dim= sugar later
+qk.ex2_approx(x)  /  qk.rcp_approx(x)
+qk.max(a, b) / qk.min(a, b)                # scalar; dim= sugar later
 ```
 
 Next: the first kernel that uses the tensor cores. We drop the

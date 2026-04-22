@@ -8,7 +8,7 @@
 
 End-to-end pipeline in one script:
   1. encode seed image/video through TAEHV → latent seed
-  2. download model → load into popcorn nn.Module → capture CUDA graph
+  2. download model → load into quark nn.Module → capture CUDA graph
   3. replay per frame → collect latents
   4. decode latents through TAEHV → pixel frames
   5. write HEVC/mp4 with ``hvc1`` tag (Discord-playable)
@@ -17,7 +17,7 @@ End-to-end pipeline in one script:
   *.mp4 / *.mov / *.mkv  →  decode + ffmpeg libx265 + hvc1 tag
   *.npy                    →  save raw [T, C, H, W] f32 latents (skip decode)
 
-On CUDA: uses PopcornTensor throughout the denoise loop, no torch
+On CUDA: uses QuarkTensor throughout the denoise loop, no torch
 dependency in the hot path. torch is pulled in only for the TAEHV
 round-trip (encode seed / decode output).
 
@@ -43,46 +43,46 @@ _LATENT_FPS = _PIXEL_FPS // _TEMPORAL_COMPRESS  # 15 latent frames/s
 
 def _sync():
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         PT.synchronize()
     else:
-        from popcorn.runtime.cuda import CudaRuntime
+        from quark.runtime.cuda import CudaRuntime
 
         CudaRuntime.instance().stream_synchronize(0)
 
 
 def _randn(*shape, dtype="bf16"):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32}
         return PT.astype(PT.randn(*shape), _dt.get(dtype, PT.bfloat16))
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.tensor import QuarkTensor
 
-    return PopcornTensor.randn(*shape, dtype=dtype)
+    return QuarkTensor.randn(*shape, dtype=dtype)
 
 
 def _zeros(*shape, dtype="bf16"):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
         return PT.zeros(*shape, dtype=_dt.get(dtype, PT.bfloat16))
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.tensor import QuarkTensor
 
-    return PopcornTensor.zeros(*shape, dtype=dtype)
+    return QuarkTensor.zeros(*shape, dtype=dtype)
 
 
 def _tensor(data, dtype="f32"):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         _dt = {"bf16": PT.bfloat16, "f32": PT.float32, "s32": PT.int32}
         return PT.tensor(data, dtype=_dt.get(dtype, PT.float32))
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.tensor import QuarkTensor
 
-    return PopcornTensor.from_list(data, dtype=dtype)
+    return QuarkTensor.from_list(data, dtype=dtype)
 
 
 def _make_ctrl_input(model):
@@ -127,10 +127,10 @@ def _make_ctrl_input(model):
 
         return dev, fill
 
-    from popcorn.runtime.cuda import CudaRuntime
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.cuda import CudaRuntime
+    from quark.runtime.tensor import QuarkTensor
 
-    dev = PopcornTensor.zeros(*shape, dtype=dtype)
+    dev = QuarkTensor.zeros(*shape, dtype=dtype)
     host = np.zeros(shape, dtype=np.float32)
     # Pre-allocate the packed-bits staging buffer once; per-call is an
     # in-place f32→target cast + a single memcpy_htod.
@@ -164,11 +164,11 @@ def _precompute_noise(n_frames: int, elems_per_frame: int, dtype: str = "bf16") 
     device tensors** — one per frame.
 
     Returns a list rather than a single ``[n_frames, elems]`` tensor
-    because PopcornTensor slicing is not free today (contiguous-offset
+    because QuarkTensor slicing is not free today (contiguous-offset
     views materialize via copy_strided). Separate tensors let the hot
     path use ``noise_pool[fi]`` directly without any slice materialization.
 
-    ``PopcornTensor.randn`` / ``PT.randn`` use scalar Python RNG loops
+    ``QuarkTensor.randn`` / ``PT.randn`` use scalar Python RNG loops
     (``random.gauss`` per element) that cost ~1µs/value — for a 360p
     latent that's ~60 ms of pure-Python loop *per frame*. Doing the
     whole bulk on host with numpy keeps the host cost constant.
@@ -191,16 +191,16 @@ def _precompute_noise(n_frames: int, elems_per_frame: int, dtype: str = "bf16") 
             return [mx.array(f16[fi]).reshape(1, elems_per_frame) for fi in range(n_frames)]
         return [mx.array(arr[fi]).reshape(1, elems_per_frame) for fi in range(n_frames)]
 
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.tensor import QuarkTensor
 
     return [
-        PopcornTensor.from_numpy(arr[fi : fi + 1], dtype=dtype) for fi in range(n_frames)
+        QuarkTensor.from_numpy(arr[fi : fi + 1], dtype=dtype) for fi in range(n_frames)
     ]
 
 
 def _astype(x, dtype: str):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
         return PT.astype(x, _dt.get(dtype, PT.bfloat16))
@@ -209,17 +209,17 @@ def _astype(x, dtype: str):
 
 def _cat(tensors, dim=0):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         return PT.cat(tensors, dim=dim)
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.tensor import QuarkTensor
 
-    return PopcornTensor.cat(tensors, dim=dim)
+    return QuarkTensor.cat(tensors, dim=dim)
 
 
 def _reshape(x, *shape):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         return PT.reshape(x, shape)
     return x.reshape(*shape)
@@ -227,7 +227,7 @@ def _reshape(x, *shape):
 
 def _permute(x, dims):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         return PT.permute(x, dims)
     return x.permute(*dims)
@@ -235,12 +235,12 @@ def _permute(x, dims):
 
 def _expand(x, shape):
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         return PT.expand(x, shape)
-    # PopcornTensor doesn't have expand yet — use broadcast via reshape + cat.
+    # QuarkTensor doesn't have expand yet — use broadcast via reshape + cat.
     # For the [C, 1, 1] → [C, ph, pw] case, just repeat manually.
-    raise NotImplementedError("_expand: not yet on PopcornTensor — use reshape + tile")
+    raise NotImplementedError("_expand: not yet on QuarkTensor — use reshape + tile")
 
 
 def _to_numpy_f32(x):
@@ -248,14 +248,14 @@ def _to_numpy_f32(x):
     import numpy as np
 
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         if PT._is_mx(x):
             import mlx.core as mx
 
             return np.array(x.astype(mx.float32))
     if hasattr(x, "to_numpy"):
-        # PopcornTensor path: cast to f32, then to_numpy.
+        # QuarkTensor path: cast to f32, then to_numpy.
         t = x.astype("f32") if x.dtype != "f32" else x
         return t.to_numpy()
     import torch
@@ -266,7 +266,7 @@ def _to_numpy_f32(x):
 def _from_numpy(arr, dtype="bf16"):
     """numpy → device tensor."""
     if _IS_METAL:
-        from popcorn.backend import PT
+        from quark.backend import PT
 
         import mlx.core as mx
         import numpy as np
@@ -275,9 +275,9 @@ def _from_numpy(arr, dtype="bf16"):
             u16 = (arr.view(np.uint32) >> 16).astype(np.uint16)
             return mx.array(u16).view(mx.bfloat16)
         return mx.array(arr)
-    from popcorn.runtime.tensor import PopcornTensor
+    from quark.runtime.tensor import QuarkTensor
 
-    return PopcornTensor.from_numpy(arr, dtype=dtype)
+    return QuarkTensor.from_numpy(arr, dtype=dtype)
 
 
 # ---------------------------------------------------------------
@@ -286,7 +286,7 @@ def _from_numpy(arr, dtype="bf16"):
 
 
 def remap_state_dict(raw_sd: dict, cfg) -> dict:
-    from popcorn.models.waypoint_15 import Waypoint15Config
+    from quark.models.waypoint_15 import Waypoint15Config
 
     sd: dict = {}
     d = cfg.d_model
@@ -306,7 +306,7 @@ def remap_state_dict(raw_sd: dict, cfg) -> dict:
         # Tile [C] → [C*ph*pw] by repeating each element ph*pw times.
         # On Metal we can use mx.tile; on CUDA do it via reshape + cat.
         if _IS_METAL:
-            from popcorn.backend import PT
+            from quark.backend import PT
 
             if PT._is_mx(b):
                 import mlx.core as mx
@@ -315,7 +315,7 @@ def remap_state_dict(raw_sd: dict, cfg) -> dict:
             else:
                 b = _reshape(_expand(b.reshape(C, 1, 1), (C, ph, pw)), -1)
         else:
-            # PopcornTensor: repeat via explicit construction.
+            # QuarkTensor: repeat via explicit construction.
             import struct as _struct
 
             b_f32 = b.astype("f32")
@@ -323,9 +323,9 @@ def remap_state_dict(raw_sd: dict, cfg) -> dict:
             tiled = []
             for v in b_vals:
                 tiled.extend([v] * (ph * pw))
-            from popcorn.runtime.tensor import PopcornTensor
+            from quark.runtime.tensor import QuarkTensor
 
-            b = PopcornTensor.from_list(tiled, dtype="f32")
+            b = QuarkTensor.from_list(tiled, dtype="f32")
             b = b.astype(raw_sd["unpatchify.bias"].dtype if hasattr(raw_sd["unpatchify.bias"], "dtype") else "bf16")
     sd["unpatchify.bias"] = b
 
@@ -615,7 +615,7 @@ def _make_config(preset: str):
     720p: input 1280×720 → AE resizes to 1024×512 → latent 64×32 →
           grid 32×16 = 512 tokens/frame
     """
-    from popcorn.models.waypoint_15 import Waypoint15Config
+    from quark.models.waypoint_15 import Waypoint15Config
 
     presets = {
         "360p": (8, 16),   # 128 tokens, pixel input 640×360
@@ -655,7 +655,7 @@ def _make_config(preset: str):
 def main():
     import numpy as np
 
-    from popcorn.models.waypoint_15 import CtrlInput, Waypoint15
+    from quark.models.waypoint_15 import CtrlInput, Waypoint15
 
     parser = argparse.ArgumentParser(description="Generate video with waypoint-1.5")
     parser.add_argument("--repo", default="Overworld/Waypoint-1.5-1B")
@@ -722,7 +722,7 @@ def main():
     # ── Load model ──
     print(f"loading model from {args.repo} …")
     t0 = time.perf_counter()
-    from popcorn.nn.io import load_from_hub
+    from quark.nn.io import load_from_hub
 
     repo_suffix = "-360P" if args.preset == "360p" else ""
     raw_sd = load_from_hub(args.repo + repo_suffix, dtype="bf16")
@@ -734,7 +734,7 @@ def main():
 
     # ── Autotune ──
     print("autotuning …")
-    import popcorn
+    import quark
 
     latent = _randn(1, C * H * W, dtype=half_dt)
     sigmas = cfg.scheduler_sigmas
@@ -745,7 +745,7 @@ def main():
     if ctrl_fill is not None:
         ctrl_fill(CtrlInput())  # zero-filled default for autotune + seed
     autotune_ctrl_emb = model.encode_ctrl(ctrl_dev)
-    with popcorn.max_autotune():
+    with quark.max_autotune():
         model(latent, sigma_idx=0, frame_t=frame_t, ctrl_emb=autotune_ctrl_emb)
         model(latent, sigma_idx=0, frame_t=frame_t, ctrl_emb=autotune_ctrl_emb)
         _sync()
@@ -817,8 +817,8 @@ def main():
 
     # ── Profile pass ──
     if args.profile:
-        import popcorn.nn as _nn
-        from popcorn.nn import Module as _M
+        import quark.nn as _nn
+        from quark.nn import Module as _M
 
         print("\nprofiling one frame …")
 
@@ -871,7 +871,7 @@ def main():
 
     if _IS_METAL or args.no_graph:
         # Unrolled host loop — one python dispatch per step.
-        import popcorn.nn as _nn
+        import quark.nn as _nn
 
         dsig_tensors = [
             _tensor([float(sigmas[si + 1] - sigmas[si])], dtype="f32")
@@ -906,7 +906,7 @@ def main():
         # ``gen_frame(...)`` auto-copies the input tensors into the
         # stable capture buffers and returns a cloned output. No
         # manual copy_from / replay bookkeeping on the host loop.
-        from popcorn.models.waypoint_15 import GenerateFrame
+        from quark.models.waypoint_15 import GenerateFrame
 
         gen_frame = GenerateFrame(model)
 

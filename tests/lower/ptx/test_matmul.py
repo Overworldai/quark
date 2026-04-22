@@ -25,7 +25,7 @@ import re
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,
@@ -33,7 +33,7 @@ from popcorn.ir import (
     MmaShape,
     validate_module,
 )
-from popcorn.lower.ptx import PtxLowerer
+from quark.lower.ptx import PtxLowerer
 
 # ---------------------------------------------------------------------------
 # Shape registry fixtures
@@ -569,7 +569,7 @@ class TestMma:
         """m16n8k8 bf16 — the smaller-K bf16 MMA added in MMA_SHAPES M2.
         Same A-reg layout as e4m3 k=16 (2 regs) but with bf16's 2-elem-
         per-b32 packing."""
-        from popcorn.ir.mma_registry import _BF16_M16N8K8
+        from quark.ir.mma_registry import _BF16_M16N8K8
 
         b = _builder_with(_BF16_M16N8K8.shape)
         A = b.smem_alloc("A", DType.BF16, (16, 8))

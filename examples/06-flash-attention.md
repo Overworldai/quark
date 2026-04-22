@@ -11,7 +11,7 @@ and the `MmaBody(a=, b=, acc=)` Triton-style call form.
 
 ## New ideas
 
-* `pop.q_register_load(g_q, smem=, q_row=, warp_id=, MT=, Dh=)` —
+* `qk.q_register_load(g_q, smem=, q_row=, warp_id=, MT=, Dh=)` —
   cp.async Q → per-warp smem → register A-fragments. Returns
   `q_frags[mt][kk_step]` — a nested list of MMA-ready Values.
 * `Stage.staged(n, **SmemTile.spec(...))` — factory for `n` stages
@@ -26,7 +26,7 @@ and the `MmaBody(a=, b=, acc=)` Triton-style call form.
 * `OnlineSoftmax` — the one L1 Block specific to attention. Returns
   the rescaled O, new m, new l, and the P A-fragments ready to feed
   GEMM2.
-* `pop.store_acc(..., per_warp=True, row_scale=l)` — attention-style
+* `qk.store_acc(..., per_warp=True, row_scale=l)` — attention-style
   epilogue: `O /= l`, cast, stage through a per-warp smem slice,
   cooperative vec_store.
 
@@ -107,12 +107,12 @@ class AttnConfig(KernelConfig):
 ```python
 import math
 
-import popcorn.lang as pop
-from popcorn.blocks import (
+import quark.lang as qk
+from quark.blocks import (
     Accumulators, Carry, IterCtx, MmaBody, PipelineBody, SmemTile, Stage, TensorDecl,
 )
-from popcorn.ir import DType
-from popcorn.kernels.attn.online_softmax_block import OnlineSoftmax
+from quark.ir import DType
+from quark.kernels.attn.online_softmax_block import OnlineSoftmax
 
 
 @kernel("attn", spec=AttnSpec, config=AttnConfig)
@@ -168,8 +168,8 @@ class Attn(Kernel):
         # for the whole KV loop. The smem is dead after this — the layout pass
         # can alias its storage with O_stage.
         lcs = mma_cfg.lane_col_step
-        q_smem = pop.smem_alloc("Q_smem", s.a_dtype, (BlockQRows, Dh), pad=c.KvPad)
-        q_frags = pop.q_register_load(
+        q_smem = qk.smem_alloc("Q_smem", s.a_dtype, (BlockQRows, Dh), pad=c.KvPad)
+        q_frags = qk.q_register_load(
             g.Q, smem=q_smem, q_row=q_row_warp, warp_id=warp_id,
             MT=MTiles, Dh=Dh, kv_pad=c.KvPad,
         )
@@ -233,7 +233,7 @@ class Attn(Kernel):
         # was populated by the pipeline. Staging smem is auto-allocated
         # (AUTO lifetime — the smem-layout pass aliases it over the now-dead
         # Q_smem); `warp_id` defaults to bctx.warp_id.
-        pop.store_acc(
+        qk.store_acc(
             g.output, o_acc,
             row=q_row_warp, col=0,
             cast=s.a_dtype,
@@ -244,7 +244,7 @@ class Attn(Kernel):
 
 ## Things to notice
 
-* **`pop.q_register_load(...)`** — issues cp.async, waits, barriers,
+* **`qk.q_register_load(...)`** — issues cp.async, waits, barriers,
   then extracts the MMA A-fragments into a nested
   `list[list[Value]]`. The smem allocation you pass in is yours —
   the lifetime pass will alias it with the output staging smem
@@ -271,7 +271,7 @@ class Attn(Kernel):
   to stay in registers throughout). Callable:
   `softmax(s_acc_vals=, o_vals=, m_vals=, l_vals=)` returns the
   updated tuple + P A-fragments for GEMM2.
-* **`pop.store_acc(..., per_warp=True, row_scale=final.l)`** —
+* **`qk.store_acc(..., per_warp=True, row_scale=final.l)`** —
   attention epilogue. `per_warp=True` stages the block's output into
   a per-warp slice of smem and stores warp-local row ranges with the
   warp's 32 lanes. `row_scale=final.l` applies `O /= l` during the
@@ -281,7 +281,7 @@ class Attn(Kernel):
 ## What we skipped
 
 The kernel above is close to production. The real
-`src/popcorn/kernels/attn/kernel.py` adds:
+`src/quark/kernels/attn/kernel.py` adds:
 
 * `consume_tail=` for the `n_stages=2` last-iter skip.
 * `is_valid_for(caps)` filtering.
@@ -297,14 +297,14 @@ weight.
 
 ```python
 # New from step 05:
-from popcorn.blocks import Carry, Stage, SmemTile, SmemTileSpec
-import popcorn.lang as pop
+from quark.blocks import Carry, Stage, SmemTile, SmemTileSpec
+import quark.lang as qk
 
-q_frags = pop.q_register_load(g_q, smem=, q_row=, warp_id=, MT=, Dh=, kv_pad=)
+q_frags = qk.q_register_load(g_q, smem=, q_row=, warp_id=, MT=, Dh=, kv_pad=)
 stages = Stage.staged(n, **SmemTile.spec(dtype, shape, pad=, lane_col_step=))
 carry = Carry(o=..., m=(count, init, dtype), l=(count, init, dtype))
 s_vals = mma(a=q_frags, b=stage.k, acc=s_acc.init())      # Triton-style
-pop.store_acc(..., per_warp=True, row_scale=final.l)
+qk.store_acc(..., per_warp=True, row_scale=final.l)
 ```
 
 ---
@@ -313,7 +313,7 @@ That's the full progression — from a 10-line vector add to a
 production flash-attention kernel, with each abstraction introduced
 only when the previous one started creaking. The same primitives
 cover GEMM, MoE, KV-cache append, and the various attention
-variants. Every registered kernel in `src/popcorn/kernels/` is built
+variants. Every registered kernel in `src/quark/kernels/` is built
 from this toolkit.
 
 If you're about to write a new kernel, start from

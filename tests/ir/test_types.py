@@ -1,9 +1,9 @@
-"""Tests for popcorn.ir.types: DType, MemSpace, ValueShape, Param types."""
+"""Tests for quark.ir.types: DType, MemSpace, ValueShape, Param types."""
 
 import pytest
 
-from popcorn.ir import BufferType, DType, MemSpace, ScalarType, ValueShape
-from popcorn.ir.types import _VALID_VECTOR_WIDTHS
+from quark.ir import BufferType, DType, MemSpace, ScalarType, ValueShape
+from quark.ir.types import _VALID_VECTOR_WIDTHS
 
 
 class TestDType:

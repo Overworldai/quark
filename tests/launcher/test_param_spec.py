@@ -1,17 +1,17 @@
-"""Tests for popcorn.launcher.param_spec — pure-python, no CUDA needed."""
+"""Tests for quark.launcher.param_spec — pure-python, no CUDA needed."""
 
 import struct
 
 import pytest
 
-from popcorn.ir import (
+from quark.ir import (
     BufferType,
     Builder,
     DType,
     ParamAttrs,
     ScalarType,
 )
-from popcorn.launcher import ParamSpec, ProgramFootprint, ScalarSpec
+from quark.launcher import ParamSpec, ProgramFootprint, ScalarSpec
 
 
 def _function_with_params(specs):

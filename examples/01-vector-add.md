@@ -6,10 +6,10 @@
 
 ## New ideas
 
-* `@kernel` decorator — wires the kernel into popcorn's registry and
+* `@kernel` decorator — wires the kernel into quark's registry and
   binds `self.bctx` / `self.g` / `self.m_base` before `build()` runs.
 * `TensorDecl` manifest — the kernel's gmem parameter list.
-* `build(self)` body — authors IR via `popcorn.lang as pop`.
+* `build(self)` body — authors IR via `quark.lang as qk`.
 * 1D grid + per-thread element loop.
 
 ## Shape
@@ -30,8 +30,8 @@ block0:       ^^^^^^^^^^        (BM=256 per block)
 ```python
 # spec.py
 from dataclasses import dataclass
-from popcorn.ir import DType
-from popcorn.kernels.base import KernelSpec
+from quark.ir import DType
+from quark.kernels.base import KernelSpec
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ class VecAddSpec(KernelSpec):
 
 # config.py
 from dataclasses import dataclass
-from popcorn.kernels.base import KernelConfig
+from quark.kernels.base import KernelConfig
 
 
 @dataclass(frozen=True)
@@ -61,11 +61,11 @@ class VecAddConfig(KernelConfig):
 # kernel.py
 from typing import ClassVar
 
-import popcorn.lang as pop
-from popcorn.blocks import TensorDecl
-from popcorn.ir import DType
-from popcorn.kernels.base import Kernel
-from popcorn.kernels.decorator import kernel
+import quark.lang as qk
+from quark.blocks import TensorDecl
+from quark.ir import DType
+from quark.kernels.base import Kernel
+from quark.kernels.decorator import kernel
 
 
 @kernel("vec_add", spec=VecAddSpec, config=VecAddConfig)
@@ -97,11 +97,11 @@ class VecAdd(Kernel):
         bctx = self.bctx
 
         # Per-block starting offset in the flat N-length vector.
-        block_base = pop.block_idx("x") * c.BM
+        block_base = qk.block_idx("x") * c.BM
         n_threads = c.n_warps * 32
         per_thread = c.BM // n_threads     # each thread handles this many elements
 
-        with pop.for_range(0, per_thread, 1, iv_name="i") as (i, _):
+        with qk.for_range(0, per_thread, 1, iv_name="i") as (i, _):
             # Flat index this thread touches on this loop iteration.
             local_idx = bctx.tid * per_thread + i
             gmem_idx = block_base + local_idx
@@ -118,30 +118,30 @@ That's it. `@kernel` handles everything else — the decorator:
 * Emits the function signature + parameter declarations from
   `TENSORS`.
 * Calls `build()`, then closes the IR module.
-* Registers the kernel in `popcorn.kernels.registry` so
+* Registers the kernel in `quark.kernels.registry` so
   `pop functional.vec_add(a, b)` can find it (once the name
-  conflict-free helpers are added in `popcorn.functional`).
+  conflict-free helpers are added in `quark.functional`).
 
 ## Things to notice
 
-* **`pop.for_range(0, per_thread, 1)`** — Python ints are
+* **`qk.for_range(0, per_thread, 1)`** — Python ints are
   auto-promoted to U32 constants. The loop's body runs per IR
   iteration; the induction variable `i` is a `Value` you use in
   expressions.
 * **`g.A[gmem_idx]`** — subscripting a `GlobalTensor` emits a load
   of the element; `g.Out[idx] = value` emits a store.
 * **`a + b`** — `Value` has the arithmetic operators overloaded;
-  equivalent to `pop.add(a, b)`.
+  equivalent to `qk.add(a, b)`.
 * **No smem, no barriers, no MMA.** Vector add is embarrassingly
   parallel — every thread works independently.
 
 ## Authoring surface recap
 
 ```python
-import popcorn.lang as pop                  # free-function IR ops
-from popcorn.blocks import TensorDecl       # DSL primitives
-from popcorn.kernels.base import Kernel
-from popcorn.kernels.decorator import kernel
+import quark.lang as qk                  # free-function IR ops
+from quark.blocks import TensorDecl       # DSL primitives
+from quark.kernels.base import Kernel
+from quark.kernels.decorator import kernel
 ```
 
 Next up: we introduce shared memory so threads within a block can
