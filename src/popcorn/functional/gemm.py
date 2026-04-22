@@ -10,10 +10,25 @@ Returns C: [M, N] in ``out_dtype`` (defaults to A's dtype).
 
 from __future__ import annotations
 
+import os
+import sys
+
 from popcorn.functional._dispatch import call_with_bindings, make_autotune
 from popcorn.kernels import get
 
 _GemmCls = None
+_IS_METAL = sys.platform == "darwin"
+
+# Dtype combos where ``cublasLtMatmul`` gives us scale-free row-major
+# A × B^T directly. Anything else (mixed bf16×e4m3, e4m3 output, scales,
+# fused activations, pre-shuffled B) stays on the custom kernel.
+_CUBLAS_COMBOS: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "bf16", "f32"),
+        ("e4m3", "e4m3", "bf16"),
+    }
+)
 
 
 def _cls():
@@ -22,6 +37,84 @@ def _cls():
     if _GemmCls is None:
         _GemmCls = get("gemm")
     return _GemmCls
+
+
+def _dtype_str(t) -> str:
+    dt = t.dtype
+    return dt if isinstance(dt, str) else str(dt)
+
+
+def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias, out):
+    """Short-circuit to ``cublasLtMatmul`` when the combo supports it.
+
+    Returns the output tensor on a hit, or ``None`` to tell the caller
+    to fall through to the custom-kernel path. Kept deliberately
+    conservative: anything the gate can't prove cuBLAS handles in one
+    call (scales, fused epilogues, weight pre-shuffle, non-standard
+    dtypes) falls back immediately.
+    """
+    if _IS_METAL:
+        return None
+    if os.environ.get("POPCORN_DISABLE_CUBLAS") == "1":
+        return None
+    if b_shuffled or activation is not None or bias is not None:
+        return None
+
+    from popcorn.runtime.tensor import PopcornTensor
+
+    if not isinstance(A, PopcornTensor) or not isinstance(B, PopcornTensor):
+        return None
+    if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
+        return None
+
+    a_dt = _dtype_str(A)
+    b_dt = _dtype_str(B)
+
+    # compute_dtype: custom kernel uses it to down-cast A during the
+    # smem load (bf16 → e4m3 for mixed-dtype fp8 MMA). cuBLAS has no
+    # equivalent zero-cost path without scales, so any explicit
+    # compute_dtype that differs from a_dt forces fallback.
+    if compute_dtype is not None and str(compute_dtype) != a_dt:
+        return None
+
+    if out is not None:
+        c_dt = _dtype_str(out)
+    else:
+        c_dt = str(out_dtype) if out_dtype is not None else a_dt
+
+    if (a_dt, b_dt, c_dt) not in _CUBLAS_COMBOS:
+        return None
+
+    from popcorn.runtime.cublas import CublasRuntime
+
+    if not CublasRuntime.is_available():
+        return None
+
+    M = int(A.shape[0])
+    K = int(A.shape[1])
+    N = int(B.shape[0])
+
+    if out is None:
+        out = PopcornTensor.empty(M, N, dtype=c_dt)
+    elif tuple(out.shape) != (M, N):
+        return None
+
+    from popcorn.graph import active_stream
+
+    stream = active_stream() or 0
+    CublasRuntime.instance().matmul(
+        a_ptr=A.data_ptr(),
+        b_ptr=B.data_ptr(),
+        c_ptr=out.data_ptr(),
+        M=M,
+        N=N,
+        K=K,
+        a_dtype=a_dt,
+        b_dtype=b_dt,
+        c_dtype=c_dt,
+        stream=stream,
+    )
+    return out
 
 
 def _gemm_impl(
@@ -35,6 +128,19 @@ def _gemm_impl(
     bias=None,
     out=None,
 ):
+    cublas_out = _try_cublas(
+        A,
+        B,
+        out_dtype=out_dtype,
+        compute_dtype=compute_dtype,
+        b_shuffled=b_shuffled,
+        activation=activation,
+        bias=bias,
+        out=out,
+    )
+    if cublas_out is not None:
+        return cublas_out
+
     cls = _cls()
     has_bias = bias is not None
     spec = cls.spec_from_tensors(

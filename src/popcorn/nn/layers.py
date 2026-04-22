@@ -156,17 +156,16 @@ class Linear(Module):
         a_dtype = x.dtype if isinstance(x.dtype, str) else str(x.dtype)
         is_fp8_weight = b_dtype in ("e4m3", "e5m2")
 
-        if is_fp8_weight:
-            if a_dtype not in ("f16", "bf16"):
-                raise TypeError(
-                    f"Linear: fp8 weight expects f16/bf16 activation, got {a_dtype!r}. "
-                    f"Insert a Cast upstream — Linear no longer casts silently."
-                )
-        elif a_dtype != b_dtype:
+        # Linear accepts any half / fp8 activation. When a_dtype != b_dtype
+        # the GEMM kernel does the cast during smem load (``compute_dtype
+        # = b_dtype`` is set below). This keeps the "no silent cast" spirit
+        # — the cast is explicit at the kernel boundary — while letting
+        # the fp8 inference path carry e4m3 intermediaries end-to-end.
+        _OK_ACTIVATION = ("f16", "bf16", "e4m3", "e5m2")
+        if a_dtype not in _OK_ACTIVATION:
             raise TypeError(
-                f"Linear: activation dtype {a_dtype!r} != weight dtype {b_dtype!r}. "
-                f"Fix the upstream module's out_dtype or insert a Cast — "
-                f"Linear no longer casts silently."
+                f"Linear: activation dtype {a_dtype!r} not in {_OK_ACTIVATION}. "
+                f"Insert a Cast upstream."
             )
 
         # Pad M when too small for the GEMM kernel's minimum tile.
@@ -413,10 +412,26 @@ class EulerStep(Module):
 
 
 class MLP(Module):
-    """Two-layer MLP with fused SiLU on fc1: ``fc2(silu(fc1(x)))``."""
+    """Two-layer MLP with fused SiLU on fc1: ``fc2(silu(fc1(x)))``.
 
-    def __init__(self, d_in: int, d_mid: int, d_out: int, out_dtype: str = "f16"):
-        self.fc1 = Linear(d_in, d_mid, out_dtype=out_dtype)
+    ``hidden_out_dtype``: optional override for fc1's output dtype, so
+    the mid activation can stay in e4m3 when both weights are fp8. When
+    ``None``, falls back to ``out_dtype`` (original behavior). fc2's
+    output dtype is always ``out_dtype`` so the MLP's return value
+    matches the residual stream.
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        d_mid: int,
+        d_out: int,
+        out_dtype: str = "f16",
+        *,
+        hidden_out_dtype: str | None = None,
+    ):
+        mid_dt = hidden_out_dtype if hidden_out_dtype is not None else out_dtype
+        self.fc1 = Linear(d_in, d_mid, out_dtype=mid_dt)
         self.fc2 = Linear(d_mid, d_out, out_dtype=out_dtype)
 
     def forward(self, x):

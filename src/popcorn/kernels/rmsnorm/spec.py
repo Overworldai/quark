@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from popcorn.ir import DType
 from popcorn.kernels.base import KernelSpec
 
-_VALID_DTYPES = frozenset({DType.BF16, DType.F16, DType.F32})
+_VALID_DTYPES = frozenset({DType.BF16, DType.F16, DType.F32, DType.E4M3, DType.E5M2})
 
 
 @dataclass(frozen=True)

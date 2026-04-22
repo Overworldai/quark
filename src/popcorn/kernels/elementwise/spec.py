@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from popcorn.ir import DType
 from popcorn.kernels.base import KernelSpec
 
-_VALID_DTYPES = frozenset({DType.BF16, DType.F16, DType.F32, DType.S32, DType.U32})
+_VALID_DTYPES = frozenset(
+    {DType.BF16, DType.F16, DType.F32, DType.S32, DType.U32, DType.E4M3, DType.E5M2}
+)
 
 UNARY_OPS = frozenset({"neg", "abs", "exp", "sin", "cos", "sqrt"})
 BINARY_OPS = frozenset({"add", "sub", "mul", "div"})

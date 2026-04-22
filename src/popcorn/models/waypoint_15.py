@@ -148,8 +148,17 @@ class TransformerBlock(nn.Module):
         # this block (qkv, activations, ctrl emb, …). Captured once and
         # referenced by the dtype checks in forward().
         self._half_dt = half_dt
+        # Intermediate fp8 tensors: qkv_proj output, MLP fc1 output, and
+        # everything derived from qkv stay in e4m3. The downstream consumers
+        # (HeadRMSNorm, ValueResidualPacked, KVCacheUpdate, OwlAttn, fused
+        # silu → fc2) all cast fp8→f32 on load, so the extra quantization
+        # pass is free and the bandwidth/cache footprint drops by ~2×. The
+        # residual stream x stays in half_dt because out_proj and fc2
+        # reproject back.
+        intermediate_dt = "e4m3"
+        self._intermediate_dt = intermediate_dt
         self.pre_attn_norm = nn.AdaRMSNorm()
-        self.qkv_proj = nn.Linear(d, cfg.qkv_dim, out_dtype=out_dt)
+        self.qkv_proj = nn.Linear(d, cfg.qkv_dim, out_dtype=intermediate_dt)
         self.head_norm = nn.HeadRMSNorm(cfg.n_heads, cfg.n_kv_heads, cfg.Dh)
         if cfg.value_residual:
             self.v_residual = nn.ValueResidualPacked(cfg.v_col_offset, cfg.v_width)
@@ -209,7 +218,10 @@ class TransformerBlock(nn.Module):
             self.ctrl_residual = nn.Add()
 
         self.pre_mlp_norm = nn.AdaRMSNorm()
-        self.mlp = nn.MLP(d, cfg.mlp_dim, d, out_dtype=out_dt)
+        # fc1 writes its fused-silu output in e4m3 so the fc2 load reads
+        # half-width values. fc2 re-projects back to half_dt for the
+        # residual gate.
+        self.mlp = nn.MLP(d, cfg.mlp_dim, d, out_dtype=out_dt, hidden_out_dtype=intermediate_dt)
         self.mlp_gate = nn.AdaGateResidual()
 
     def forward(
@@ -221,16 +233,20 @@ class TransformerBlock(nn.Module):
         _check_dtype(x, half_dt, "block input x")
 
         # ── Attention ──
+        # qkv_proj outputs e4m3; head_norm / v_residual / kv_cache / attn
+        # all consume e4m3 inputs natively (each kernel casts to f32 on
+        # load). out_proj re-projects back to half_dt for the residual.
+        qkv_dt = self._intermediate_dt
         qkv = self.head_norm(self.qkv_proj(self.pre_attn_norm(x, s0, b0)))
-        _check_dtype(qkv, half_dt, "qkv (after head_norm)")
+        _check_dtype(qkv, qkv_dt, "qkv (after head_norm)")
 
         if hasattr(self, "v_residual") and qkv_first is not None:
             qkv = self.v_residual(qkv, qkv_first)
-            _check_dtype(qkv, half_dt, "qkv (after v_residual)")
+            _check_dtype(qkv, qkv_dt, "qkv (after v_residual)")
 
         self.kv_cache(qkv, frame_t, frozen=frozen)
         attn_out = self.attn(qkv, self.kv_cache, frame_t)
-        _check_dtype(attn_out, half_dt, "attn_out")
+        _check_dtype(attn_out, qkv_dt, "attn_out")
         x = self.attn_gate(x, self.out_proj(attn_out), g0)
         _check_dtype(x, half_dt, "x (after attn_gate)")
 
