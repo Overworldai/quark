@@ -292,6 +292,8 @@ class PopcornTensor:
             "f32": np.dtype("float32"),
             "f16": np.dtype("float16"),
             "bf16": np.dtype("uint16"),
+            "e4m3": np.dtype("uint8"),
+            "e5m2": np.dtype("uint8"),
             "s32": np.dtype("int32"),
             "s64": np.dtype("int64"),
             "u8": np.dtype("uint8"),

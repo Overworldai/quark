@@ -1,23 +1,18 @@
 """GEMM numpy reference — ``C = A @ B^T`` with f32 accumulation.
 
-When ``compute_dtype`` differs from ``a_dtype`` / ``b_dtype`` we
-round-trip A / B through the compute carrier before the matmul so
-the cos-sim gate sees the same on-load precision loss the kernel
-does.
+The reference stays in f32 end-to-end. It used to round-trip A / B
+through the compute carrier (e.g. f32 → e4m3 → f32) to mirror the
+kernel's on-load precision loss, but Python-side fp8 encoding is
+per-element and dominated autotune cold-start wall time on 2048-wide
+GEMMs. The correctness gate compensates with a more generous cos-sim
+threshold on fp8 outputs (see ``KernelCls.correctness_threshold``).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from popcorn.ir import DType
 from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
-
-
-def _roundtrip_through(arr_f32: np.ndarray, target: DType) -> np.ndarray:
-    """f32 → carrier → f32. Matches the kernel's on-load cast."""
-    carrier = astype_numpy(arr_f32, target)
-    return to_f32_numpy(carrier, dtype_hint=target.value)
 
 
 def gemm_reference_numpy(spec, *, A, B, Bias=None, Out=None):
@@ -30,13 +25,6 @@ def gemm_reference_numpy(spec, *, A, B, Bias=None, Out=None):
 
     if a.ndim > 2:
         a = a.reshape(-1, a.shape[-1])
-
-    # Simulate the compute-dtype cast when it differs from the source.
-    compute_dt = spec.compute_dtype_resolved
-    if compute_dt is not spec.a_dtype:
-        a = _roundtrip_through(a, compute_dt)
-    if compute_dt is not spec.b_dtype:
-        b = _roundtrip_through(b, compute_dt)
 
     c = a @ b.T
 

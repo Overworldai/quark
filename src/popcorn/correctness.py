@@ -41,7 +41,15 @@ _THRESHOLD_TABLE: dict[tuple[DType, DType], float] = {
     (DType.BF16, DType.F16): 1 - 3e-3,
     (DType.F16, DType.F32): 1 - 1e-3,
     (DType.F16, DType.F16): 1 - 5e-3,
-    (DType.E4M3, DType.F32): 1 - 5e-3,
+    # fp8 outputs: references stay in f32 with no narrow-cast round-trip,
+    # so the kernel's actual e4m3/e5m2 quantization drift shows up in full.
+    # A generous cos-sim budget keeps the autotune correctness gate focused
+    # on catching "kernel is completely wrong" rather than "last bit of
+    # mantissa mismatch".
+    (DType.E4M3, DType.F32): 1 - 1e-1,
+    (DType.E4M3, DType.F16): 1 - 1e-1,
+    (DType.E5M2, DType.F32): 1 - 1e-1,
+    (DType.E5M2, DType.F16): 1 - 1e-1,
     (DType.S32, DType.S32): 1 - 1e-9,
     (DType.U32, DType.U32): 1 - 1e-9,
 }

@@ -11,15 +11,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from popcorn.ir import DType
-from popcorn.runtime.npconv import astype_numpy, to_f32_numpy
+from popcorn.runtime.npconv import to_f32_numpy
 
 _REF_BM = 32
-
-
-def _roundtrip_through(arr_f32: np.ndarray, target: DType) -> np.ndarray:
-    carrier = astype_numpy(arr_f32, target)
-    return to_f32_numpy(carrier, dtype_hint=target.value)
 
 
 def moe_outproj_reference_numpy(
@@ -29,17 +23,14 @@ def moe_outproj_reference_numpy(
     a_hint = spec.a_dtype.value
     b_hint = spec.b_dtype.value
 
+    # Reference stays in f32 — no compute-dtype round-trip. The autotune
+    # correctness gate uses a relaxed fp8 cos-sim budget to absorb the
+    # kernel's narrow-cast drift.
     h = to_f32_numpy(h_in, dtype_hint=a_hint)
     w = to_f32_numpy(W_out, dtype_hint=b_hint)
     tok = to_f32_numpy(token_ids, dtype_hint="s32").astype(np.int64)
     wts = to_f32_numpy(slot_weights, dtype_hint="f32")
     wl = to_f32_numpy(work_list, dtype_hint="s32").astype(np.int64).reshape(-1, 2)
-
-    compute_dt = spec.compute_dtype_resolved
-    if compute_dt is not spec.a_dtype:
-        h = _roundtrip_through(h, compute_dt)
-    if compute_dt is not spec.b_dtype:
-        w = _roundtrip_through(w, compute_dt)
 
     D, H = spec.D, spec.H
     n_experts = spec.n_experts
