@@ -65,12 +65,12 @@ class BlockContext:
     @property
     def warp_id(self) -> Value:
         if self._warp_id is None:
-            self._warp_id = qk.div(self.tid, self.const(DType.U32, 32))
+            self._warp_id = qk.subgroup_id()
         return self._warp_id
 
     @property
     def lane_id(self) -> Value:
-        return self.hoist("lane_id", lambda: qk.rem(self.tid, self.const(DType.U32, 32)))
+        return self.hoist("lane_id", lambda: qk.lane_id())
 
     def hoist(self, name: str, compute_fn: Any) -> Value:
         """Compute an expression once and cache by name.

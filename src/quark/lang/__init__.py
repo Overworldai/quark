@@ -58,6 +58,8 @@ __all__ = [  # noqa: RUF022 — grouped by category; see comments below
     "neg",
     "abs_",
     "fma",
+    "fma_bf16x2",
+    "cvt_rn_bf16x2_f32",
     # compare / select
     "cmp",
     "select",
@@ -79,6 +81,8 @@ __all__ = [  # noqa: RUF022 — grouped by category; see comments below
     # vectors
     "vec_build",
     "vec_extract",
+    "vec_build_packed_b32",
+    "packed_extract_b32",
     "split_b32",
     "merge_b32",
     # memory
@@ -319,6 +323,14 @@ def fma(*args, **kwargs):
     return current_builder().fma(*args, **kwargs)
 
 
+def fma_bf16x2(*args, **kwargs):
+    return current_builder().fma_bf16x2(*args, **kwargs)
+
+
+def cvt_rn_bf16x2_f32(*args, **kwargs):
+    return current_builder().cvt_rn_bf16x2_f32(*args, **kwargs)
+
+
 # compare / select
 def cmp(*args, **kwargs):
     return current_builder().cmp(*args, **kwargs)
@@ -397,6 +409,14 @@ def vec_build(*args, **kwargs):
 
 def vec_extract(*args, **kwargs):
     return current_builder().vec_extract(*args, **kwargs)
+
+
+def vec_build_packed_b32(*args, **kwargs):
+    return current_builder().vec_build_packed_b32(*args, **kwargs)
+
+
+def packed_extract_b32(*args, **kwargs):
+    return current_builder().packed_extract_b32(*args, **kwargs)
 
 
 def split_b32(*args, **kwargs):

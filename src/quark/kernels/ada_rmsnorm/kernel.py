@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import quark.lang as qk
-from quark.blocks import PipelineBody, TensorDecl
+from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
 from quark.ir import DType
 from quark.kernels.ada_rmsnorm.baselines import ada_rmsnorm_baselines
@@ -151,12 +151,9 @@ class AdaRMSNormKernel(Kernel):
         D = s.D
         M = s.M
         n_warps = c.n_warps
-        n_threads = n_warps * _WARP
         dtype = s.dtype
 
         vec_elems = _CP_BYTES // dtype.bytes
-        total_vecs = D // vec_elems
-        vecs_per_thread = total_vecs // n_threads
 
         chunk_D = c.chunk_D
         n_chunks = D // chunk_D
@@ -171,8 +168,8 @@ class AdaRMSNormKernel(Kernel):
         lane = bctx.lane_id
 
         # ── Smem ──
-        S_smem = qk.smem_alloc("S_smem", dtype, (D,), pad=0)
-        B_smem = qk.smem_alloc("B_smem", dtype, (D,), pad=0)
+        scale_vec = SmemVector("S_smem", dtype, D)
+        bias_vec = SmemVector("B_smem", dtype, D)
         n_stages = min(2, n_chunks)
         x_stages = [
             _XStage(X=qk.smem_alloc(f"X_s{i}", dtype, (n_warps, chunk_D), pad=0))
@@ -180,25 +177,13 @@ class AdaRMSNormKernel(Kernel):
         ]
 
         # ── Load scale/bias via cooperative cp.async ──
-        for v in range(vecs_per_thread):
-            elem = (bctx.tid * vecs_per_thread + v) * vec_elems
-            qk.async_copy(
-                dst=S_smem,
-                src=g.scale,
-                dst_idx=[elem],
-                src_idx=[group_for_load, elem],
-                count=_CP_BYTES,
-            )
-            qk.async_copy(
-                dst=B_smem,
-                src=g.bias,
-                dst_idx=[elem],
-                src_idx=[group_for_load, elem],
-                count=_CP_BYTES,
-            )
+        scale_vec.load_from(g.scale, row=group_for_load)
+        bias_vec.load_from(g.bias, row=group_for_load)
         qk.async_commit()
         qk.async_wait(0)
         qk.barrier("block")
+        S_smem = scale_vec.smem
+        B_smem = bias_vec.smem
 
         # ── Pass 1: pipelined X chunks → accumulate sum(x²) ──
         init_sum = bctx.c(0.0, dtype=DType.F32)

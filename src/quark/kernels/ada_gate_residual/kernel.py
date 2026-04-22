@@ -1,9 +1,19 @@
 """AdaGateResidual — fused ``out = x + gate_bmcast * y``.
 
-Warp-per-row, chunked over D with double-buffered pipeline.
-Gate vector in 1D smem via cp.async. Per chunk: cp.async X/Y
-into per-warp smem (overlapped with previous chunk's compute)
-→ vec_load → compute → vec_build + vec_store to gmem.
+Two build paths, selected by AdaGateResidualConfig.direct:
+
+smem pipeline (direct=False):
+  Warp-per-row, chunked over D with double-buffered pipeline.
+  Gate vector staged to 1D smem via cp.async. Per chunk:
+  cp.async X/Y into per-warp smem → vec_load → fma → vec_store.
+  Best for large G where different blocks load different gate rows.
+
+direct (direct=True):
+  Warp-per-row, zero smem. Gate/X/Y read straight from gmem via
+  ld.global.v4.b32. No async_wait barriers. All loads unrolled so
+  ptxas can schedule them to hide L2 latency. Best for small G
+  (e.g. G=1) where the gate row is L2-resident and smem staging
+  overhead exceeds the load latency savings.
 """
 
 from __future__ import annotations
@@ -12,7 +22,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import quark.lang as qk
-from quark.blocks import PipelineBody, TensorDecl
+from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
 from quark.ir import DType
 from quark.kernels.ada_gate_residual.baselines import ada_gate_residual_baselines
@@ -70,7 +80,7 @@ class AdaGateResidualKernel(Kernel):
             return False
         if s.D % _WARP != 0:
             return False
-        if s.B % c.n_warps != 0:
+        if s.M % c.n_warps != 0:
             return False
         vec_elems = _CP_BYTES // s.dtype.bytes
         if s.D % vec_elems != 0:
@@ -91,14 +101,24 @@ class AdaGateResidualKernel(Kernel):
         return True
 
     def grid(self) -> tuple[int, int, int]:
-        return (1, self.spec.B // self.config.n_warps, 1)
+        s, c = self.spec, self.config
+        if c.direct:
+            # 3D grid: x=D chunks, y=M//n_warps row-groups within each gate
+            # group, z=G gate groups. Using z for gate groups eliminates the
+            # integer division my_group = my_row // M at runtime.
+            return (s.D // c.chunk_D, s.M // c.n_warps, s.G)
+        return (1, s.M // c.n_warps, s.G)
 
     def flops(self) -> int:
         return 5 * self.spec.B * self.spec.D
 
     @classmethod
     def tune_space(cls) -> dict[str, list]:
-        return {"n_warps": [1, 2, 4, 8], "chunk_D": [256, 512, 1024, 2048]}
+        return {
+            "n_warps": [1, 2, 4, 8, 16],
+            "chunk_D": [256, 512, 1024, 2048],
+            "direct": [False, True],
+        }
 
     @classmethod
     def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
@@ -134,6 +154,80 @@ class AdaGateResidualKernel(Kernel):
         return AdaGateResidualSpec(G=G, M=M, D=D, dtype=dt)
 
     def build(self) -> None:
+        if self.config.direct:
+            self._build_direct()
+        else:
+            self._build_smem_pipeline()
+
+    # ── Direct gmem path ─────────────────────────────────────────────────
+
+    def _build_direct(self) -> None:
+        """Zero-smem path: all loads are ld.global, ptxas schedules them
+        to hide L2 latency. No async_wait barriers.
+
+        Uses a 3D grid: x=D-chunks, y=within-group row-groups, z=gate-groups.
+        blockIdx.z encodes the gate group directly, eliminating the integer
+        division my_group = my_row // M at runtime."""
+        s, c = self.spec, self.config
+        g = self.g
+        bctx = self.bctx
+
+        M = s.M
+        n_warps = c.n_warps
+        dtype = s.dtype
+        vec_elems = _CP_BYTES // dtype.bytes
+
+        chunk_D = c.chunk_D
+        vecs_per_lane = (chunk_D // vec_elems) // _WARP
+
+        # blockIdx.z = gate group index (no division needed).
+        my_group = qk.block_idx("z")
+        # blockIdx.y = within-group warp-row-group index.
+        block_base_in_group = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)
+        my_row_in_group = block_base_in_group + bctx.warp_id
+        my_row = my_group * bctx.c(M, dtype=DType.U32) + my_row_in_group
+        lane = bctx.lane_id
+
+        # blockIdx.x selects the D-chunk this block owns.
+        col_off = qk.block_idx("x") * bctx.c(chunk_D, dtype=DType.U32)
+
+        for v in range(vecs_per_lane):
+            vc = (lane * vecs_per_lane + v) * vec_elems
+            col = col_off + vc
+
+            g_vec = qk.vec_load(g.gate, my_group, col, width=vec_elems, dtype=dtype)
+            x_vec = qk.vec_load(g.X, my_row, col, width=vec_elems, dtype=dtype)
+            y_vec = qk.vec_load(g.Y, my_row, col, width=vec_elems, dtype=dtype)
+
+            n_pairs = vec_elems // 2
+            if dtype == DType.BF16 and n_pairs * 2 == vec_elems:
+                # Native bf16x2 FMA: avoids 3× convert chains, uses packed b32 ops.
+                # fma.rn.bf16x2 d, gate, y, x  =>  d = gate * y + x
+                out_b32 = [
+                    qk.fma_bf16x2(
+                        qk.packed_extract_b32(g_vec, k),
+                        qk.packed_extract_b32(y_vec, k),
+                        qk.packed_extract_b32(x_vec, k),
+                    )
+                    for k in range(n_pairs)
+                ]
+                out_vec = qk.vec_build_packed_b32(out_b32, elem_dtype=dtype, width=vec_elems)
+            else:
+                out_elems = []
+                for j in range(vec_elems):
+                    gf = qk.convert(qk.vec_extract(g_vec, j), DType.F32)
+                    xf = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                    yf = qk.convert(qk.vec_extract(y_vec, j), DType.F32)
+                    out_elems.append(qk.convert(qk.fma(gf, yf, xf), dtype))
+                out_vec = qk.vec_build(out_elems)
+
+            qk.vec_store(g.Out, out_vec, my_row, col)
+
+    # ── Smem pipeline path ───────────────────────────────────────────────
+
+    def _build_smem_pipeline(self) -> None:
+        """Warp-per-row, double-buffered cp.async pipeline.
+        Gate staged to 1D smem; X/Y staged per-warp per chunk."""
         s, c = self.spec, self.config
         g = self.g
         bctx = self.bctx
@@ -141,27 +235,26 @@ class AdaGateResidualKernel(Kernel):
         D = s.D
         M = s.M
         n_warps = c.n_warps
-        n_threads = n_warps * _WARP
         dtype = s.dtype
 
         vec_elems = _CP_BYTES // dtype.bytes
-        total_vecs = D // vec_elems
-        vecs_per_thread = total_vecs // n_threads
 
         chunk_D = c.chunk_D
         n_chunks = D // chunk_D
         loads_per_lane = (chunk_D // vec_elems) // _WARP
         vecs_per_lane = loads_per_lane
 
-        block_base = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)
-        my_row = block_base + bctx.warp_id
-        M_c = bctx.c(M, dtype=DType.U32)
-        group_for_load = block_base // M_c
+        # 3D grid: z=gate-group, y=within-group row-group, x=always 1 (no D chunking).
+        my_group = qk.block_idx("z")
+        block_base_in_group = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)
+        my_row_in_group = block_base_in_group + bctx.warp_id
+        my_row = my_group * bctx.c(M, dtype=DType.U32) + my_row_in_group
+        group_for_load = my_group
 
         lane = bctx.lane_id
 
         # ── Smem ──
-        G_smem = qk.smem_alloc("G_smem", dtype, (D,), pad=0)
+        gate_vec = SmemVector("G_smem", dtype, D)
         n_stages = min(2, n_chunks)
         stages = [
             _GateStage(
@@ -172,18 +265,13 @@ class AdaGateResidualKernel(Kernel):
         ]
 
         # ── Load gate via cooperative cp.async ──
-        for v in range(vecs_per_thread):
-            elem = (bctx.tid * vecs_per_thread + v) * vec_elems
-            qk.async_copy(
-                dst=G_smem,
-                src=g.gate,
-                dst_idx=[elem],
-                src_idx=[group_for_load, elem],
-                count=_CP_BYTES,
-            )
-        qk.async_commit()
-        qk.async_wait(0)
-        qk.barrier("block")
+        # Do NOT commit here. The uncommitted gate copies get bundled
+        # with the prologue's first X/Y async_commit (auto-emitted by
+        # PipelineBody). The pipeline's async_wait(1) before the first
+        # consume covers gate + X/Y chunk 0 together, hiding the gate
+        # load latency behind the prologue prefetch.
+        gate_vec.load_from(g.gate, row=group_for_load)
+        G_smem = gate_vec.smem
 
         # ── Double-buffered pipeline over D chunks ──
         def produce(ictx: IterCtx) -> None:
@@ -215,14 +303,27 @@ class AdaGateResidualKernel(Kernel):
                 x_vec = qk.vec_load(stage.X, bctx.warp_id, vc, width=vec_elems, dtype=dtype)
                 y_vec = qk.vec_load(stage.Y, bctx.warp_id, vc, width=vec_elems, dtype=dtype)
 
-                out_elems = []
-                for j in range(vec_elems):
-                    gf = qk.convert(qk.vec_extract(g_vec, j), DType.F32)
-                    xf = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
-                    yf = qk.convert(qk.vec_extract(y_vec, j), DType.F32)
-                    out_elems.append(qk.convert(qk.fma(gf, yf, xf), dtype))
+                n_pairs = vec_elems // 2
+                if dtype == DType.BF16 and n_pairs * 2 == vec_elems:
+                    out_b32 = [
+                        qk.fma_bf16x2(
+                            qk.packed_extract_b32(g_vec, k),
+                            qk.packed_extract_b32(y_vec, k),
+                            qk.packed_extract_b32(x_vec, k),
+                        )
+                        for k in range(n_pairs)
+                    ]
+                    out_vec = qk.vec_build_packed_b32(out_b32, elem_dtype=dtype, width=vec_elems)
+                else:
+                    out_elems = []
+                    for j in range(vec_elems):
+                        gf = qk.convert(qk.vec_extract(g_vec, j), DType.F32)
+                        xf = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                        yf = qk.convert(qk.vec_extract(y_vec, j), DType.F32)
+                        out_elems.append(qk.convert(qk.fma(gf, yf, xf), dtype))
+                    out_vec = qk.vec_build(out_elems)
 
-                qk.vec_store(g.Out, qk.vec_build(out_elems), my_row, col_off + vc)
+                qk.vec_store(g.Out, out_vec, my_row, col_off + vc)
             return ()
 
         PipelineBody(

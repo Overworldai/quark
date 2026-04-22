@@ -81,6 +81,8 @@ _ARITH_KINDS = frozenset(
         "min",
         "max",
         "fma",
+        "fma_bf16x2",
+        "cvt_rn_bf16x2_f32",
         "div",
         "rem",
         "shl",
@@ -137,7 +139,9 @@ class ArithOp(Op):
         kind = self.attrs.get("kind")
         if kind not in _ARITH_KINDS:
             raise ValueError(f"ArithOp: unknown kind {kind!r}")
-        expected = {"neg": 1, "abs": 1, "fma": 3}.get(kind, 2)
+        expected = {"neg": 1, "abs": 1, "fma": 3, "fma_bf16x2": 3, "cvt_rn_bf16x2_f32": 2}.get(
+            kind, 2
+        )
         if len(self.operands) != expected:
             raise ValueError(
                 f"ArithOp({kind}): expected {expected} operands, got {len(self.operands)}"
@@ -305,7 +309,7 @@ class VecBuildOp(Op):
         if len(self.results) != 1:
             raise ValueError("VecBuildOp: expected 1 result")
         width = self.results[0].width
-        if len(self.operands) != width:
+        if not self.attrs.get("packed_b32") and len(self.operands) != width:
             raise ValueError(
                 f"VecBuildOp: result width {width} must match operand count {len(self.operands)}"
             )

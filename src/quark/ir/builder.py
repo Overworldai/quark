@@ -278,6 +278,35 @@ class Builder:
         self._emit(_op.ArithOp(results=(out,), operands=(a, b, c), attrs={"kind": "fma"}))
         return out
 
+    def fma_bf16x2(self, a: Value, b: Value, c: Value, name: str = "") -> Value:
+        """Packed BF16×2 fused multiply-add: d = a*b + c.
+
+        All operands and result are B32, each holding two packed BF16 values.
+        Lowers to `fma.rn.bf16x2` on sm_80+."""
+        if not (a.dtype == b.dtype == c.dtype == DType.B32):
+            raise TypeError(
+                f"fma_bf16x2: all operands must be B32, got {a.dtype}/{b.dtype}/{c.dtype}"
+            )
+        out = self._fresh(ValueShape(DType.B32), name)
+        self._emit(_op.ArithOp(results=(out,), operands=(a, b, c), attrs={"kind": "fma_bf16x2"}))
+        return out
+
+    def cvt_rn_bf16x2_f32(self, a: Value, b: Value, name: str = "") -> Value:
+        """Pack two F32 values into a B32 holding two packed BF16 values.
+
+        Lowers to `cvt.rn.bf16x2.f32 rD, rA, rB;` on sm_80+. Equivalent to
+        two `cvt.rn.bf16.f32` + `mov.b32 {lo,hi}` but in a single instruction.
+        Used by the bf16x2 atomic-add scatter path."""
+        if not (a.dtype == DType.F32 and b.dtype == DType.F32):
+            raise TypeError(
+                f"cvt_rn_bf16x2_f32: both operands must be F32, got {a.dtype}/{b.dtype}"
+            )
+        out = self._fresh(ValueShape(DType.B32), name)
+        self._emit(
+            _op.ArithOp(results=(out,), operands=(a, b), attrs={"kind": "cvt_rn_bf16x2_f32"})
+        )
+        return out
+
     def cmp(self, kind: str, a: Value, b: Value, name: str = "") -> Value:
         # CSE: comparisons are pure. Not commutative, so preserve
         # operand order in the cache key.
@@ -459,6 +488,38 @@ class Builder:
     def vec_extract(self, v: Value, index: int, name: str = "") -> Value:
         out = self._fresh(ValueShape(v.dtype, width=1), name)
         self._emit(_op.VecExtractOp(results=(out,), operands=(v,), attrs={"index": index}))
+        return out
+
+    def packed_extract_b32(self, vec: Value, pair_idx: int, name: str = "") -> Value:
+        """Extract physical b32 register for BF16/F16 pair at pair_idx.
+
+        Returns the B32 register holding elements [2*pair_idx, 2*pair_idx+1]
+        of a packed sub-register vector.  Zero cost — no PTX emitted."""
+        if vec.dtype not in (DType.BF16, DType.F16):
+            raise TypeError(f"packed_extract_b32: expected BF16/F16 vec, got {vec.dtype}")
+        out = self._fresh(ValueShape(DType.B32), name)
+        self._emit(
+            _op.VecExtractOp(
+                results=(out,), operands=(vec,), attrs={"index": pair_idx, "packed_b32": True}
+            )
+        )
+        return out
+
+    def vec_build_packed_b32(
+        self, b32_scalars: list[Value], *, elem_dtype, width: int, name: str = ""
+    ) -> Value:
+        """Build a BF16/F16 vector from pre-packed B32 values.
+
+        b32_scalars: B32 values, each holding 2 elements of elem_dtype.
+        width = 2 * len(b32_scalars). Zero PTX emitted — just rebinds registers."""
+        if not all(v.dtype == DType.B32 for v in b32_scalars):
+            raise TypeError("vec_build_packed_b32: all inputs must be B32")
+        if width != 2 * len(b32_scalars):
+            raise ValueError(f"vec_build_packed_b32: width={width} != 2 * {len(b32_scalars)}")
+        out = self._fresh(ValueShape(elem_dtype, width), name)
+        self._emit(
+            _op.VecBuildOp(results=(out,), operands=tuple(b32_scalars), attrs={"packed_b32": True})
+        )
         return out
 
     def split_b32(self, v: Value) -> tuple[Value, Value]:

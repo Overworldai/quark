@@ -390,9 +390,18 @@ class Kernel(ABC):
                         return False
                 # Atomic dtype support
                 if isinstance(op, AtomicRmwOp):
-                    if caps.atomic_add_dtypes and op.attrs.get("op") == "add":
-                        if op.operands[0].dtype not in caps.atomic_add_dtypes:
-                            return False
+                    if op.attrs.get("op") == "add":
+                        atomic_type = op.attrs.get("atomic_type")
+                        # Vector atomics: type string encodes the packed form
+                        # ("bf16x2", "f16x2"). Gate on caps.atomic_add_vector
+                        # instead of the scalar dtype set.
+                        if atomic_type in ("bf16x2", "f16x2"):
+                            elem = DType.BF16 if atomic_type == "bf16x2" else DType.F16
+                            if (elem, 2) not in caps.atomic_add_vector:
+                                return False
+                        elif caps.atomic_add_dtypes:
+                            if op.operands[0].dtype not in caps.atomic_add_dtypes:
+                                return False
                 if isinstance(op, MmaOp):
                     mma_ops.append(op)
             per_fn_counts[fn.name] = n

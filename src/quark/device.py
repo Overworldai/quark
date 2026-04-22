@@ -408,9 +408,12 @@ def _atomic_add_vector_for_cuda(cc_major: int, cc_minor: int) -> frozenset[tuple
         # red.add.noftz.f16x2 — Volta+. Reliable way to atomic-accumulate
         # packed fp16 epilogues.
         caps.add((DType.F16, 2))
-    if cc_major >= 10:
-        # red.add.noftz.bf16x2 on Blackwell — matches the scalar bf16
-        # gate above so split-K with bf16 out stays consistent.
+    if cc_major >= 9:
+        # red.add.noftz.bf16x2 — Hopper+ (sm_90). The vector form ships
+        # two generations later than f16x2: ptxas flatly rejects it on
+        # sm_89/sm_80 ("requires sm_90 or higher"). Used by the paired
+        # scatter path to accumulate split-K / MoE epilogues into bf16
+        # output at half the atomic op count.
         caps.add((DType.BF16, 2))
     return frozenset(caps)
 

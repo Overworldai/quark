@@ -355,6 +355,14 @@ class PtxLowerer:
         dtype = out.dtype
         suffix = arith_suffix(dtype)
 
+        if kind == "fma_bf16x2":
+            ops_str = ", ".join(ctx.regs.name_for(v) for v in op.operands)
+            ctx.emit(f"fma.rn.bf16x2 {dst}, {ops_str};")
+            return
+        if kind == "cvt_rn_bf16x2_f32":
+            a, b = op.operands
+            ctx.emit(f"cvt.rn.bf16x2.f32 {dst}, {ctx.regs.name_for(b)}, {ctx.regs.name_for(a)};")
+            return
         # Integer multiply needs .lo. Int div/rem use the same syntax.
         if kind == "mul" and (dtype.is_int or dtype.is_bit):
             instr = f"mul.lo.{suffix}"
@@ -598,6 +606,14 @@ class PtxLowerer:
         Otherwise zero-emit: bind the result to the concat of input regs.
         """
         (out,) = op.results
+
+        if op.attrs.get("packed_b32"):
+            # Operands are pre-packed B32 values; bind them directly.
+            # Bypass bind()'s width check: N B32 regs back 2N BF16 logical elements.
+            b32_names = tuple(ctx.regs.name_for(v) for v in op.operands)
+            ctx.regs._components[out.id] = b32_names
+            return
+
         n_logical = len(op.operands)
         elem_dt = op.operands[0].dtype
         form = _vec_phys_form(n_logical, elem_dt)
@@ -654,7 +670,11 @@ class PtxLowerer:
         sub_idx = idx % pack_factor
         phys_reg = phys_comps[phys_idx]
 
-        if pack_factor == 2:
+        if pack_factor == 2 and op.attrs.get("packed_b32"):
+            # idx is a pair index (B32 register index), not a logical element
+            # index — use it directly as the physical register selector.
+            ctx.regs.bind(out, (phys_comps[idx],))
+        elif pack_factor == 2:
             # B32 → 2 × B16. Split via mov.b32 {lo, hi}, reg.
             lo = ctx.regs.declare("b16")
             hi = ctx.regs.declare("b16")
@@ -1133,8 +1153,21 @@ class PtxLowerer:
             cls = arith_suffix(value.dtype)
         # f16/bf16/f16x2/bf16x2 atomic add requires .noftz qualifier.
         noftz = ""
-        if atomic_op == "add" and value.dtype in (DType.F16, DType.BF16):
+        if atomic_op == "add" and (
+            value.dtype in (DType.F16, DType.BF16) or atomic_type in ("bf16x2", "f16x2")
+        ):
             noftz = ".noftz"
+        # Vector atomic types (bf16x2, f16x2) are only exposed via `red.add`
+        # on sm_80–sm_89 — `atom.add.bf16x2` requires sm_90+. `red` has no
+        # result (no old-value write-back); the fresh output register we
+        # declared is left unwritten and elided by ptxas as dead. Callers
+        # never read it (scatter epilogue throws it away), so this is safe.
+        if atomic_type in ("bf16x2", "f16x2"):
+            ctx.emit(
+                f"{prefix}red.global.{atomic_op}{noftz}.{cls} "
+                f"[{addr_expr}], {ctx.regs.name_for(value)};"
+            )
+            return
         ctx.emit(
             f"{prefix}atom.global.{atomic_op}{noftz}.{cls} "
             f"{ctx.regs.name_for(out)}, [{addr_expr}], {ctx.regs.name_for(value)};"

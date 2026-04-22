@@ -27,6 +27,7 @@ from quark.blocks.dsl.carry import Carry, Stage
 from quark.blocks.dsl.context import _ACTIVE_BCTX, _ACTIVE_KCTX, active_bctx, active_kctx
 from quark.blocks.dsl.kernel_context import KernelContext
 from quark.blocks.dsl.smem_tile import SmemTile, SmemTileSpec
+from quark.blocks.dsl.smem_vector import SmemVector
 from quark.blocks.dsl.tensors import C, TensorDecl, _to_value
 from quark.ir import DType, Value
 
@@ -89,6 +90,7 @@ __all__ = [
     "SetupBlock",
     "SmemTile",
     "SmemTileSpec",
+    "SmemVector",
     "Stage",
     "TensorDecl",
     "_to_value",

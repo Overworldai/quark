@@ -197,6 +197,27 @@ def store_acc(
         )
         return
 
+    # Paired bf16x2 atomic scatter — halves the atomic op count vs scalar
+    # bf16 atomics. Used when: atomic=True, output is BF16, and the MMA
+    # shape's cd_offsets walk in adjacent-column pairs (true for all
+    # m16n8k16_bf16 / m16n8k8_f16 shapes). Device-cap gating of
+    # (BF16, 2) in caps.atomic_add_vector happens in is_valid_for, so
+    # configs that emit this on unsupported hardware get autotune-filtered.
+    _cast = cast or DType.F32
+    if atomic and _cast == DType.BF16 and _cd_offsets_pairable(bctx.mma_cfg.cd_offsets):
+        _emit_scatter_store_paired_bf16x2(
+            bctx,
+            dst=dst,
+            acc_results=acc.results,
+            acc=acc,
+            row_base=row,
+            col_base=col,
+            activation=activation,
+            bias=bias,
+            row_scale=row_scale,
+        )
+        return
+
     _emit_scatter_store(
         bctx,
         dst=dst,
@@ -204,7 +225,7 @@ def store_acc(
         acc=acc,
         row_base=row,
         col_base=col,
-        cast=cast or DType.F32,
+        cast=_cast,
         activation=activation,
         bias=bias,
         row_scale=row_scale,
@@ -415,6 +436,137 @@ def _silu_scalar(elem: Value, log2e: Value, one: Value) -> Value:
     from quark.lang import ex2_approx, neg, rcp_approx
 
     return elem * rcp_approx(one + ex2_approx(neg(elem * log2e)))
+
+
+def _cd_offsets_pairable(cd_offsets: tuple[tuple[int, int], ...]) -> bool:
+    """True if cd_offsets slot-list walks in adjacent-column pairs with
+    even left-column. E.g. ``((0,0),(0,1),(8,0),(8,1))`` → True."""
+    if len(cd_offsets) % 2 != 0:
+        return False
+    for i in range(0, len(cd_offsets), 2):
+        dr_a, dc_a = cd_offsets[i]
+        dr_b, dc_b = cd_offsets[i + 1]
+        if dr_a != dr_b or dc_b != dc_a + 1 or dc_a % 2 != 0:
+            return False
+    return True
+
+
+def _emit_scatter_store_paired_bf16x2(
+    bctx: BlockContext,
+    *,
+    dst: GlobalTensor,
+    acc_results: list[Value],
+    acc: Accumulators,
+    row_base: Any,
+    col_base: Any,
+    activation: str | None = None,
+    bias: GlobalTensor | None = None,
+    row_scale: list[Value] | None = None,
+) -> None:
+    """Paired bf16x2 atomic scatter-add.
+
+    Walks the accumulator fragment in column-adjacent pairs. For each
+    pair (slot_a, slot_b) with ``dr_a==dr_b`` and ``dc_b==dc_a+1`` and
+    even ``dc_a``, packs two F32 accumulator values into a single B32
+    (``cvt.rn.bf16x2.f32``) and emits one ``atom.global.add.noftz.bf16x2``
+    — half the atomic op count vs the scalar bf16 path.
+
+    Bias/activation/row_scale are applied per-element in F32 before the
+    final pack. Row is shared by the pair; bias reads two adjacent cols.
+    """
+    from popcorn.lang import (
+        and_,
+        atomic_rmw,
+        convert,
+        cvt_rn_bf16x2_f32,
+        load,
+        rcp_approx,
+        shl,
+        shr,
+        vec_extract,
+    )
+
+    cfg = bctx.mma_cfg
+    cd_offsets = cfg.cd_offsets
+    if not _cd_offsets_pairable(cd_offsets):
+        raise ValueError(
+            f"_emit_scatter_store_paired_bf16x2: cd_offsets not pair-compatible: {cd_offsets}"
+        )
+
+    # Lane-local base: gid = laneid >> 2, tig_x2 = (laneid & 3) << 1
+    lane = bctx.lane_id
+    gid = shr(lane, bctx.c(2, dtype=DType.U32))
+    tig = and_(lane, bctx.c(3, dtype=DType.U32))
+    tig_x2 = shl(tig, bctx.c(1, dtype=DType.U32))
+
+    _row = bctx.c(row_base) if isinstance(row_base, int) else row_base
+    _col = bctx.c(col_base) if isinstance(col_base, int) else col_base
+    log2e = bctx.c(_LOG2E) if activation == "silu" else None
+    one = bctx.c(1.0) if activation == "silu" else None
+
+    rc_info = _rc_info(cfg) if row_scale is not None else None
+    rcps = [rcp_approx(v) for v in row_scale] if row_scale is not None else None
+
+    m_stride = cfg.shape.m
+    n_stride = cfg.shape.n
+
+    for mt in range(acc.MT):
+        for nt in range(acc.NT):
+            idx = mt * acc.NT + nt
+            acc_v = acc_results[idx]
+            mt_row_base = bctx.c(mt * m_stride)
+            nt_col_base = bctx.c(nt * n_stride)
+
+            for pair_i in range(0, len(cd_offsets), 2):
+                slot_a, slot_b = pair_i, pair_i + 1
+                dr, dc_a = cd_offsets[slot_a]
+
+                # F32 per-slot values via vec_extract on the fragment.
+                elem_a = vec_extract(acc_v, slot_a)
+                elem_b = vec_extract(acc_v, slot_b)
+
+                # row_scale: same selector for both slots in the pair.
+                if rc_info is not None and rcps is not None:
+                    n_rc, slot_to_selector = rc_info
+                    sel = rcps[mt * n_rc + slot_to_selector[slot_a]]
+                    elem_a = elem_a * sel
+                    elem_b = elem_b * sel
+
+                # Row (shared by pair).
+                row_in_tile = gid if dr == 0 else (gid + bctx.c(dr, dtype=DType.U32))
+                gmem_row = _row + (mt_row_base + row_in_tile)
+
+                # Col of left element of pair.
+                col_in_tile_a = tig_x2 if dc_a == 0 else (tig_x2 + bctx.c(dc_a, dtype=DType.U32))
+                gmem_col_a = _col + (nt_col_base + col_in_tile_a)
+
+                # Bias: read two adjacent cols in F32 space.
+                if bias is not None:
+                    gmem_col_b = gmem_col_a + bctx.c(1, dtype=DType.U32)
+                    b_a = load(bias, gmem_col_a)
+                    b_b = load(bias, gmem_col_b)
+                    b_a_f32 = convert(b_a, DType.F32) if b_a.dtype != DType.F32 else b_a
+                    b_b_f32 = convert(b_b, DType.F32) if b_b.dtype != DType.F32 else b_b
+                    elem_a = elem_a + b_a_f32
+                    elem_b = elem_b + b_b_f32
+
+                if activation == "silu":
+                    assert log2e is not None and one is not None
+                    elem_a = _silu_scalar(elem_a, log2e, one)
+                    elem_b = _silu_scalar(elem_b, log2e, one)
+
+                # Pack F32 pair → B32 (packed bf16x2).
+                packed = cvt_rn_bf16x2_f32(elem_a, elem_b)
+
+                # One atomic per pair — half the instruction count.
+                atomic_rmw(
+                    dst,
+                    "add",
+                    packed,
+                    gmem_row,
+                    gmem_col_a,
+                    atomic_type="bf16x2",
+                )
 
 
 def _emit_staged_store(
