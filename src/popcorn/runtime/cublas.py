@@ -282,7 +282,8 @@ class CublasRuntime:
         a_cuda = _DTYPE_TO_CUDA[a_dtype]
         b_cuda = _DTYPE_TO_CUDA[b_dtype]
         c_cuda = _DTYPE_TO_CUDA[c_dtype]
-        is_fp8 = a_dtype in ("e4m3", "e5m2") or b_dtype in ("e4m3", "e5m2")
+        is_fp8_input = a_dtype in ("e4m3", "e5m2") or b_dtype in ("e4m3", "e5m2")
+        is_fp8_output = c_dtype in ("e4m3", "e5m2")
 
         desc = ctypes.c_void_p(0)
         self._check(
@@ -312,7 +313,7 @@ class CublasRuntime:
                 )
             )
 
-            if is_fp8:
+            if is_fp8_input:
                 scale_ptr = ctypes.c_uint64(self._unit_scale)
                 for attr in (
                     CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
@@ -326,6 +327,20 @@ class CublasRuntime:
                             ctypes.sizeof(scale_ptr),
                         )
                     )
+            if is_fp8_output:
+                # cublasLt writes D = alpha * op(A) * op(B) * A_scale *
+                # B_scale / D_scale. With a unit D_scale the output is
+                # the raw product narrowed to fp8 — exactly what the
+                # custom kernel produces (no extra scaling).
+                d_scale_ptr = ctypes.c_uint64(self._unit_scale)
+                self._check(
+                    self._lib.cublasLtMatmulDescSetAttribute(
+                        desc,
+                        CUBLASLT_MATMUL_DESC_D_SCALE_POINTER,
+                        ctypes.byref(d_scale_ptr),
+                        ctypes.sizeof(d_scale_ptr),
+                    )
+                )
 
             # Layouts: see module docstring for the row-major → col-major
             # mapping. cublasLt_A = our B (op=T, K×N, ld=K), cublasLt_B =

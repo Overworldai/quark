@@ -20,13 +20,20 @@ _GemmCls = None
 _IS_METAL = sys.platform == "darwin"
 
 # Dtype combos where ``cublasLtMatmul`` gives us scale-free row-major
-# A × B^T directly. Anything else (mixed bf16×e4m3, e4m3 output, scales,
-# fused activations, pre-shuffled B) stays on the custom kernel.
+# A × B^T directly. fp8 A+B requires both operands fp8 (cublasLt's fp8
+# matmul doesn't do mixed half/fp8), so Linear pre-casts x to e4m3 when
+# the weight is fp8 to land here. Mixed input combos + pre-shuffled B +
+# fused activations stay on the custom kernel.
 _CUBLAS_COMBOS: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("bf16", "bf16", "bf16"),
         ("bf16", "bf16", "f32"),
+        ("f16", "f16", "f16"),
+        ("f16", "f16", "f32"),
         ("e4m3", "e4m3", "bf16"),
+        ("e4m3", "e4m3", "f16"),
+        ("e4m3", "e4m3", "e4m3"),
+        ("e4m3", "e4m3", "f32"),
     }
 )
 
@@ -102,6 +109,11 @@ def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias,
     from popcorn.graph import active_stream
 
     stream = active_stream() or 0
+    if os.environ.get("POPCORN_CUBLAS_VERBOSE") == "1":
+        print(
+            f"[cublas] matmul M={M} N={N} K={K} a={a_dt} b={b_dt} c={c_dt} stream={stream}",
+            flush=True,
+        )
     CublasRuntime.instance().matmul(
         a_ptr=A.data_ptr(),
         b_ptr=B.data_ptr(),

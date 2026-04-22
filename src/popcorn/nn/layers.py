@@ -95,6 +95,22 @@ class Linear(Module):
 
     _BM_MIN = 16  # minimum M for GEMM tile
 
+    def _cast_to_fp8(self, x, fp8_dtype: str):
+        """Narrow ``x`` to e4m3/e5m2 via ``pcf.quantize_e4m3``.
+
+        Used by ``forward`` to land on the cuBLAS fp8 matmul path when
+        the weight is fp8 and ``x`` arrives in bf16/f16. The custom
+        GEMM kernel's in-kernel ``compute_dtype`` cast is still
+        available as a fallback (and is what the b_shuffle / fused-
+        activation paths use), but cuBLAS wants both operands fp8 so
+        we materialize the cast here for the simple Linear path.
+        """
+        if x.dtype == fp8_dtype:
+            return x
+        import popcorn.functional as pcf
+
+        return pcf.quantize_e4m3(x)
+
     def _out_buf(self, M_eff: int):
         """Return a cached, pre-zeroed ``[M_eff, out_features]`` buffer.
 
@@ -167,6 +183,22 @@ class Linear(Module):
                 f"Linear: activation dtype {a_dtype!r} not in {_OK_ACTIVATION}. "
                 f"Insert a Cast upstream."
             )
+
+        # cuBLAS routing: cublasLt's fp8 matmul only takes fp8 A *and*
+        # B — mixed bf16×e4m3 stays on the custom kernel. To land the
+        # fp8-weight Linear on cuBLAS, narrow the activation to e4m3
+        # here (cached buffer, zero churn). Scalar shuffle / fused-
+        # activation / bias paths skip the cast and keep the custom
+        # kernel.
+        can_use_cublas = (
+            activation is None
+            and bias is None
+            and not self._has_bias
+            and not getattr(self, "_shuffled", False)
+        )
+        if is_fp8_weight and a_dtype not in ("e4m3", "e5m2") and can_use_cublas:
+            x = self._cast_to_fp8(x, b_dtype)
+            a_dtype = b_dtype
 
         # Pad M when too small for the GEMM kernel's minimum tile.
         M = int(x.shape[0])
