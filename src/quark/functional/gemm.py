@@ -64,6 +64,14 @@ def _try_cublas(A, B, *, out_dtype, compute_dtype, b_shuffled, activation, bias,
         return None
     if os.environ.get("QUARK_DISABLE_CUBLAS") == "1":
         return None
+    # Validation knob: bypass the shortcut to force cuBLAS-eligible
+    # shapes through the autotune cache's cuBLAS candidate path instead
+    # (kernels/gemm/cublas_dispatch.py). Used to A/B the two paths
+    # before the shortcut is retired in a follow-up commit. Separate
+    # from QUARK_DISABLE_CUBLAS so cuBLAS stays usable via autotune
+    # when the shortcut is off.
+    if os.environ.get("QUARK_DISABLE_CUBLAS_SHORTCUT") == "1":
+        return None
     if b_shuffled or activation is not None:
         return None
 

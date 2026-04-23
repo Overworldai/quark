@@ -20,6 +20,16 @@ class GemmConfig(KernelConfig):
     BM / BN / BK are the tile dimensions the proposal calls
     MTile / NTile / KChunk. n_stages is NStages (cp.async pipeline
     depth: 1 = synchronous, 2 = double buffer, 3 = triple).
+
+    ``impl`` tags which implementation executes the config. ``"ptx"``
+    (default) uses the in-repo PTX kernel and all the tiling knobs
+    below. ``"cublas"`` routes to cublasLtMatmul — the knobs are
+    don't-care in that case (cublasLt picks its own algorithm
+    internally). Keeping both variants under one dataclass keeps the
+    autotune cache schema stable: on-disk records carry the same
+    field set regardless of implementation, with ``impl`` distinguishing
+    the two paths at dispatch time. Existing cached configs without
+    the ``impl`` field deserialize with the default ``"ptx"``.
     """
 
     BM: int = 64
@@ -38,6 +48,11 @@ class GemmConfig(KernelConfig):
     # adds its partial sum to the output. Requires out_dtype=F32
     # (atomic add is only supported for f32).
     split_k: int = 1
+    # Which implementation executes this config. Default ``"ptx"``
+    # matches pre-existing cached configs (missing field deserializes
+    # to the default). ``"cublas"`` routes to ``CublasRuntime.matmul``;
+    # all PTX knobs above are ignored.
+    impl: str = "ptx"
 
     @classmethod
     def default_for(cls, spec) -> GemmConfig:

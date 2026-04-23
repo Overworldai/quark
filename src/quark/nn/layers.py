@@ -95,22 +95,6 @@ class Linear(Module):
 
     _BM_MIN = 16  # minimum M for GEMM tile
 
-    def _cast_to_fp8(self, x, fp8_dtype: str):
-        """Narrow ``x`` to e4m3/e5m2 via ``pcf.quantize_e4m3``.
-
-        Used by ``forward`` to land on the cuBLAS fp8 matmul path when
-        the weight is fp8 and ``x`` arrives in bf16/f16. The custom
-        GEMM kernel's in-kernel ``compute_dtype`` cast is still
-        available as a fallback (and is what the b_shuffle / fused-
-        activation paths use), but cuBLAS wants both operands fp8 so
-        we materialize the cast here for the simple Linear path.
-        """
-        if x.dtype == fp8_dtype:
-            return x
-        import quark.functional as pcf
-
-        return pcf.quantize_e4m3(x)
-
     def _out_buf(self, M_eff: int):
         """Return a cached, pre-zeroed ``[M_eff, out_features]`` buffer.
 
@@ -184,16 +168,14 @@ class Linear(Module):
                 f"Insert a Cast upstream."
             )
 
-        # cuBLAS routing: cublasLt's fp8 matmul only takes fp8 A *and*
-        # B — mixed bf16×e4m3 stays on the custom kernel. To land the
-        # fp8-weight Linear on cuBLAS, narrow the activation to e4m3
-        # here (packed_convert, no scalar cvt crash). Bias is fine:
-        # cublasLt has a BIAS epilogue. Only activation fusion and
-        # weight pre-shuffle still send us to the custom kernel.
-        can_use_cublas = activation is None and not getattr(self, "_shuffled", False)
-        if is_fp8_weight and a_dtype not in ("e4m3", "e5m2") and can_use_cublas:
-            x = self._cast_to_fp8(x, b_dtype)
-            a_dtype = b_dtype
+        # cuBLAS routing: the mixed-dtype bf16→e4m3 pre-cast used to
+        # live here, gating on ``can_use_cublas``, to satisfy cublasLt's
+        # "both operands fp8" constraint. It's now owned by
+        # ``kernels/gemm/cublas_dispatch.py``: the autotuner treats
+        # (bf16, e4m3) specs as cuBLAS-eligible and dispatch applies
+        # the cast on-stream when cuBLAS wins the config race. PTX
+        # configs still see the raw bf16 A and down-cast during the
+        # smem load (``compute_dtype=b_dtype`` below).
 
         # Pad M when too small for the GEMM kernel's minimum tile.
         M = int(x.shape[0])

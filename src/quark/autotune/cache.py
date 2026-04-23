@@ -197,6 +197,21 @@ class AutotuneCache:
         ``QUARK_MAX_AUTOTUNE=1`` or the ``quark.max_autotune()``
         context manager flip it from ``"fast"`` to ``"full"``.
         """
+        # Force path: ``force_alt_config`` lets a kernel publish a
+        # non-negotiable winner (e.g. ``QUARK_FORCE_CUBLAS=1`` on the
+        # GEMM kernel). It takes precedence over the cache so the env
+        # flips the effective winner immediately; and it is NOT
+        # persisted — unsetting the env reverts to the cached PTX
+        # winner without having to clear state.
+        force_fn = getattr(kernel_cls, "force_alt_config", None)
+        if callable(force_fn):
+            try:
+                forced = force_fn(spec, self.device.caps)
+            except (TypeError, NotImplementedError):
+                forced = None
+            if forced is not None:
+                return forced
+
         cached = self.lookup(kernel_cls, spec)
         if cached is not None:
             return cached
@@ -248,6 +263,21 @@ class AutotuneCache:
 
     def _search(self, kernel_cls, spec, *, depth: str = "fast") -> Optional[Any]:
         seeds = self._load_warm_seeds(kernel_cls, spec)
+        # Alt-impl configs (e.g. cuBLAS for GEMM) are priority
+        # candidates: a single entry in a pool of hundreds of PTX
+        # configs that fast-search sampling would miss most of the
+        # time, leaving cuBLAS untimed and a PTX config as the winner
+        # even on shapes where cuBLAS is ~2× faster. Seeding them into
+        # the warm-seed slot makes them tested first unconditionally.
+        alt_fn = getattr(kernel_cls, "alt_configs", None)
+        if callable(alt_fn):
+            try:
+                alt = list(alt_fn(spec, self.device.caps))
+            except (TypeError, NotImplementedError):
+                alt = []
+            if alt:
+                seed_keys = {_cfg_key_simple(c) for c in seeds}
+                seeds = list(seeds) + [c for c in alt if _cfg_key_simple(c) not in seed_keys]
         if depth == "full":
             return self._search_full(kernel_cls, spec, seeds)
         return self._search_fast(kernel_cls, spec, seeds)
@@ -466,6 +496,19 @@ class AutotuneCache:
             # wrong config.
             with contextlib.suppress(BaseException):
                 synchronize()
+            # Alt-impl configs (e.g. cuBLAS) can't be compiled through
+            # the PTX lowering pipeline — delegate correctness to the
+            # kernel's own hook so the real alt path is what gets
+            # checked, not a PTX fallback running with default knobs.
+            impl = getattr(cfg, "impl", "ptx")
+            if impl != "ptx":
+                check_alt = getattr(kernel_cls, "check_alt_config", None)
+                if callable(check_alt):
+                    try:
+                        return check_alt(spec, cfg, tensors=tensors, reference=reference)
+                    except Exception as e:
+                        return False, float("nan"), f"{type(e).__name__}: {e}"
+                return False, float("nan"), f"no check_alt_config hook for impl={impl!r}"
             try:
                 cfg_kernel = kernel_cls(spec_cls(**spec_dict), cfg)
                 launch_tensors = cfg_kernel.prepare_launch_tensors(tensors)
@@ -605,6 +648,19 @@ class AutotuneCache:
                 continue
             if _is_valid_for_device(kernel, self.device.caps):
                 yield cfg
+
+        # Alternate-implementation configs outside the tune_space
+        # cartesian (e.g. cuBLAS for GEMM). Kernel class owns eligibility
+        # via ``alt_configs(spec, caps)``; no device-caps filter here
+        # because alt configs don't obey the PTX knob constraints that
+        # ``is_valid_for`` checks.
+        alt_fn = getattr(kernel_cls, "alt_configs", None)
+        if callable(alt_fn):
+            try:
+                for cfg in alt_fn(spec, self.device.caps):
+                    yield cfg
+            except (TypeError, NotImplementedError):
+                pass
 
     # Alias kept for existing test imports.
     def _enumerate_candidates(self, kernel_cls, spec) -> Iterable[Any]:

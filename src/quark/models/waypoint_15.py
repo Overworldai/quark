@@ -218,8 +218,10 @@ class TransformerBlock(nn.Module):
         self.pre_mlp_norm = nn.AdaRMSNorm()
         # fc1 keeps its fused-silu path on the custom kernel with a
         # half_dt store (the custom epilogue's ``cvt → e4m3`` is scalar-
-        # only and PTX has no scalar fp8 cvt). fc2 routes to cuBLAS via
-        # Linear's ``_cast_to_fp8`` pre-step when the weights are fp8.
+        # only and PTX has no scalar fp8 cvt). fc2 now runs whichever
+        # config wins the autotune race for its spec — cuBLAS applies
+        # the bf16→e4m3 cast on-stream when it's picked; PTX uses its
+        # own compute_dtype smem down-cast when it wins.
         self.mlp = nn.MLP(d, cfg.mlp_dim, d, out_dtype=out_dt)
         self.mlp_gate = nn.AdaGateResidual()
 

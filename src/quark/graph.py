@@ -103,7 +103,7 @@ class CapturedGraph:
 
 
 @contextmanager
-def capture_graph(stream: int = 0):
+def capture_graph(stream: int = 0, *, quiet: bool = False):
     """Context manager that captures all kernel launches into a CUDA graph.
 
     Usage::
@@ -118,6 +118,11 @@ def capture_graph(stream: int = 0):
     The context manager yields a ``CapturedGraph`` that is populated
     on exit. Calling ``replay()`` before exiting the context raises
     an error.
+
+    ``quiet=True`` suppresses the post-capture ``[graph capture] N
+    kernel launches recorded`` summary. Used by the autotune timer
+    which captures ``fn()`` once per config and would otherwise spam
+    hundreds of those lines per autotune run.
     """
     if _IS_METAL:
         raise NotImplementedError(
@@ -161,7 +166,9 @@ def capture_graph(stream: int = 0):
         _capture_storages.clear()
         # Restore previous stream.
         _capture_state.stream = prev_stream
-        # Print capture summary.
+        # Print capture summary (unless the caller asked for silence —
+        # autotune's per-config timer captures once per candidate and
+        # would otherwise print a line per config).
         n = len(_capture_launch_log)
         # Check for duplicates.
         from collections import Counter
@@ -169,10 +176,12 @@ def capture_graph(stream: int = 0):
         counts = Counter(_capture_launch_log)
         dupes = {k: v for k, v in counts.items() if v > 1}
         if dupes:
+            # Duplicates are still surfaced even when quiet=True — they
+            # indicate a real capture-side bug that shouldn't be hidden.
             print(f"[graph capture] WARNING: {n} kernel launches, DUPLICATES:")
             for name, count in sorted(dupes.items()):
                 print(f"  {name}: {count}x")
-        else:
+        elif not quiet:
             print(f"[graph capture] {n} kernel launches recorded")
         # Clear per-capture duplicate-detection flags.
         _clear_capture_flags(capture_stream)

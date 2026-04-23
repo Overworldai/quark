@@ -158,6 +158,26 @@ def call_with_bindings(
     if config is None:
         config = lc._autotune.lookup_or_search(kernel_cls, spec)
 
+    # Alt-impl configs (e.g. cuBLAS) bypass the compile+launch pipeline
+    # entirely. The kernel class owns the dispatch via a
+    # ``dispatch_alt_config`` hook that fills auto-alloc buffers, runs
+    # the alt path, and returns the full {name: tensor} dict the caller
+    # expects.
+    impl = getattr(config, "impl", "ptx")
+    if impl != "ptx":
+        dispatch_alt = getattr(kernel_cls, "dispatch_alt_config", None)
+        if not callable(dispatch_alt):
+            raise ValueError(
+                f"config.impl={impl!r} but {kernel_cls.__name__} has no dispatch_alt_config hook"
+            )
+        return dispatch_alt(
+            spec,
+            config,
+            provided=provided,
+            auto_alloc=auto_alloc,
+            like=like,
+        )
+
     # Compile is cached on (cls, spec, config); on the hot path this
     # is a dict lookup and returns a ``CompiledKernel`` that already
     # holds the ParamSpec + source Kernel instance. Using those avoids

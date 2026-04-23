@@ -78,6 +78,11 @@ class GemmKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
+        # cuBLAS-impl configs ignore the PTX tiling knobs entirely —
+        # validity is decided by cublas_dispatch.is_cublas_eligible at
+        # enumeration time, not by BM/BN/BK/main_shape here.
+        if getattr(c, "impl", "ptx") == "cublas":
+            return True
         if s.M % c.BM != 0 or s.N % c.BN != 0 or s.K % c.BK != 0:
             return False
         try:
@@ -202,6 +207,187 @@ class GemmKernel(Kernel):
             activation=activation,
             has_bias=has_bias,
             b_shuffle=b_shuffled,
+        )
+
+    @classmethod
+    def alt_configs(cls, spec, caps=None) -> list:
+        """Alternate-implementation configs outside ``tune_space()``.
+
+        The autotune cache concatenates this with the PTX cartesian
+        enumeration so cuBLAS competes on equal footing — one candidate
+        among ~hundreds of PTX configs, timed under the same event
+        bracket, cached by the same ``(kernel, spec, device)`` key.
+        The cache also seeds alt_configs into its warm-seed slot so
+        fast-search always times them (a single candidate in a pool
+        of hundreds would be randomly-sampled out most of the time
+        otherwise).
+
+        Returns ``[]`` when cuBLAS is ineligible or unavailable; the
+        caller treats both cases as "no alternate for this spec".
+        """
+        from quark.kernels.gemm.cublas_dispatch import is_cublas_eligible, make_cublas_config
+
+        if not is_cublas_eligible(spec, caps):
+            return []
+        return [make_cublas_config()]
+
+    @classmethod
+    def force_alt_config(cls, spec, caps=None):
+        """Return a forced-winner alt config, or ``None`` to skip the force path.
+
+        When ``QUARK_FORCE_CUBLAS=1`` and the spec is cuBLAS-eligible,
+        the autotune cache uses the returned config directly — no PTX
+        search, no cache write. The forced config is ephemeral: it's
+        returned in-memory only, so toggling the env off immediately
+        reverts to whatever the cache already knows (or triggers a
+        real search if it doesn't).
+        """
+        from quark.kernels.gemm.cublas_dispatch import (
+            is_cublas_eligible,
+            is_cublas_forced,
+            make_cublas_config,
+        )
+
+        if is_cublas_forced() and is_cublas_eligible(spec, caps):
+            return make_cublas_config()
+        return None
+
+    @classmethod
+    def dispatch_alt_config(cls, spec, config, *, provided, auto_alloc, like=None) -> dict:
+        """User-facing dispatch for an alt-impl config (cuBLAS).
+
+        Mirrors ``call_with_bindings``'s PTX branch but only allocates
+        auto-alloc buffers the alt path actually reads. For cuBLAS
+        that's just output-role buffers (``Out``) — input dummies like
+        the placeholder ``Bias`` when ``has_bias=False`` are *not*
+        materialized: cublasLt takes ``bias_ptr=0`` for the no-bias
+        case directly, so a fresh 1-element buffer every call would
+        burn ``cuMemAllocAsync`` + ``cuMemsetD8Async`` per GEMM. Inside
+        a captured CUDA graph that shows up as a per-frame replay cost
+        (~100-500 µs per call × every fp8 Linear × every frame — the
+        PR that introduced this path without the skip measured ~1.8×
+        overall regression from this exact waste).
+
+        The PTX path has no equivalent shortcut because the kernel's
+        ParamSpec always includes ``Bias`` in its buffer list; it
+        avoids the alloc cost instead by caching the dummy on
+        ``CompiledKernel._input_dummies``. cuBLAS has no ParamSpec
+        dependency, so we skip the mechanism entirely.
+        """
+        from quark.functional._dispatch import alloc_from_decl
+        from quark.kernels.gemm.cublas_dispatch import dispatch_cublas
+
+        if getattr(config, "impl", "ptx") != "cublas":
+            raise ValueError(f"dispatch_alt_config: expected impl='cublas', got {config.impl!r}")
+
+        decls_by_name = {d.name: d for d in cls.TENSORS}
+        if like is None:
+            like = next(iter(provided.values()))
+        full: dict = dict(provided)
+        for name in auto_alloc:
+            decl = decls_by_name[name]
+            # Only output-role buffers are materialized here — see
+            # docstring for why we skip input-role dummies.
+            if getattr(decl, "role", "in") != "out":
+                continue
+            full[name] = alloc_from_decl(decl, spec, config, like=like)
+
+        Bias = full.get("Bias") if spec.has_bias else None
+
+        # dispatch_cublas auto-picks active_stream() when stream=None,
+        # so it lands on the graph-capture stream correctly here.
+        dispatch_cublas(A=full["A"], B=full["B"], Out=full["Out"], Bias=Bias)
+        return full
+
+    @classmethod
+    def check_alt_config(cls, spec, config, *, tensors, reference) -> tuple:
+        """Correctness-check an alt-impl config against the reference.
+
+        Runs ``dispatch_cublas`` against the pre-built autotune test
+        tensors and compares the output to ``reference`` via
+        ``check_correctness``. Returns ``(passed: bool, cos_sim: float,
+        err: str | None)`` — same shape the autotune cache's
+        ``_check_config`` / full-search's ``_evaluate_config``
+        expect so the caller can branch on impl without duplicating
+        the correctness-gate machinery.
+
+        This hook is required because the default path in both searches
+        calls ``launcher.compile(kernel_cls, spec, cfg)`` — which
+        lowers *every* config through the PTX pipeline regardless of
+        ``impl``. For cuBLAS configs that means the default PTX knobs
+        (BM/BN/BK dataclass defaults) get used to "compile" the config;
+        the correctness gate then checks the PTX output (not cuBLAS's)
+        and the timing loop measures the PTX launch (not cuBLAS's).
+        Without this hook cuBLAS never actually gets timed or checked
+        as cuBLAS, and the autotune result's ``impl="cublas"`` tag
+        reflects PTX-with-defaults performance — completely wrong.
+        """
+        from quark.correctness import check_correctness
+        from quark.kernels.gemm.cublas_dispatch import dispatch_cublas
+        from quark.runtime.sync import ir_dtype_of, synchronize, zero_buffer
+
+        if getattr(config, "impl", "ptx") != "cublas":
+            raise ValueError(f"check_alt_config: expected impl='cublas', got {config.impl!r}")
+
+        A = tensors["A"]
+        B = tensors["B"]
+        Out_buf = tensors["Out"]
+        Bias = tensors.get("Bias") if spec.has_bias else None
+
+        try:
+            Out_zeroed = zero_buffer(Out_buf)
+            dispatch_cublas(A=A, B=B, Out=Out_zeroed, Bias=Bias)
+            synchronize()
+        except BaseException as e:
+            return False, float("nan"), f"{type(e).__name__}: {e}"
+
+        out_dtype = ir_dtype_of(Out_zeroed)
+        cr = check_correctness(
+            Out_zeroed,
+            reference,
+            out_dtype=out_dtype,
+            threshold=cls.correctness_threshold(out_dtype),
+        )
+        return cr.passed, cr.cos_sim, None
+
+    @classmethod
+    def time_alt_config(cls, launcher, kernel, *, tensors=None) -> float:
+        """Time an alt-impl config (cuBLAS) under the launcher's timing loop.
+
+        The PTX path compiles a kernel then times ``ck.launch(buffers)``;
+        this path skips compilation and times a ``dispatch_cublas``
+        closure against the same event-bracketed ``_time_callable``.
+        Tensors are materialized the same way as the PTX path so the
+        comparison is apples-to-apples.
+        """
+        from quark.kernels.gemm.cublas_dispatch import dispatch_cublas
+        from quark.launcher.launcher import _time_callable
+
+        if getattr(kernel.config, "impl", "ptx") != "cublas":
+            raise ValueError(f"time_alt_config: expected impl='cublas', got {kernel.config.impl!r}")
+
+        if tensors is None:
+            from quark.refs import ref_cache
+            from quark.runtime.device_tensors import numpy_to_device_dict
+
+            problems_fn = getattr(cls, "problems", None)
+            problems = problems_fn() if callable(problems_fn) else []
+            if not problems:
+                raise ValueError("time_alt_config: kernel.problems() is empty")
+            inputs_np, _ = ref_cache().get(cls, problems[0].params)
+            tensors = numpy_to_device_dict(cls, kernel.spec, inputs_np)
+
+        A = tensors["A"]
+        B = tensors["B"]
+        Out = tensors["Out"]
+        Bias = tensors.get("Bias") if kernel.spec.has_bias else None
+
+        for _ in range(launcher._autotune.warmup):
+            dispatch_cublas(A=A, B=B, Out=Out, Bias=Bias)
+        return _time_callable(
+            lambda: dispatch_cublas(A=A, B=B, Out=Out, Bias=Bias),
+            warmup_ms=10.0,
+            bench_ms=50.0,
         )
 
     @classmethod

@@ -147,6 +147,13 @@ def _parallel_compile(
     def _worker(cfg):
         if _runtime is not None:
             _runtime.retain_primary_context(0)
+        # Alt-impl configs (e.g. cuBLAS) don't go through PTX lowering —
+        # return (None, None) so the consumer treats them as "no compile
+        # needed" rather than "compile failed". _evaluate_config /
+        # _check_config will route them to the kernel's alt hook for
+        # correctness + timing.
+        if getattr(cfg, "impl", "ptx") != "ptx":
+            return _cfg_key(cfg), None, None, cfg
         try:
             return _cfg_key(cfg), launcher.compile(kernel_cls, spec, cfg), None, cfg
         except Exception as e:

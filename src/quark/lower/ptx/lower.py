@@ -439,20 +439,74 @@ class PtxLowerer:
         src_dtype: DType = op.attrs["src_dtype"]
         dst_dtype: DType = op.attrs["dst_dtype"]
         rounding: str = op.attrs.get("rounding", "rn")
-        if dst_dtype in (DType.E4M3, DType.E5M2):
-            # PTX has no scalar fp8 cvt — only the packed
-            # `cvt.<rnd>.satfinite.<fp8>x2.<src>x2` form. Callers that
-            # want fp8 dst must go through `PackedConvertOp` (see
-            # `_visit_packed_convert`), which consumes two source scalars
-            # at once and writes a width-2 fp8 Value. A scalar-wide
-            # ConvertOp to fp8 would have to fake a pair and discard half
-            # the result, so reject it here.
-            raise NotImplementedError(
-                f"scalar cvt → {dst_dtype.value} is not representable in PTX "
-                f"(only packed `{dst_dtype.value}x2` exists). Use "
-                f"`builder.packed_convert(lo, hi, {dst_dtype})` to convert "
-                f"two source values at once."
+
+        # Scalar fp → e4m3/e5m2: PTX has no single-element fp8 cvt,
+        # only the packed ``cvt.{fp8}x2.f32`` / ``cvt.{fp8}x2.{fp16|bf16}x2``
+        # forms. For a single-element convert we pair the source with
+        # a zero partner, emit the packed cvt, and narrow the packed
+        # b16 result to the one-byte fp8 destination. Works on sm_89+
+        # (Ada and later). For hot-path callers with paired inputs,
+        # ``builder.packed_convert`` is still the faster entry point —
+        # it skips the zero partner + narrow and stores 2 fp8 bytes in
+        # one b16 register.
+        if dst_dtype in (DType.E4M3, DType.E5M2) and src_v.width == 1:
+            fp8_suffix = dst_dtype.value  # "e4m3" or "e5m2"
+            # Promote to f32 so we can use the universal
+            # ``cvt.{fp8}x2.f32`` form regardless of src dtype. PTX has
+            # a direct ``cvt.{fp8}x2.{f16|bf16}x2`` form for PTX 9.1+
+            # but it's sm_90+ for bf16 and we want broad compatibility.
+            if src_dtype is DType.F32:
+                src_f32 = src
+            else:
+                src_f32 = ctx.regs.declare("f32")
+                ctx.emit(f"cvt.f32.{_cvt_suffix(src_dtype)} {src_f32}, {src};")
+            # Zero partner — goes to the 'a' (upper) byte; real value
+            # goes to 'b' (lower byte). Picking 'b' puts the result in
+            # the low 8 bits of the packed b16, so the subsequent
+            # narrow is just a ``cvt.u8.u16`` truncation.
+            zero_f32 = ctx.regs.declare("f32")
+            ctx.emit(f"mov.f32 {zero_f32}, 0f00000000;")
+            packed_b16 = ctx.regs.declare("b16")
+            ctx.emit(
+                f"cvt.{rounding}.satfinite.{fp8_suffix}x2.f32 {packed_b16}, {zero_f32}, {src_f32};"
             )
+            ctx.emit(f"cvt.u8.u16 {dst}, {packed_b16};")
+            return
+
+        # Scalar e4m3/e5m2 → fp: inverse of the above. Zero-extend the
+        # source byte into a b16 with the value in the low byte, emit
+        # ``cvt.f16x2.{fp8}x2`` to unpack, extract the lower 16 bits
+        # (our f16), then widen/convert to the destination dtype.
+        if src_dtype in (DType.E4M3, DType.E5M2) and src_v.width == 1:
+            fp8_suffix = src_dtype.value
+            # Zero-extend u8 → u16. ``cvt.u16.u8`` accepts the b8/u8
+            # register class the reg_class table maps fp8 to.
+            packed_in_b16 = ctx.regs.declare("b16")
+            ctx.emit(f"cvt.u16.u8 {packed_in_b16}, {src};")
+            # Unpack to f16x2 (packed in a b32). Our value is in the
+            # low 16 bits; the high half is whatever cvt(0) produces
+            # (= 0.0 in f16), which we discard.
+            packed_out_b32 = ctx.regs.declare("b32")
+            ctx.emit(f"cvt.{rounding}.f16x2.{fp8_suffix}x2 {packed_out_b32}, {packed_in_b16};")
+            f16_val = ctx.regs.declare("b16")
+            ctx.emit(f"cvt.u16.u32 {f16_val}, {packed_out_b32};")
+            if dst_dtype is DType.F16:
+                ctx.emit(f"mov.b16 {dst}, {f16_val};")
+            elif dst_dtype is DType.F32:
+                ctx.emit(f"cvt.f32.f16 {dst}, {f16_val};")
+            elif dst_dtype is DType.BF16:
+                # PTX has no direct f16→bf16; go through f32.
+                tmp_f32 = ctx.regs.declare("f32")
+                ctx.emit(f"cvt.f32.f16 {tmp_f32}, {f16_val};")
+                ctx.emit(f"cvt.rn.bf16.f32 {dst}, {tmp_f32};")
+            else:
+                # Widen to f32 first, then cvt to whatever dst is.
+                tmp_f32 = ctx.regs.declare("f32")
+                ctx.emit(f"cvt.f32.f16 {tmp_f32}, {f16_val};")
+                suffix = f".{rounding}" if dst_dtype.is_float or dst_dtype.is_int else ""
+                ctx.emit(f"cvt{suffix}.{_cvt_suffix(dst_dtype)}.f32 {dst}, {tmp_f32};")
+            return
+
         # Rounding mode: required when converting to a narrower float OR
         # when converting from integer to float (the integer value may
         # not be exactly representable).

@@ -249,6 +249,121 @@ class TestUnpackedConvert:
             b.unpacked_convert(v, src_dtype=DType.E4M3, dst_dtype=DType.BF16)
 
 
+class TestScalarFp8Convert:
+    """Scalar `bld.convert` to/from fp8 (e4m3 / e5m2).
+
+    PTX has no scalar cvt for fp8; the only fp8 cvt is the `x2` packed
+    form. For a single-element convert we synthesize the packed op by
+    pairing with a zero partner and narrowing / widening around it.
+    The result is that callers can do plain `qk.convert(x, DType.E4M3)`
+    and not know anything about packing.
+
+    These tests pin the emitted PTX sequence so scalar cvt stays on the
+    sm_89-compatible path (no PTX 9.1+ `bf16x2.e4m3x2` direct form).
+    """
+
+    # -- fp → e4m3 / e5m2 -------------------------------------------------
+
+    @pytest.mark.parametrize("fp8", [DType.E4M3, DType.E5M2])
+    def test_f32_to_fp8_packs_with_zero_then_narrows(self, fresh_builder, fp8):
+        b = fresh_builder
+        v = b.const(DType.F32, 1.0)
+        b.convert(v, fp8)
+        out = lower(b)
+        suffix = fp8.value  # "e4m3" / "e5m2"
+        # Zero partner in the upper byte, src in the lower byte.
+        assert "mov.f32" in out and "0f00000000" in out
+        assert f"cvt.rn.satfinite.{suffix}x2.f32" in out
+        # Low byte of the packed b16 is the result; narrow via cvt.u8.u16.
+        assert "cvt.u8.u16" in out
+        # Must not emit a nonexistent scalar fp8 cvt.
+        assert f"cvt.rn.{suffix}.f32" not in out
+        assert f"cvt.rn.satfinite.{suffix}.f32" not in out
+
+    @pytest.mark.parametrize("fp8", [DType.E4M3, DType.E5M2])
+    def test_bf16_to_fp8_promotes_via_f32(self, fresh_builder, fp8):
+        b = fresh_builder
+        v = b.const(DType.BF16, 0)
+        b.convert(v, fp8)
+        out = lower(b)
+        # bf16 widens to f32 first (direct bf16x2.e4m3x2 cvt is sm_90+).
+        assert "cvt.f32.bf16" in out
+        assert f"cvt.rn.satfinite.{fp8.value}x2.f32" in out
+        assert "cvt.u8.u16" in out
+        # Ensure we don't leak the sm_90-only direct path.
+        assert f"cvt.rn.satfinite.{fp8.value}x2.bf16x2" not in out
+
+    @pytest.mark.parametrize("fp8", [DType.E4M3, DType.E5M2])
+    def test_f16_to_fp8_promotes_via_f32(self, fresh_builder, fp8):
+        b = fresh_builder
+        v = b.const(DType.F16, 0)
+        b.convert(v, fp8)
+        out = lower(b)
+        assert "cvt.f32.f16" in out
+        assert f"cvt.rn.satfinite.{fp8.value}x2.f32" in out
+        assert "cvt.u8.u16" in out
+
+    # -- e4m3 / e5m2 → fp -------------------------------------------------
+
+    @pytest.mark.parametrize("fp8", [DType.E4M3, DType.E5M2])
+    def test_fp8_to_f16_unpacks_via_f16x2(self, fresh_builder, fp8):
+        b = fresh_builder
+        v = b.const(fp8, 0)
+        b.convert(v, DType.F16)
+        out = lower(b)
+        # Zero-extend u8 → u16, then unpack to f16x2.
+        assert "cvt.u16.u8" in out
+        assert f"cvt.rn.f16x2.{fp8.value}x2" in out
+        # Extract low half via cvt.u16.u32 and bind to the f16 dst.
+        assert "cvt.u16.u32" in out
+        # No nonexistent scalar fp8→f16 cvt.
+        assert f"cvt.rn.f16.{fp8.value}" not in out
+
+    @pytest.mark.parametrize("fp8", [DType.E4M3, DType.E5M2])
+    def test_fp8_to_f32_unpacks_and_widens(self, fresh_builder, fp8):
+        b = fresh_builder
+        v = b.const(fp8, 0)
+        b.convert(v, DType.F32)
+        out = lower(b)
+        assert "cvt.u16.u8" in out
+        assert f"cvt.rn.f16x2.{fp8.value}x2" in out
+        assert "cvt.u16.u32" in out
+        # f16 → f32 widen (unconditional, no .rn).
+        assert "cvt.f32.f16" in out
+
+    @pytest.mark.parametrize("fp8", [DType.E4M3, DType.E5M2])
+    def test_fp8_to_bf16_routes_through_f32(self, fresh_builder, fp8):
+        """fp8 → bf16 has no direct PTX path on sm_89 (`cvt.bf16.f16`
+        is sm_90+). Must go f16 → f32 → bf16."""
+        b = fresh_builder
+        v = b.const(fp8, 0)
+        b.convert(v, DType.BF16)
+        out = lower(b)
+        assert "cvt.u16.u8" in out
+        assert f"cvt.rn.f16x2.{fp8.value}x2" in out
+        assert "cvt.f32.f16" in out
+        assert "cvt.rn.bf16.f32" in out
+        # Must NOT emit sm_90-only direct paths.
+        assert "cvt.rn.bf16.f16" not in out
+        assert f"cvt.rn.bf16x2.{fp8.value}x2" not in out
+
+    # -- round-trip -------------------------------------------------------
+
+    def test_bf16_roundtrip_through_e4m3(self, fresh_builder):
+        """Sanity: convert bf16 → e4m3 → bf16 chains two scalar paths
+        without any leftover e4m3 or bf16 scalar cvt."""
+        b = fresh_builder
+        v = b.const(DType.BF16, 0)
+        q = b.convert(v, DType.E4M3)
+        b.convert(q, DType.BF16)
+        out = lower(b)
+        # Forward + backward both emit their respective packed cvts.
+        assert "cvt.rn.satfinite.e4m3x2.f32" in out
+        assert "cvt.rn.f16x2.e4m3x2" in out
+        assert "cvt.u8.u16" in out
+        assert "cvt.u16.u8" in out
+
+
 class TestBitcast:
     def test_f32_to_b32_via_mov(self, fresh_builder):
         b = fresh_builder

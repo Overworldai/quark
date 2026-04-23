@@ -47,21 +47,27 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
     throttling, cache warming all bias the probe-then-count approach
     toward the first generation of configs).
 
-    Phase 1 — warmup: launch ``fn()`` in a tight loop until wall-clock
-    elapsed ≥ ``warmup_ms``, periodically draining the command queue
-    so the host doesn't run ahead and skew what "warmup" means. Sync
-    once at the end so the bench starts from a drained pipeline.
+    Phase 1 — warmup: launch ``fn()`` eagerly in a tight loop until
+    wall-clock elapsed ≥ ``warmup_ms``, periodically draining the
+    command queue so the host doesn't run ahead and skew what "warmup"
+    means. Sync once at the end so capture starts drained.
 
-    Phase 2 — bench: bracket a wall-clock-bounded loop with CUDA
-    events. The events measure actual GPU execution time across every
-    launched iter (including queued work that finishes after the host
-    exits the loop), so the returned µs/call reflects GPU occupancy,
-    not host-side queueing. Sync on the end event before reading the
-    elapsed time.
+    Phase 2 — bench (CUDA): capture ``fn()`` into a CUDA graph once,
+    then replay that graph in a wall-clock-bounded loop bracketed by
+    CUDA events. Replaying a captured graph eliminates per-call
+    Python + driver-API overhead (cublasLt descriptor create/destroy,
+    dispatch bookkeeping, stream-ordered alloc setup) that the eager
+    loop over-weighted — and matches the regime production runs in
+    (QuarkBackend + user code capture the full forward once, then
+    replay per frame). This is what makes the PTX vs cuBLAS autotune
+    comparison apples-to-apples: both get measured at their true
+    steady-state GPU cost, nothing else.
 
-    Sync gates at both ends keep adjacent measurements from bleeding
-    into each other — important when the autotuner times dozens of
-    configs back-to-back.
+    Falls back to eager timing on capture failure (e.g. when ``fn()``
+    internally host-syncs) so autotune still works for any kernel
+    that can't be captured.
+
+    Metal path stays eager — graph capture isn't wired up there yet.
     """
     import time as _time
 
@@ -106,14 +112,28 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
             rt.stream_synchronize(0)
     rt.stream_synchronize(0)
 
-    # Phase 2: bench. CUDA events bracket a wall-clock-bounded loop.
+    # Phase 2: capture ``fn()`` once, replay the graph in the bench
+    # loop. If capture fails (kernel host-syncs internally, uses an
+    # unsupported op, etc.) fall back to eager — autotune needs to
+    # keep working even for kernels that can't graph.
+    captured = None
+    try:
+        from quark.graph import capture_graph
+
+        with capture_graph(quiet=True) as _g:
+            fn()
+        captured = _g
+    except Exception:
+        rt.stream_synchronize(0)
+    replay = captured.replay if captured is not None else fn
+
     start = rt.event_create()
     end = rt.event_create()
     rt.event_record(start, 0)
     t_bench = _time.perf_counter()
     n_bench = 0
     while (_time.perf_counter() - t_bench) * 1000 < bench_ms:
-        fn()
+        replay()
         n_bench += 1
     rt.event_record(end, 0)
     rt.event_synchronize(end)
@@ -550,6 +570,19 @@ class Launcher:
         kernel = kernel_cls(spec, config)
         if not _kernel_is_valid(kernel, self.device.caps):
             raise ValueError("config invalid for device")
+
+        # Alt-impl configs (e.g. cuBLAS) bypass PTX compile entirely.
+        # The kernel class provides a ``time_alt_config`` hook that
+        # materializes whatever buffers/runner the alt path needs and
+        # returns μs/call under the same timing loop.
+        impl = getattr(config, "impl", "ptx")
+        if impl != "ptx":
+            time_alt = getattr(kernel_cls, "time_alt_config", None)
+            if not callable(time_alt):
+                raise ValueError(
+                    f"config.impl={impl!r} but {kernel_cls.__name__} has no time_alt_config hook"
+                )
+            return time_alt(self, kernel, tensors=tensors)
 
         ck = self.compile(kernel_cls, spec, config)
 

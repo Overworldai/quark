@@ -1,5 +1,13 @@
 """Full genetic search — the body of ``AutotuneCache._search_full_result``.
 
+EXEMPT FROM 500-LINE RULE: the config enumeration, population breeding,
+per-config correctness+timing (``_evaluate_config``), and the outer
+generational loop (``run_full_search``) are all tightly coupled around
+the same compile-cache / reference / tensors state. Splitting would
+either duplicate that state threading across modules or force a
+circular import between the search driver and its per-config
+evaluator.
+
 Fast search on the launcher-absent fallback path is delegated back to
 ``cache._search_fast`` so we don't duplicate that logic here.
 """
@@ -172,6 +180,49 @@ def _evaluate_config(
     except BaseException as _e:
         say(f"  [prior cfg error drained]: {type(_e).__name__}: {_e}")
 
+    # Alt-impl configs (e.g. cuBLAS) can't be compiled through the PTX
+    # lowering pipeline — the ``compiled`` kernel threaded in here is
+    # either a PTX fallback with default knobs or None. Delegate
+    # correctness to the kernel's hook and do timing via its own
+    # dispatch under the same _time_callable budget so the comparison
+    # vs PTX configs is apples-to-apples.
+    impl = getattr(cfg, "impl", "ptx")
+    if impl != "ptx":
+        check_alt = getattr(kernel_cls, "check_alt_config", None)
+        if not callable(check_alt):
+            say(f"  [alt err] {cfg}: no check_alt_config hook for impl={impl!r}")
+            return float("inf"), "launch"
+        try:
+            passed, cos_sim, err = check_alt(spec, cfg, tensors=tensors, reference=reference)
+        except BaseException as _e:
+            say(f"  [alt check err] {cfg}: {type(_e).__name__}: {_e}")
+            return float("inf"), "launch"
+        if err is not None:
+            say(f"  [alt launch err] {cfg}: {err}")
+            return float("inf"), "launch"
+        if not passed:
+            say(f"  [wrong] {cfg}: cos={cos_sim:.4f}")
+            return float("inf"), "wrong"
+
+        # Time the alt dispatch under the same bench budget as PTX.
+        from quark.kernels.gemm.cublas_dispatch import dispatch_cublas
+
+        A = tensors["A"]
+        B = tensors["B"]
+        Out = tensors["Out"]
+        Bias = tensors.get("Bias") if spec.has_bias else None
+        try:
+            us = _time_callable(
+                lambda: dispatch_cublas(A=A, B=B, Out=Out, Bias=Bias),
+                warmup_ms=10.0,
+                bench_ms=bench_ms,
+            )
+        except BaseException as _e:
+            say(f"  [alt bench err] {cfg}: {type(_e).__name__}: {_e}")
+            return float("inf"), "time"
+        say(f"  {us:8.2f} μs  cos={cos_sim:.6f}  {cfg}")
+        return us, ""
+
     cfg_kernel = kernel_cls(spec_cls(**spec_dict), cfg)
     try:
         launch_tensors = cfg_kernel.prepare_launch_tensors(tensors)
@@ -320,6 +371,16 @@ def run_full_search(
         say=_say,
     )
 
+    # Alternate-implementation configs (e.g. cuBLAS for GEMM). Mirror
+    # the hook in cache._enumerate_valid so full search sees the same
+    # candidate set as fast search.
+    import contextlib as _contextlib
+
+    alt_fn = getattr(kernel_cls, "alt_configs", None)
+    if callable(alt_fn):
+        with _contextlib.suppress(TypeError, NotImplementedError):
+            valid_configs = list(valid_configs) + list(alt_fn(spec, lnch.device.caps))
+
     n_valid = len(valid_configs)
     if n_valid == 0:
         _say("(no valid configs)")
@@ -379,7 +440,12 @@ def run_full_search(
             for cfg in to_compile:
                 key = tuple(getattr(cfg, k) for k in knob_names)
                 compiled, err = compile_cache.get(key, (None, "not compiled"))
-                if compiled is None and err is None:
+                # Alt-impl configs (e.g. cuBLAS) never get compiled — the
+                # parallel-compile worker returns (None, None) for them.
+                # Let them fall through to _evaluate_config, which routes
+                # them to the kernel's alt hook.
+                is_alt = getattr(cfg, "impl", "ptx") != "ptx"
+                if compiled is None and err is None and not is_alt:
                     err = "compile returned None"
                 if err is not None:
                     _say(f"  [compile err] {cfg}: {err}")
