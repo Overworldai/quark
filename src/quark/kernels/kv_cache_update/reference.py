@@ -61,6 +61,20 @@ def _rope_positional_freqs(
 def _make_ortho_rope_freqs(H: int, W: int, T: int, Dh: int) -> tuple[np.ndarray, np.ndarray]:
     """Build (cos, sin) of shape ``[T*H*W, Dh//2]`` matching
     world_engine OrthoRoPE."""
+    # The downstream ``np.linspace(-1 + 1/W, 1 - 1/W, W)`` and
+    # ``1/H`` scalar divisions raise ``ZeroDivisionError: float
+    # division by zero`` if H or W is 0, which the autotune
+    # reference-setup path swallows as a generic "reference setup
+    # failed" log line. Catch here with a message that names the
+    # offending dim so callers don't have to spelunk through the
+    # RoPE math to figure out which spec field tripped it.
+    if H <= 0 or W <= 0 or Dh <= 0:
+        raise ValueError(
+            f"_make_ortho_rope_freqs: H_spatial, W_spatial, and Dh must all "
+            f"be > 0; got H={H}, W={W}, Dh={Dh}. Check the KVCacheUpdate "
+            f"layer's construction — zero spatial dims come from a model "
+            f"config that hasn't set height/width (cfg.height / cfg.width)."
+        )
     head_dim = Dh
     max_freq = min(H, W) * 0.8
 

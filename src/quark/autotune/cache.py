@@ -397,7 +397,15 @@ class AutotuneCache:
                 output_name = pspec.buffers[out_idx].name
                 reference = outputs_np[output_name]
             except Exception as e:
-                _log(name, f"reference setup failed ({type(e).__name__}: {e})")
+                # Include the spec in the log so "reference setup failed"
+                # is actionable — otherwise the spec-dependent errors
+                # (zero dims, dtype mismatches in the reference pipeline)
+                # are impossible to trace back to the layer that emitted
+                # them.
+                _log(
+                    name,
+                    f"reference setup failed ({type(e).__name__}: {e}) spec={_spec_summary(spec)}",
+                )
                 tensors = None
 
         return name, all_valid, knob_names, tensors, reference, pspec, out_idx

@@ -303,12 +303,25 @@ class KVCacheUpdateKernel(Kernel):
 
     @classmethod
     def tune_space(cls) -> dict[str, list]:
-        # Restricted: autotune sweeping the full cross product of
-        # tile_T × n_warps × smem_pad occasionally produced ILLEGAL_ADDRESS
-        # from device-side OOB in one of the failing configs. Until that's
-        # tracked down, we ship a single known-good point and let
-        # ``default_for`` pick it.
-        return {"tile_T": [64], "n_warps": [4], "smem_pad": [0]}
+        # Previously pinned to a single point (tile_T=64, n_warps=4,
+        # smem_pad=0) after the full cartesian occasionally produced
+        # ILLEGAL_ADDRESS in one of the failing configs. The error was
+        # never diagnosable before because the launcher's CudaError
+        # re-raise ate the real driver code — now fixed, so widen the
+        # space and let autotune surface any actual crashes with real
+        # codes we can add ``is_valid`` rules for.
+        #
+        # is_valid already enforces tpf % tile_T == 0 and the smem vec-
+        # store 16-byte alignment constraints, so invalid combos get
+        # filtered before launch. The wider space means autotune can
+        # find real winners on shapes where tile_T=64 isn't optimal
+        # (a ~2ms-per-layer cost on Waypoint-scale specs with the
+        # single-point pin).
+        return {
+            "tile_T": [16, 32, 64, 128, 256],
+            "n_warps": [2, 4, 8],
+            "smem_pad": [0, 8, 16],
+        }
 
     # ── emit() ──
 

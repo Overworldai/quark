@@ -470,12 +470,27 @@ class Launcher:
                     smem_bytes=lowered.smem_bytes,
                 )
             except Exception as exc:
+                from quark.runtime.cuda import CudaError
                 from quark.utils.ptx_dump import classify_compile_error, dump_path_for
 
                 if classify_compile_error(exc) == "ptx":
                     path = dump_path_for(kernel_cls, spec, config)
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(lowered.ptx)
+                    # ``CudaError(code, name, message)`` doesn't fit the
+                    # generic ``type(exc)(msg)`` pattern — the three-arg
+                    # ctor raises TypeError when passed a single formatted
+                    # string, eating the real driver code (218 INVALID_PTX,
+                    # 209 NO_BINARY_FOR_GPU, etc.) so autotune's [cerr]
+                    # logs just show the reconstruction TypeError instead.
+                    # Preserve the original code/name and fold the PTX
+                    # path into the message.
+                    if isinstance(exc, CudaError):
+                        raise CudaError(
+                            exc.code,
+                            exc.name,
+                            f"{exc.message}\n\nPTX dumped to: {path}",
+                        ) from exc
                     raise type(exc)(f"{exc}\n\nPTX dumped to: {path}") from exc
                 raise
 

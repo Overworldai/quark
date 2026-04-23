@@ -107,17 +107,20 @@ def e5m2_u8_to_f32(u8: np.ndarray) -> np.ndarray:
 
 
 def _encode_e4m3_scalar(x: float) -> int:
+    import math
+
     if x != x:  # NaN
         return 0x7F  # canonical NaN encoding
     if x == 0.0:
-        return 0x80 if (1.0 / x) == float("-inf") else 0x00
+        # Python scalar ``1.0 / 0.0`` raises ZeroDivisionError regardless
+        # of the zero's sign (unlike IEEE 754 / numpy, which yield ±inf).
+        # Use ``math.copysign`` to recover the sign bit without dividing.
+        return 0x80 if math.copysign(1.0, x) < 0 else 0x00
     sign = 1 if x < 0 else 0
     ax = abs(x)
     # Clamp to max representable e4m3 (448) per OCP FP8.
     if ax >= 448.0:
         return (sign << 7) | 0x7E  # ±448 (not NaN)
-    import math
-
     exp = math.floor(math.log2(ax))
     # Unbiased exp range for e4m3: subnormal for exp<-6, normal up to 8.
     if exp < -6:
