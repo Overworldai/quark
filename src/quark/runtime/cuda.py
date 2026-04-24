@@ -303,12 +303,31 @@ class CudaRuntime:
         ]
         L.cuMemcpyHtoD_v2.restype = ctypes.c_int
 
+        L.cuMemcpyHtoDAsync_v2.argtypes = [
+            ctypes.c_uint64,  # CUdeviceptr dst
+            ctypes.c_void_p,  # const void* src
+            ctypes.c_size_t,
+            ctypes.c_void_p,  # CUstream
+        ]
+        L.cuMemcpyHtoDAsync_v2.restype = ctypes.c_int
+
         L.cuMemcpyDtoH_v2.argtypes = [
             ctypes.c_void_p,  # void* dst
             ctypes.c_uint64,  # CUdeviceptr src
             ctypes.c_size_t,
         ]
         L.cuMemcpyDtoH_v2.restype = ctypes.c_int
+
+        # Pinned host allocation (birth-pinned: no cuMemHostRegister
+        # page-table walk). Drives the load_safetensors fast path.
+        L.cuMemHostAlloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        L.cuMemHostAlloc.restype = ctypes.c_int
+        L.cuMemFreeHost.argtypes = [ctypes.c_void_p]
+        L.cuMemFreeHost.restype = ctypes.c_int
 
         L.cuMemsetD8_v2.argtypes = [
             ctypes.c_uint64,  # CUdeviceptr dst
@@ -603,13 +622,9 @@ class CudaRuntime:
             self._check(self._lib.cuMemFree_v2(ctypes.c_uint64(ptr)))
 
     def memcpy_htod(self, dst: int, src: int, nbytes: int) -> None:
-        """Host → device. ``src`` is the host pointer (e.g. ``arr.ctypes.data``).
-
-        Runs at full PCIe bandwidth only if ``src`` is page-locked
-        (``cuMemHostRegister`` or ``cuMemHostAlloc``). Pageable HtoD
-        stages through a small internal pinned buffer at ~1/4 speed
-        and serializes per driver call — hence the register dance in
-        ``quark.nn.io.load_safetensors``.
+        """Sync host → device. Full PCIe bandwidth iff ``src`` is page-
+        locked (``cuMemHostAlloc`` / ``cuMemHostRegister``); pageable
+        stages through a small driver pinned buffer at ~1/4 speed.
         """
         self._check(
             self._lib.cuMemcpyHtoD_v2(
@@ -617,10 +632,40 @@ class CudaRuntime:
             )
         )
 
-    # Host-memory flags (CUmemhostregister_flags).
-    _MEMHOSTREGISTER_PORTABLE = 0x01
-    _MEMHOSTREGISTER_DEVICEMAP = 0x02
+    def memcpy_htod_async(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        """Async host → device on ``stream``. ``src`` must be pinned for
+        true async behavior; pageable falls back to driver-internal sync.
+        """
+        self._check(
+            self._lib.cuMemcpyHtoDAsync_v2(
+                ctypes.c_uint64(dst),
+                ctypes.c_void_p(src),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_void_p(stream),
+            )
+        )
+
+    # Host-memory flags (CUmemhostregister_flags / CUmemhostalloc_flags).
+    _MEMHOSTREGISTER_PORTABLE = _MEMHOSTALLOC_PORTABLE = 0x01
     _MEMHOSTREGISTER_READ_ONLY = 0x08
+    _MEMHOSTALLOC_WRITECOMBINED = 0x04
+
+    def memhost_alloc(self, nbytes: int, *, write_combined: bool = False) -> int:
+        """Allocate birth-pinned host memory (no ``memhost_register`` page
+        walk). ``write_combined=True`` = CPU-writes-only staging (CPU
+        reads through WC are slow). Free via :meth:`memhost_free`."""
+        flags = self._MEMHOSTALLOC_PORTABLE
+        if write_combined:
+            flags |= self._MEMHOSTALLOC_WRITECOMBINED
+        p = ctypes.c_void_p()
+        self._check(
+            self._lib.cuMemHostAlloc(ctypes.byref(p), ctypes.c_size_t(nbytes), ctypes.c_uint(flags))
+        )
+        return p.value or 0
+
+    def memhost_free(self, ptr: int) -> None:
+        """Free memory allocated via :meth:`memhost_alloc`."""
+        self._check(self._lib.cuMemFreeHost(ctypes.c_void_p(ptr)))
 
     def memhost_register(
         self,

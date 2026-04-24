@@ -195,7 +195,7 @@ class QuarkTensor:
 
     def __init__(
         self,
-        storage: _CudaStorage | _BorrowedStorage,
+        storage,  # _CudaStorage | _BorrowedStorage | duck-typed slice storage
         shape: tuple[int, ...],
         strides: tuple[int, ...],
         offset: int,
