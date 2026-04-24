@@ -462,6 +462,10 @@ def main():
 
     if args.bf16:
         cfg = _dc.replace(cfg, use_f16=False)
+    # ``--fp8`` now drives both Linear weight quantization AND the KV
+    # cache dtype / OwlAttn MMA path. Without it everything stays in
+    # half_dt end-to-end (safe fallback).
+    cfg = _dc.replace(cfg, use_fp8=args.fp8)
     # ctrl_conditioning is always True — even with default CtrlInput(),
     # the MLPFusion on every 3rd block transforms x through its own weights.
 
@@ -480,7 +484,7 @@ def main():
     t0 = time.perf_counter()
     repo_suffix = "-360P" if args.preset == "360p" else ""
     model = Waypoint15.from_world_engine_hub(args.repo + repo_suffix, cfg=cfg, dtype="bf16")
-    model.prepare(shuffle=args.b_shuffle, fp8=args.fp8)
+    model.prepare(shuffle=args.b_shuffle)  # fp8 defaults to cfg.use_fp8
     _sync()
     print(f"  model ready ({time.perf_counter() - t0:.1f}s)")
 

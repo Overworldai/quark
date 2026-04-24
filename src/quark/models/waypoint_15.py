@@ -66,6 +66,15 @@ class Waypoint15Config:
     ctrl_conditioning: bool = True
     ctrl_conditioning_period: int = 3
     use_f16: bool = True  # False → bf16 weights + f32 output (safe baseline)
+    # End-to-end fp8 mode. When True (default on sm_89+):
+    #   - Linear weights are quantized to e4m3 by ``prepare()``
+    #   - KV cache is stored as e4m3
+    #   - OwlAttn runs both MMAs in e4m3 (Q/K/V all cast to e4m3
+    #     internally)
+    # When False, everything stays in the "half" dtype (bf16 by default)
+    # from weights through KV cache through attention MMAs — the safe
+    # fallback for devices without fp8 support or for precision debugging.
+    use_fp8: bool = True
 
     @property
     def Dh(self):
@@ -210,13 +219,16 @@ class TransformerBlock(nn.Module):
         self.head_norm = nn.HeadRMSNorm(cfg.n_heads, cfg.n_kv_heads, cfg.Dh)
         if cfg.value_residual:
             self.v_residual = nn.ValueResidualPacked(cfg.v_col_offset, cfg.v_width)
-        # KV cache + kv_cache_update write + owl_attn MMAs all run in
-        # e4m3: cache stride, cp.async KV smem tile, and the GEMM inputs
-        # share a width so the TileLoad path avoids the bf16→e4m3
-        # runtime cast and the cache bandwidth halves. Q still arrives
-        # in half precision; it's cast to e4m3 during the Q-RoPE pass
-        # (packed_convert) inside owl_attn.
-        kv_cache_dt = "e4m3"
+        # KV cache + owl_attn MMAs are driven by ``cfg.use_fp8``:
+        #   fp8 path: e4m3 cache + e4m3 MMAs; Q is cast to e4m3 during
+        #     the Q-RoPE pass (packed_convert) inside owl_attn. Cache
+        #     bandwidth halves + sm_89+ fp8 MMA throughput win.
+        #   bf16 path: kv cache, Q, K, V all in half_dt; MMAs inherit
+        #     that from the tensor dtypes (compute_dtype=None). The
+        #     safe fallback when fp8 is misbehaving or the device
+        #     doesn't support it.
+        kv_cache_dt = "e4m3" if cfg.use_fp8 else half_dt
+        owl_compute_dt = "e4m3" if cfg.use_fp8 else None
         self.kv_cache = nn.KVCacheUpdate(
             B=1,
             n_kv_heads=cfg.n_kv_heads,
@@ -240,6 +252,7 @@ class TransformerBlock(nn.Module):
             pinned_dilation=cfg.pinned_dilation(layer_idx),
             packed_qkv=True,
             rope_n_frames=rope_n_frames,
+            compute_dtype=owl_compute_dt,
         )
         out_dt = "f16" if cfg.use_f16 else "bf16"
         self.out_proj = nn.Linear(cfg.n_heads * cfg.Dh, d, out_dtype=out_dt)
@@ -375,9 +388,17 @@ class Waypoint15(nn.Module):
         # ``load_state_dict(...)`` then ``prepare()`` themselves.
 
     def prepare(self, **kwargs):
-        """Pre-compute per-sigma cond LUTs. Call after loading weights."""
+        """Pre-compute per-sigma cond LUTs. Call after loading weights.
+
+        ``fp8`` defaults to ``cfg.use_fp8`` so Linear weight quantization
+        stays consistent with the KV cache / OwlAttn paths (which were
+        committed at ``__init__`` time based on the same flag). Caller
+        can still override with ``prepare(fp8=False)`` for mix-and-match
+        — but that will desync from attn and is rarely what you want.
+        """
         cfg = self.cfg
         d = cfg.d_model
+        kwargs.setdefault("fp8", cfg.use_fp8)
 
         noise_lut = pcf.precompute_noise_lut(
             list(cfg.scheduler_sigmas),

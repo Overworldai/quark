@@ -663,6 +663,7 @@ class OwlAttn(Module):
         pinned_dilation: int,
         packed_qkv: bool,
         rope_n_frames: int = 1,  # kept for compat but unused (inline RoPE)
+        compute_dtype: str | None = "e4m3",
     ):
         self._kw = dict(
             B=B,
@@ -674,6 +675,12 @@ class OwlAttn(Module):
             pinned_dilation=pinned_dilation,
             packed_qkv=packed_qkv,
         )
+        # MMA / smem compute dtype. ``"e4m3"`` drives both GEMMs in fp8
+        # regardless of Q's arrival dtype (caller must also pin the KV
+        # cache to e4m3 for this to work). ``None`` inherits from Q —
+        # bf16 input → bf16 MMAs. Set to None by the bf16 fallback path
+        # in Waypoint15 when ``cfg.use_fp8 = False``.
+        self._compute_dtype = compute_dtype
 
     def forward(self, qkv, kv_cache, frame_t=None):
         """``kv_cache``: a ``KVCacheUpdate`` module (reads its buffers)."""
@@ -700,6 +707,6 @@ class OwlAttn(Module):
             kv_cache.n_segments,
             frame_t=frame_t,
             out=out,
-            compute_dtype="e4m3",
+            compute_dtype=self._compute_dtype,
             **self._kw,
         )
