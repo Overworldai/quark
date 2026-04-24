@@ -353,6 +353,29 @@ class QuarkTensor:
     # ── Zero-copy wrapping of external tensors ──
 
     @staticmethod
+    def borrow(
+        ptr: int,
+        nbytes: int,
+        shape: tuple[int, ...],
+        dtype: str,
+        *,
+        owner: object = None,
+        strides: tuple[int, ...] | None = None,
+        offset: int = 0,
+    ) -> QuarkTensor:
+        """Zero-copy wrap an existing device pointer as a QuarkTensor.
+
+        Non-owning: caller (or ``owner``) must keep the allocation
+        alive for the returned tensor's lifetime. ``owner`` anchors GC
+        (e.g. the source ``torch.Tensor`` whose ``.data_ptr()`` is
+        passed as ``ptr``). Strides default to row-major over ``shape``.
+        """
+        if strides is None:
+            strides = _contiguous_strides(tuple(shape))
+        storage = _BorrowedStorage(ptr, nbytes, owner=owner)
+        return QuarkTensor(storage, tuple(shape), tuple(strides), offset, dtype)
+
+    @staticmethod
     def from_mlx(t) -> QuarkTensor:
         """Zero-copy wrap an ``mx.array`` as a QuarkTensor.
 
@@ -708,6 +731,29 @@ class QuarkTensor:
         from quark.runtime.kernels import copy_strided_into
 
         copy_strided_into(self, src)
+
+    def copy_into_ptr(self, dst_ptr: int, stream: int = 0) -> None:
+        """Async D2D copy self → ``dst_ptr``. Hand-off primitive for foreign
+        owners (e.g. torch). Non-contiguous tensors are made contiguous first."""
+        t = self.contiguous()
+        nbytes = t.numel() * PC_BYTES[t._dtype]
+        if nbytes == 0:
+            return
+        from quark.runtime.cuda import CudaRuntime
+
+        CudaRuntime.instance().memcpy_dtod(dst_ptr, t.data_ptr(), nbytes, stream=stream)
+
+    def copy_from_ptr(self, src_ptr: int, stream: int = 0) -> None:
+        """Async D2D copy ``src_ptr`` → self. Counterpart to ``copy_into_ptr``;
+        self must be contiguous (common case — borrowed stable buffers)."""
+        if not self.is_contiguous():
+            raise ValueError("copy_from_ptr: destination tensor must be contiguous")
+        nbytes = self.numel() * PC_BYTES[self._dtype]
+        if nbytes == 0:
+            return
+        from quark.runtime.cuda import CudaRuntime
+
+        CudaRuntime.instance().memcpy_dtod(self.data_ptr(), src_ptr, nbytes, stream=stream)
 
     @staticmethod
     def cat(tensors: list[QuarkTensor], dim: int = 0) -> QuarkTensor:

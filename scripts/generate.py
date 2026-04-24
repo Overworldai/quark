@@ -85,79 +85,6 @@ def _tensor(data, dtype="f32"):
     return QuarkTensor.from_list(data, dtype=dtype)
 
 
-def _make_ctrl_input(model):
-    """Allocate the persistent ``[1, padded_in]`` ctrl MLP input and
-    return ``(dev_tensor, fill_fn)`` where ``fill_fn(ctrl)`` updates
-    the device tensor in place from a ``CtrlInput`` and returns it.
-
-    Shape / dtype come from the model so generate.py doesn't hardcode
-    them. Returns ``(None, None)`` when the model has no ``ctrl_emb``.
-    """
-    if not hasattr(model, "ctrl_emb"):
-        return None, None
-
-    import numpy as np
-
-    shape = model.ctrl_input_shape  # (1, padded_in)
-    dtype = model.ctrl_input_dtype()
-    n_buttons = model.cfg.n_buttons
-
-    if _IS_METAL:
-        import mlx.core as mx
-
-        mx_dt = mx.bfloat16 if dtype == "bf16" else mx.float16
-        dev = mx.zeros(shape, dtype=mx_dt)
-        host = np.zeros(shape, dtype=np.float32)
-
-        def fill(ctrl):
-            nonlocal dev
-            host.fill(0.0)
-            host[0, 0] = float(ctrl.mouse[0])
-            host[0, 1] = float(ctrl.mouse[1])
-            for b in ctrl.button:
-                if 0 <= b < n_buttons:
-                    host[0, 2 + b] = 1.0
-            host[0, 2 + n_buttons] = float(ctrl.scroll_wheel)
-            if dtype == "bf16":
-                u16 = (host.view(np.uint32) >> 16).astype(np.uint16)
-                dev = mx.array(u16).view(mx.bfloat16).reshape(*shape)
-            else:
-                dev = mx.array(host.astype(np.float16))
-            return dev
-
-        return dev, fill
-
-    from quark.runtime.cuda import CudaRuntime
-    from quark.runtime.tensor import QuarkTensor
-
-    dev = QuarkTensor.zeros(*shape, dtype=dtype)
-    host = np.zeros(shape, dtype=np.float32)
-    # Pre-allocate the packed-bits staging buffer once; per-call is an
-    # in-place f32→target cast + a single memcpy_htod.
-    if dtype == "bf16":
-        staged = np.zeros(shape, dtype=np.uint16)
-    else:  # f16
-        staged = np.zeros(shape, dtype=np.float16)
-    rt = CudaRuntime.instance()
-
-    def fill(ctrl):
-        host.fill(0.0)
-        host[0, 0] = float(ctrl.mouse[0])
-        host[0, 1] = float(ctrl.mouse[1])
-        for b in ctrl.button:
-            if 0 <= b < n_buttons:
-                host[0, 2 + b] = 1.0
-        host[0, 2 + n_buttons] = float(ctrl.scroll_wheel)
-        if dtype == "bf16":
-            staged[:] = (host.view(np.uint32) >> 16).astype(np.uint16)
-        else:
-            staged[:] = host.astype(np.float16)
-        rt.memcpy_htod(dev.data_ptr(), staged.ctypes.data, staged.nbytes)
-        return dev
-
-    return dev, fill
-
-
 def _precompute_noise(n_frames: int, elems_per_frame: int, dtype: str = "bf16") -> list:
     """Pre-generate ``n_frames`` latent-noise tensors on host via a single
     bulk ``np.random.randn`` call and upload as a **list of ``[1, elems]``
@@ -198,51 +125,6 @@ def _precompute_noise(n_frames: int, elems_per_frame: int, dtype: str = "bf16") 
     ]
 
 
-def _astype(x, dtype: str):
-    if _IS_METAL:
-        from quark.backend import PT
-
-        _dt = {"bf16": PT.bfloat16, "f16": PT.float16, "f32": PT.float32, "s32": PT.int32}
-        return PT.astype(x, _dt.get(dtype, PT.bfloat16))
-    return x.astype(dtype)
-
-
-def _cat(tensors, dim=0):
-    if _IS_METAL:
-        from quark.backend import PT
-
-        return PT.cat(tensors, dim=dim)
-    from quark.runtime.tensor import QuarkTensor
-
-    return QuarkTensor.cat(tensors, dim=dim)
-
-
-def _reshape(x, *shape):
-    if _IS_METAL:
-        from quark.backend import PT
-
-        return PT.reshape(x, shape)
-    return x.reshape(*shape)
-
-
-def _permute(x, dims):
-    if _IS_METAL:
-        from quark.backend import PT
-
-        return PT.permute(x, dims)
-    return x.permute(*dims)
-
-
-def _expand(x, shape):
-    if _IS_METAL:
-        from quark.backend import PT
-
-        return PT.expand(x, shape)
-    # QuarkTensor doesn't have expand yet — use broadcast via reshape + cat.
-    # For the [C, 1, 1] → [C, ph, pw] case, just repeat manually.
-    raise NotImplementedError("_expand: not yet on QuarkTensor — use reshape + tile")
-
-
 def _to_numpy_f32(x):
     """Convert a device tensor to a numpy float32 array."""
     import numpy as np
@@ -278,132 +160,6 @@ def _from_numpy(arr, dtype="bf16"):
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.from_numpy(arr, dtype=dtype)
-
-
-# ---------------------------------------------------------------
-# Weight remapping
-# ---------------------------------------------------------------
-
-
-def remap_state_dict(raw_sd: dict, cfg) -> dict:
-    from quark.models.waypoint_15 import Waypoint15Config
-
-    sd: dict = {}
-    d = cfg.d_model
-    ph, pw = cfg.patch
-    C = cfg.channels
-
-    w = raw_sd["patchify.weight"]
-    sd["patchify.weight"] = _reshape(w, d, C * ph * pw) if w.ndim == 4 else w
-
-    w = raw_sd["unpatchify.weight"]
-    if w.ndim == 4:
-        w = _reshape(_permute(w, (1, 2, 3, 0)), C * ph * pw, d)
-    sd["unpatchify.weight"] = w
-
-    b = raw_sd["unpatchify.bias"]
-    if int(b.shape[0]) == C:
-        # Tile [C] → [C*ph*pw] by repeating each element ph*pw times.
-        # On Metal we can use mx.tile; on CUDA do it via reshape + cat.
-        if _IS_METAL:
-            from quark.backend import PT
-
-            if PT._is_mx(b):
-                import mlx.core as mx
-
-                b = mx.tile(b[:, None, None], (1, ph, pw)).reshape(-1)
-            else:
-                b = _reshape(_expand(b.reshape(C, 1, 1), (C, ph, pw)), -1)
-        else:
-            # QuarkTensor: repeat via explicit construction.
-            import struct as _struct
-
-            b_f32 = b.astype("f32")
-            b_vals = list(_struct.unpack(f"<{C}f", b_f32.to_bytes()))
-            tiled = []
-            for v in b_vals:
-                tiled.extend([v] * (ph * pw))
-            from quark.runtime.tensor import QuarkTensor
-
-            b = QuarkTensor.from_list(tiled, dtype="f32")
-            b = b.astype(raw_sd["unpatchify.bias"].dtype if hasattr(raw_sd["unpatchify.bias"], "dtype") else "bf16")
-    sd["unpatchify.bias"] = b
-
-    sd["noise_fc1.weight"] = raw_sd["denoise_step_emb.mlp.fc1.weight"]
-    sd["noise_fc2.weight"] = raw_sd["denoise_step_emb.mlp.fc2.weight"]
-    sd["out_norm_proj.weight"] = raw_sd["out_norm.fc.weight"]
-
-    for i in range(cfg.n_layers):
-        p = f"transformer.blocks.{i}."
-
-        # Per-block conditioning: separate attn and mlp cond heads.
-        if p + "cond_head.bias_in" in raw_sd:
-            # Shared cond_head (both paths use same bias_in).
-            sd[f"blocks.{i}.attn_cond_bias_in"] = raw_sd[p + "cond_head.bias_in"]
-            sd[f"blocks.{i}.mlp_cond_bias_in"] = raw_sd[p + "cond_head.bias_in"]
-            for j in range(6):
-                sd[f"blocks.{i}.cond_projs.{j}.weight"] = raw_sd[p + f"cond_head.cond_proj.{j}.weight"]
-        else:
-            # Separate attn_cond_head and mlp_cond_head with DIFFERENT bias_in.
-            sd[f"blocks.{i}.attn_cond_bias_in"] = raw_sd[p + "attn_cond_head.bias_in"]
-            sd[f"blocks.{i}.mlp_cond_bias_in"] = raw_sd[p + "mlp_cond_head.bias_in"]
-            for j in range(3):
-                sd[f"blocks.{i}.cond_projs.{j}.weight"] = raw_sd[p + f"attn_cond_head.cond_proj.{j}.weight"]
-                sd[f"blocks.{i}.cond_projs.{j+3}.weight"] = raw_sd[p + f"mlp_cond_head.cond_proj.{j}.weight"]
-
-        q_w = raw_sd[p + "attn.q_proj.weight"]
-        k_w = raw_sd[p + "attn.k_proj.weight"]
-        v_w = raw_sd[p + "attn.v_proj.weight"]
-        sd[f"blocks.{i}.qkv_proj.weight"] = _cat([q_w, k_w, v_w], dim=0)
-        sd[f"blocks.{i}.out_proj.weight"] = raw_sd[p + "attn.out_proj.weight"]
-
-        fc1 = p + ("mlp.fc1.weight" if p + "mlp.fc1.weight" in raw_sd else "dit_mlp.fc1.weight")
-        fc2 = p + ("mlp.fc2.weight" if p + "mlp.fc2.weight" in raw_sd else "dit_mlp.fc2.weight")
-        sd[f"blocks.{i}.mlp.fc1.weight"] = raw_sd[fc1]
-        sd[f"blocks.{i}.mlp.fc2.weight"] = raw_sd[fc2]
-
-        if cfg.value_residual and p + "attn.v_lamb" in raw_sd:
-            lamb = raw_sd[p + "attn.v_lamb"]
-            if lamb.ndim == 0:
-                lamb = _reshape(lamb, 1)
-            sd[f"blocks.{i}.v_residual.lamb"] = _astype(lamb, "f32")
-
-        # Controller MLPFusion weights (only when ctrl_conditioning enabled).
-        if cfg.ctrl_conditioning:
-            fc1_x_key = p + "ctrl_mlpfusion.fc1_x.weight"
-            fc1_c_key = p + "ctrl_mlpfusion.fc1_c.weight"
-            fc2_key = p + "ctrl_mlpfusion.fc2.weight"
-            if fc1_x_key in raw_sd:
-                sd[f"blocks.{i}.ctrl_fusion.fc1_x.weight"] = raw_sd[fc1_x_key]
-                sd[f"blocks.{i}.ctrl_fusion.fc1_c.weight"] = raw_sd[fc1_c_key]
-                sd[f"blocks.{i}.ctrl_fusion.fc2.weight"] = raw_sd[fc2_key]
-            elif p + "ctrl_mlpfusion.mlp.fc1.weight" in raw_sd:
-                fc1_cat = raw_sd[p + "ctrl_mlpfusion.mlp.fc1.weight"]
-                d_model = int(fc1_cat.shape[1]) // 2
-                sd[f"blocks.{i}.ctrl_fusion.fc1_x.weight"] = fc1_cat[:, :d_model]
-                sd[f"blocks.{i}.ctrl_fusion.fc1_c.weight"] = fc1_cat[:, d_model:]
-                fc2_alt = p + "ctrl_mlpfusion.mlp.fc2.weight"
-                sd[f"blocks.{i}.ctrl_fusion.fc2.weight"] = raw_sd[fc2_alt]
-
-    # Controller input embedding (only when ctrl_conditioning enabled).
-    ctrl_fc1_key = "ctrl_emb.mlp.fc1.weight"
-    if cfg.ctrl_conditioning and ctrl_fc1_key in raw_sd:
-        fc1_w = raw_sd[ctrl_fc1_key]  # [d_mid, n_buttons+3]
-        # Pad columns to multiple of 16 for GEMM tile alignment.
-        raw_k = int(fc1_w.shape[1])
-        padded_k = ((raw_k + 15) // 16) * 16
-        if padded_k > raw_k:
-            import numpy as np
-
-            w_np = _to_numpy_f32(fc1_w)  # [d_mid, raw_k] f32
-            padded = np.zeros((w_np.shape[0], padded_k), dtype=np.float32)
-            padded[:, :raw_k] = w_np
-            half_dt = "f16" if cfg.use_f16 else "bf16"
-            fc1_w = _from_numpy(padded, dtype=half_dt)
-        sd["ctrl_emb.fc1.weight"] = fc1_w
-        sd["ctrl_emb.fc2.weight"] = raw_sd["ctrl_emb.mlp.fc2.weight"]
-
-    return sd
 
 
 # ---------------------------------------------------------------
@@ -722,12 +478,8 @@ def main():
     # ── Load model ──
     print(f"loading model from {args.repo} …")
     t0 = time.perf_counter()
-    from quark.nn.io import load_from_hub
-
     repo_suffix = "-360P" if args.preset == "360p" else ""
-    raw_sd = load_from_hub(args.repo + repo_suffix, dtype="bf16")
-    model = Waypoint15(cfg)
-    model.load_state_dict(remap_state_dict(raw_sd, cfg), strict=False)
+    model = Waypoint15.from_world_engine_hub(args.repo + repo_suffix, cfg=cfg, dtype="bf16")
     model.prepare(shuffle=args.b_shuffle, fp8=args.fp8)
     _sync()
     print(f"  model ready ({time.perf_counter() - t0:.1f}s)")
@@ -741,7 +493,7 @@ def main():
     n_denoise = len(sigmas) - 1
     frame_t = _tensor([0], dtype="s32")
 
-    ctrl_dev, ctrl_fill = _make_ctrl_input(model)
+    ctrl_dev, ctrl_fill = model.make_ctrl_buffer()
     if ctrl_fill is not None:
         ctrl_fill(CtrlInput())  # zero-filled default for autotune + seed
     autotune_ctrl_emb = model.encode_ctrl(ctrl_dev)
@@ -913,30 +665,10 @@ def main():
         if ctrl_fill is not None:
             ctrl_fill(ctrl_sequence[0] if ctrl_sequence else CtrlInput())
 
-        # Eager warmup: one full frame before capture so every cached
-        # output buffer (euler_step, RMSNorm, AdaGateResidual, ctrl
-        # path, etc.) is already allocated. Otherwise the capture bakes
-        # ``cuMemAllocAsync`` nodes into the graph, which replay re-runs
-        # at a different stream-ordered address every frame and
-        # de-syncs the cached-ptr state python-side.
-        gen_frame.set_frame_t(seed_frame_count)
-        _ = gen_frame(noise_pool[0], ctrl_dev)
-        _sync()
-
-        # Reset frame_t — the warmup call incremented it.
-        gen_frame.set_frame_t(seed_frame_count)
-        _sync()
-
         print("  capturing graph …")
         t_cap = time.perf_counter()
-        gen_frame.graph(noise_pool[0], ctrl_dev)
+        gen_frame.prepare_graph(noise_pool[0], ctrl_dev, start_frame_t=seed_frame_count)
         print(f"  captured in {time.perf_counter() - t_cap:.2f}s")
-        _sync()
-
-        # Capture ran one forward pass → frame_t bumped once more.
-        # Reposition to the real starting value before the loop.
-        gen_frame.set_frame_t(seed_frame_count)
-        _sync()
 
         for fi in range(args.n_frames):
             if ctrl_sequence and ctrl_fill is not None:

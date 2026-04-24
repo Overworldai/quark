@@ -641,6 +641,12 @@ class KVCacheUpdate(Module):
         else:
             self.frame_t = _tensor([value], dtype="s32")
 
+    def reset(self, stream: int = 0) -> None:
+        """Zero the ring buffers and rewind frame_t. Async on ``stream``."""
+        self.K_cache.zero_()
+        self.Vt_cache.zero_()
+        self.set_frame_t(0, stream=stream)
+
 
 class OwlAttn(Module):
     """Owl attention module — carries per-layer config kwargs."""

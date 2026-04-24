@@ -108,6 +108,51 @@ class Waypoint15Config:
     def pinned_dilation(self, layer):
         return self.global_pinned_dilation if self.is_global(layer) else 1
 
+    @classmethod
+    def from_world_engine(cls, we_cfg, **overrides) -> Waypoint15Config:
+        """Build a ``Waypoint15Config`` from a ``world_engine`` model config.
+
+        ``we_cfg`` is either an OmegaConf node or a plain dict (or any
+        mapping that supports ``in`` + ``__getitem__``). Only the fields
+        that ``Waypoint15Config`` knows about are copied — everything
+        else on the source config (``ae_uri``, ``prompt_conditioning``,
+        ``base_fps``, …) is the caller's concern.
+
+        ``we_cfg.ctrl_conditioning`` is the *controller spec* on the
+        world_engine side and truthiness decides whether quark should
+        wire up the ctrl path; ``cfg.ctrl_conditioning`` on this side is
+        a plain bool. ``overrides`` wins over the mapped values so
+        callers can tweak e.g. ``use_f16`` without rebuilding the dict.
+        """
+        _SCALAR_FIELDS = (
+            "d_model",
+            "n_layers",
+            "n_heads",
+            "n_kv_heads",
+            "mlp_ratio",
+            "channels",
+            "height",
+            "width",
+            "local_window",
+            "global_window",
+            "global_pinned_dilation",
+            "global_attn_period",
+            "global_attn_offset",
+            "value_residual",
+            "fourier_dim",
+            "n_buttons",
+            "ctrl_conditioning_period",
+        )
+        kwargs = {name: we_cfg[name] for name in _SCALAR_FIELDS if name in we_cfg}
+        if "patch" in we_cfg:
+            kwargs["patch"] = tuple(we_cfg["patch"])
+        if "scheduler_sigmas" in we_cfg:
+            kwargs["scheduler_sigmas"] = tuple(we_cfg["scheduler_sigmas"])
+        if "ctrl_conditioning" in we_cfg:
+            kwargs["ctrl_conditioning"] = we_cfg["ctrl_conditioning"] is not None
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
 
 def _check_dtype(t, expected: str, where: str) -> None:
     """Raise if ``t``'s dtype doesn't match ``expected``.
@@ -124,6 +169,11 @@ def _check_dtype(t, expected: str, where: str) -> None:
             f"Fix the upstream module's out_dtype so the graph's dtypes align end-to-end."
         )
 
+
+# Public re-export — see ``quark.models._waypoint_15_io``. Kept in the
+# model module's namespace so ``from quark.models.waypoint_15 import
+# remap_world_engine_state_dict`` keeps working.
+from quark.models._waypoint_15_io import remap_world_engine_state_dict  # noqa: E402
 
 # ---------------------------------------------------------------
 # Transformer block
@@ -473,6 +523,68 @@ class Waypoint15(nn.Module):
         for block in cast("list[TransformerBlock]", self.blocks):
             block.kv_cache.set_frame_t(value, stream=stream)
 
+    def reset(self, stream: int = 0) -> None:
+        """Clear per-block KV ring buffers and rewind frame_t to zero.
+
+        Callers swap generations (new prompt, new seed, pause/resume)
+        by calling this between runs. Not safe while a capture/replay
+        is in flight on the same stream.
+        """
+        for block in cast("list[TransformerBlock]", self.blocks):
+            block.kv_cache.reset(stream=stream)
+
+    def make_ctrl_buffer(self):
+        """Allocate the persistent ``[1, padded_in]`` ctrl MLP input and
+        return ``(dev_tensor, fill_fn)`` where ``fill_fn(ctrl)`` updates
+        the device tensor in place from a ``CtrlInput`` and returns it.
+
+        Shape / dtype come from the model so callers never hard-code
+        them. Returns ``(None, None)`` when the model has no ``ctrl_emb``.
+
+        On CUDA the returned tensor is a stable device pointer — safe
+        to capture inside a CUDA graph. ``fill_fn`` packs host f32 →
+        bf16 packed uint16 via ``(u32 >> 16)`` once per frame and does
+        a single ``memcpy_htod`` into that stable buffer.
+        """
+        from quark.models._waypoint_15_io import build_ctrl_buffer
+
+        return build_ctrl_buffer(self)
+
+    @classmethod
+    def from_world_engine_hub(
+        cls,
+        repo_id: str,
+        *,
+        cfg: Waypoint15Config | None = None,
+        we_cfg=None,
+        dtype: str = "bf16",
+        filename: str = "model.safetensors",
+    ) -> Waypoint15:
+        """Download a world_engine-format checkpoint, remap, and load.
+
+        Either ``cfg`` (a ``Waypoint15Config`` already built by the
+        caller) or ``we_cfg`` (a world_engine OmegaConf/dict to map
+        through ``Waypoint15Config.from_world_engine``) must be given.
+
+        The returned model has weights loaded but has NOT been
+        ``prepare()``'d — callers choose their own ``fp8`` / ``shuffle``
+        kwargs. Wrap in ``GenerateFrame(model)`` for graph inference.
+        """
+        if cfg is None:
+            if we_cfg is None:
+                raise ValueError(
+                    "from_world_engine_hub: pass either cfg=Waypoint15Config(...) "
+                    "or we_cfg=<world_engine model config>"
+                )
+            cfg = Waypoint15Config.from_world_engine(we_cfg)
+
+        from quark.nn.io import load_from_hub
+
+        raw_sd = load_from_hub(repo_id, filename=filename, dtype=dtype)
+        model = cls(cfg)
+        model.load_state_dict(remap_world_engine_state_dict(raw_sd, cfg), strict=False)
+        return model
+
     def encode_ctrl(self, ctrl_input):
         """Run the controller MLP on a pre-built ``[1, padded_in]`` tensor.
 
@@ -583,6 +695,40 @@ class GenerateFrame(nn.Module):
         CudaRuntime.instance().memset_d32(
             self.frame_t.data_ptr(), int(value) & 0xFFFFFFFF, 1, stream=stream
         )
+
+    def reset(self, stream: int = 0) -> None:
+        """Reset the wrapped model's KV state and rewind this module's
+        frame_t counter. Intended for between-generation cleanup; not
+        safe during capture/replay on the same stream.
+        """
+        self.model.reset(stream=stream)
+        self.set_frame_t(0, stream=stream)
+
+    def prepare_graph(self, example_latent, example_ctrl_input, *, start_frame_t: int = 0) -> None:
+        """Warmup + capture the one-frame graph.
+
+        Runs one eager forward so every cached output buffer inside the
+        model (EulerStep, AdaGateResidual, ctrl path, RMSNorm) is
+        allocated BEFORE capture — otherwise the graph bakes in
+        ``cuMemAllocAsync`` nodes whose replay addresses desync the
+        cached-ptr state on host. Then captures via ``Module.graph(...)``
+        so subsequent ``__call__``s replay.
+
+        Both the warmup and the capture forward bump ``frame_t`` once
+        each; this helper rewinds it to ``start_frame_t`` before
+        returning so the next real frame starts from the right count.
+        """
+        from quark.runtime.cuda import CudaRuntime
+
+        self.set_frame_t(start_frame_t)
+        _ = self(example_latent, example_ctrl_input)  # eager warmup
+        CudaRuntime.instance().stream_synchronize(0)
+
+        self.set_frame_t(start_frame_t)
+        self.graph(example_latent, example_ctrl_input)  # capture
+
+        self.set_frame_t(start_frame_t)
+        CudaRuntime.instance().stream_synchronize(0)
 
     def forward(self, latent, ctrl_input):
         """Encode controls → denoise + commit one frame. Returns the denoised latent."""
