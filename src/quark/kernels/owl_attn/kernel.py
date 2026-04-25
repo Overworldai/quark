@@ -54,6 +54,7 @@ from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
 from quark.kernels.owl_attn.baselines import owl_attn_baselines
 from quark.kernels.owl_attn.config import AttnConfig as OwlAttnConfig
+from quark.kernels.owl_attn.iter_table import emit_kv_offset_table
 from quark.kernels.owl_attn.problems import owl_attn_problems
 from quark.kernels.owl_attn.reference import owl_attn_reference_numpy
 from quark.kernels.owl_attn.spec import OwlAttnSpec
@@ -122,6 +123,11 @@ class OwlAttnKernel(Kernel):
         # the autotune sweep — filter them out so autotune doesn't
         # waste time on a dominated/broken path.
         if mma.shape.k == 8:
+            return False
+        # NCW=1 broken: every other 8-row Vt group lands wrong (odd
+        # nt-tiles ~100x off ref). n_threads=64 cp.async quirk;
+        # scripts/diag_owl_attn_ncw.py reproes.
+        if c.NCW == 1:
             return False
         if s.Dh % mma.shape.m != 0 or s.Dh % mma.shape.n != 0 or s.Dh % 2 != 0:
             return False
@@ -311,20 +317,14 @@ class OwlAttnKernel(Kernel):
     @classmethod
     def tune_space(cls) -> dict[str, list]:
         return {
-            # KvTile=16 is tight but valid when the spec's tpf/L/capacity
-            # are 16-aligned — and it's the smallest that produces a
-            # Metal-compilable config. is_valid() rejects the combo when
-            # the spec alignment doesn't hold.
-            "KvTile": [8, 16, 32, 64, 128],
-            "MTiles": [1, 2, 4],
-            "NCW": [1, 2, 4],
-            # Pad granule is 8B for 2-byte compute (bf16/f16) and 16B for
-            # 1-byte compute (e4m3/e5m2); is_valid filters the wrong one
-            # per compute_dtype.
+            # KvTile=16 is the smallest Metal-compilable; is_valid rejects
+            # combos where the spec alignment doesn't hold.
+            "KvTile": [8, 16, 32, 64, 128, 256],
+            "MTiles": [1, 2, 4, 8],
+            "NCW": [1, 2, 4, 8],
+            # KvPad: 8B granule for bf16/f16, 16B for fp8 (is_valid gates).
             "KvPad": [0, 8, 16],
-            "n_stages": [1, 2, 3],
-            # mma_k=32 only registered for fp8 compute_dtype in mma_shapes.py;
-            # is_valid filters bf16 / fp16 problems away from k=32.
+            "n_stages": [1, 2],  # run_pipeline tops out at double-buffer.
         }
 
     # ── build() ──
@@ -456,7 +456,7 @@ class OwlAttnKernel(Kernel):
         # iteration is Python-unrolled below: one PipelineBody per segment,
         # carry threaded across.
         stages = Stage.staged(
-            2,
+            c.n_stages,
             k=SmemTile.spec(compute_ir_dtype, (KvTile, Dh), pad=c.KvPad, lane_col_step=lcs),
             vt=SmemTile.spec(compute_ir_dtype, (Dh, KvTile), pad=c.KvPad, lane_col_step=lcs),
         )
@@ -658,30 +658,18 @@ class OwlAttnKernel(Kernel):
         )
 
         # ── Flat KV iteration across all segments ──────────────────────
-        # One PipelineBody with a compile-time ``n_iters`` lets us run
-        # at ``n_stages=2`` (double-buffered cp.async), which the
-        # previous per-segment unroll couldn't because each segment's
-        # chunk count is a runtime Value. Total iters is bounded by the
-        # spec's capacity, so ``N_TOTAL = capacity // KvTile`` is a
-        # constant — the double-buffer emitter can place its prologue
-        # + epilogue unroll.
-        #
-        # Runtime segment data lives in smem as ``seg_starts[s]`` +
-        # cumulative chunk thresholds ``cum[s]``; ``produce`` computes
-        # ``kv_offset`` from ``iter_idx`` by picking the segment whose
-        # range brackets it. Iters past the real total load from
-        # ``kv_offset=0`` (always in-bounds) and get their ``S``
-        # masked to ``-inf`` in ``consume`` so exp(S)=0 — softmax's
-        # m/l/o state passes through untouched.
+        # PipelineBody with compile-time ``n_iters = capacity / KvTile``
+        # so n_stages=2 works (double-buffered cp.async needs the half
+        # iter count for prologue/epilogue placement). iter→kv_offset
+        # is precomputed into smem; consume's validity check skips the
+        # whole iter when invalid (segment lengths are tile-aligned).
         N_TOTAL = s.capacity // KvTile
         seg_base = b_idx * (max_segs * 2)
 
         KvTile_u = qk.const(DType.U32, KvTile)
         zero_u = qk.const(DType.U32, 0)
-        neg_inf_f32 = bctx.c(-1e30, dtype=DType.F32)
 
-        # Read all segment metadata up front so produce/consume don't
-        # re-issue gmem loads per iteration.
+        # Read all segment metadata up front (the only g_sg gmem reads).
         seg_starts_u: list = []
         cum_u: list = [zero_u]
         for seg_idx in range(max_segs):
@@ -693,23 +681,27 @@ class OwlAttnKernel(Kernel):
             cum_u.append(cum_u[-1] + n_chunks_u)
         n_real_total = cum_u[max_segs]
 
-        def _map_iter_to_offset(iter_u):
-            """Compile-time chain of selects: pick kv_offset for the
-            segment whose cumulative range includes ``iter_u``. Iters
-            past the last real chunk collapse to ``kv_offset=0`` (the
-            Mask in consume() zeroes their contribution)."""
-            # Seed with segment 0's offset (covers iters 0..cum_u[1]).
-            kv_off = seg_starts_u[0] + (iter_u - cum_u[0]) * KvTile_u
-            for si in range(1, max_segs):
-                take = qk.cmp("ge", iter_u, cum_u[si])
-                alt = seg_starts_u[si] + (iter_u - cum_u[si]) * KvTile_u
-                kv_off = qk.select(take, alt, kv_off)
-            valid = qk.cmp("lt", iter_u, n_real_total)
-            return qk.select(valid, kv_off, zero_u), valid
+        # ── Cooperative iter→kv_offset table fill ──
+        # 4 bytes × N_TOTAL ≈ 1 KB at our shape. Replaces a per-iter
+        # chain of cmp+select with a single ld.shared.b32 in produce.
+        kv_off_smem = emit_kv_offset_table(
+            bctx=bctx,
+            seg_starts_u=seg_starts_u,
+            cum_u=cum_u,
+            n_real_total=n_real_total,
+            KvTile=KvTile,
+            KvTile_u=KvTile_u,
+            zero_u=zero_u,
+            N_TOTAL=N_TOTAL,
+            n_threads_per_cta=NumWarps * 32,
+        )
 
         def produce(ictx: IterCtx) -> None:
             stage = ictx.stage
-            kv_offset, _ = _map_iter_to_offset(ictx.iter_idx)
+            # Single smem load — replaces the segment-chain compute that
+            # ran every iter before. Uniform across the warp; lowers to
+            # one ld.shared.b32.
+            kv_offset = qk.load(kv_off_smem, ictx.iter_idx)
             stage.k.load_from(g_kc, row=k_row_base + kv_offset, cast=kv_cast)
             stage.vt.load_from(g_vtc, row=vt_row_base, col=kv_offset, cast=kv_cast)
 
@@ -717,46 +709,54 @@ class OwlAttnKernel(Kernel):
 
         GEMM2_K_STEPS = KvTile // mma_cfg.mma_k
 
+        n_o = MTiles * N_DH
+
+        def _reload_p_frags_fp8():
+            """fp8 GEMM2 path — reload P from smem into the fp8 A-frag."""
+            qk.barrier("block")
+            return [
+                [
+                    qk.load_matrix(
+                        p_warp_lane,
+                        mma_shape_id,
+                        which="a",
+                        row=mt * m_tile,
+                        col=k_step * mma_cfg.mma_k,
+                        reg_offsets=mma_cfg.a_offsets,
+                    )
+                    for k_step in range(GEMM2_K_STEPS)
+                ]
+                for mt in range(MTiles)
+            ]
+
+        # Segment lengths are tile-aligned → an iter is ALL valid or
+        # ALL invalid (no sub-fragment qualifier). Wrap consume in a
+        # uniform ``if_(valid)``: skip mma1+softmax+mma2 entirely for
+        # invalid iters, AND drop the per-cell ``select(valid, x, -inf)``
+        # mask from the taken arm (it sat on the mma1→softmax chain).
         def consume(ictx: IterCtx) -> Carry:
-            stage = ictx.stage
             carry = ictx.carry
             valid = qk.cmp("lt", ictx.iter_idx, n_real_total)
-            s_vals = mma1(a=q_frags, b=stage.k, acc=s_acc.init())
-            # Mask invalid iters: force S entries to -inf so exp(S)=0
-            # and the iteration contributes nothing to m/l/o.
-            s_vals_masked = [
-                qk.frag_apply(mma_shape_id, sv, lambda x, _v=valid: qk.select(_v, x, neg_inf_f32))
-                for sv in s_vals
-            ]
-            o_vals, m_vals, l_vals, p_frags = softmax(
-                s_acc_vals=s_vals_masked,
-                o_vals=carry.o,
-                m_vals=carry.m,
-                l_vals=carry.l,
-            )
-            if compute_is_fp8:
-                # Softmax wrote P→smem (packed_convert f32→fp8). Barrier
-                # so every warp's writes are visible, then ldmatrix the
-                # fp8 A-fragment for GEMM2 at its native lane layout.
-                qk.barrier("block")
-                p_frags = []
-                for mt in range(MTiles):
-                    mt_frags = []
-                    for k_step in range(GEMM2_K_STEPS):
-                        kk = k_step * mma_cfg.mma_k
-                        frag = qk.load_matrix(
-                            p_warp_lane,
-                            mma_shape_id,
-                            which="a",
-                            row=mt * m_tile,
-                            col=kk,
-                            reg_offsets=mma_cfg.a_offsets,
-                        )
-                        mt_frags.append(frag)
-                    p_frags.append(mt_frags)
-            carry.o = mma2(a=p_frags, b=stage.vt, acc=o_vals)
-            carry.m = m_vals
-            carry.l = l_vals
+            flat_carry = list(carry.o) + list(carry.m) + list(carry.l)
+            with bctx.bld.if_(valid, carried=flat_carry) as (then_in, else_in, arms):
+                with arms.then_():
+                    inner_o = list(then_in[:n_o])
+                    inner_m = list(then_in[n_o : n_o + n_ml])
+                    inner_l = list(then_in[n_o + n_ml :])
+                    s_vals = mma1(a=q_frags, b=ictx.stage.k, acc=s_acc.init())
+                    o_vals, m_vals, l_vals, p_frags = softmax(
+                        s_acc_vals=s_vals, o_vals=inner_o, m_vals=inner_m, l_vals=inner_l
+                    )
+                    if compute_is_fp8:
+                        p_frags = _reload_p_frags_fp8()
+                    new_o = mma2(a=p_frags, b=ictx.stage.vt, acc=o_vals)
+                    qk.yield_(*new_o, *m_vals, *l_vals)
+                with arms.else_():
+                    qk.yield_(*else_in)
+            results = bctx.bld.last_results
+            carry.o = list(results[:n_o])
+            carry.m = list(results[n_o : n_o + n_ml])
+            carry.l = list(results[n_o + n_ml :])
             return carry
 
         current_carry: Carry = PipelineBody(
