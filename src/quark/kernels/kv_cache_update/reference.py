@@ -114,7 +114,12 @@ def _compute_segments(
     L: int,
     max_segments: int,
 ) -> tuple[np.ndarray, int]:
-    """Return ``(segments[max_segments, 2] s32, n_segments int)``."""
+    """Return ``(segments[max_segments, 2] s32, n_segments int)``.
+
+    ``tpf`` here is the *cached* per-frame token count (post-quilt:
+    ``H*W // quilt_factor``). ``L`` is ``num_buckets * tpf``. The
+    quilt-dense path passes the un-divided values and the math is
+    identical."""
     bucket = (frame_t + pinned_dilation - 1) // pinned_dilation
     is_write_frame = (frame_t % pinned_dilation) == 0
     is_post_wrap = bucket >= num_buckets
@@ -193,15 +198,25 @@ def kv_cache_update_reference_numpy(
     k_rot_carried = to_f32_numpy(astype_numpy(k_rot, kv_dt), dtype_hint=kv_dt.value)
     v_carried = to_f32_numpy(astype_numpy(V_4d, kv_dt), dtype_hint=kv_dt.value)
 
+    # Quilt: keep only every quilt_factor-th pixel along the per-frame
+    # token axis, starting at quilt_offset. Cache slots are contiguous
+    # in cached space — slot i holds input pixel quilt_offset + i*qf.
+    qf, qoff = s.quilt_factor, s.quilt_offset
+    if qf > 1:
+        k_rot_carried = k_rot_carried[:, :, qoff::qf, :]
+        v_carried = v_carried[:, :, qoff::qf, :]
+
+    tpf_cached = s.tpf_cached
+
     # Allocate fresh cache buffers (f32 internally, narrowed at return).
-    L = s.num_buckets * s.tpf
+    L = s.num_buckets * tpf_cached
     K_cache = np.zeros((s.B, s.n_kv_heads, s.capacity, s.Dh), dtype=np.float32)
     Vt_cache = np.zeros((s.B, s.n_kv_heads, s.Dh, s.capacity), dtype=np.float32)
 
     # Tail-slot write (always).
-    K_cache[:, :, L : L + s.tpf, :] = k_rot_carried
+    K_cache[:, :, L : L + tpf_cached, :] = k_rot_carried
     # Vt_cache expects V transposed last-two.
-    Vt_cache[:, :, :, L : L + s.tpf] = v_carried.transpose(0, 1, 3, 2)
+    Vt_cache[:, :, :, L : L + tpf_cached] = v_carried.transpose(0, 1, 3, 2)
 
     # Conditional ring write. Honor ``frozen`` the same way the kernel
     # does: skip ring writes entirely when frozen!=0.
@@ -210,15 +225,15 @@ def kv_cache_update_reference_numpy(
     if not is_frozen and (ft % s.pinned_dilation) == 0:
         bucket = (ft + s.pinned_dilation - 1) // s.pinned_dilation
         slot = bucket % s.num_buckets
-        base = slot * s.tpf
-        K_cache[:, :, base : base + s.tpf, :] = k_rot_carried
-        Vt_cache[:, :, :, base : base + s.tpf] = v_carried.transpose(0, 1, 3, 2)
+        base = slot * tpf_cached
+        K_cache[:, :, base : base + tpf_cached, :] = k_rot_carried
+        Vt_cache[:, :, :, base : base + tpf_cached] = v_carried.transpose(0, 1, 3, 2)
 
     # Segments.
     segs, n_segs = _compute_segments(
         frame_t=ft,
         num_buckets=s.num_buckets,
-        tpf=s.tpf,
+        tpf=tpf_cached,
         pinned_dilation=s.pinned_dilation,
         L=L,
         max_segments=s.max_segments,

@@ -89,9 +89,12 @@ class ElementwiseKernel(Kernel):
     def grid(self) -> tuple[int, int, int]:
         s, c = self.spec, self.config
         # ceil(N / epb). Last block handles the partial tail via
-        # bounds-checked predication inside ``build``.
-        n_blocks_y = (s.N + c.elems_per_block - 1) // c.elems_per_block
-        return (1, n_blocks_y, 1)
+        # bounds-checked predication inside ``build``. Block axis is
+        # ``x`` (limit 2^31-1) rather than ``y`` (limit 65535) so big
+        # tensors — e.g. a 67M-element bf16 weight cast — don't blow
+        # past the per-axis grid cap.
+        n_blocks = (s.N + c.elems_per_block - 1) // c.elems_per_block
+        return (n_blocks, 1, 1)
 
     def flops(self) -> int:
         return self.spec.N * (2 if self.spec.arity == 2 else 1)
@@ -137,7 +140,7 @@ class ElementwiseKernel(Kernel):
         out_dtype = s.effective_out_dtype
         op = s.op
 
-        block = qk.block_idx("y")
+        block = qk.block_idx("x")
         base = block * bctx.c(epb, dtype=DType.U32)
         n_threads_c = bctx.c(n_threads, dtype=DType.U32)
         N_c = bctx.c(s.N, dtype=DType.U32)

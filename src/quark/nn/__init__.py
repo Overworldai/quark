@@ -39,6 +39,7 @@ from quark.nn.layers import (
     ValueResidualPacked,
 )
 from quark.nn.module import Module, ModuleList, Parameter
+from quark.nn.moe import MoE
 
 __all__ = [
     "MLP",
@@ -52,6 +53,7 @@ __all__ = [
     "KVCacheUpdate",
     "Linear",
     "MLPFusion",
+    "MoE",
     "Module",
     "ModuleList",
     "OwlAttn",

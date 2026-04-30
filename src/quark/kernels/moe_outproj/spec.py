@@ -25,6 +25,9 @@ class MoeOutprojSpec(KernelSpec):
     # load, so smem and mma fragments run in compute_dtype. Defaults
     # to a_dtype (no cast) for back-compat.
     compute_dtype: DType | None = None
+    # See MoeInprojSpec.capacity. Must match the inproj spec's capacity
+    # for a given MoE block (both kernels read the same token_ids buffer).
+    capacity: int | None = None
 
     def __post_init__(self):
         for field in ("a_dtype", "b_dtype", "out_dtype"):
@@ -47,10 +50,24 @@ class MoeOutprojSpec(KernelSpec):
             raise ValueError(
                 f"MoeOutprojSpec: compute_dtype {self.compute_dtype!r} not in {_VALID_AB}"
             )
+        if self.capacity is None:
+            if (self.M * self.top_k) % self.n_experts != 0:
+                raise ValueError(
+                    f"MoeOutprojSpec: M*top_k ({self.M * self.top_k}) not divisible by "
+                    f"n_experts ({self.n_experts}); pass capacity explicitly for headroom"
+                )
+            object.__setattr__(self, "capacity", (self.M * self.top_k) // self.n_experts)
+        elif self.capacity * self.n_experts < self.M * self.top_k:
+            raise ValueError(
+                f"MoeOutprojSpec: capacity*n_experts ({self.capacity * self.n_experts}) "
+                f"< M*top_k ({self.M * self.top_k}); slot budget too small"
+            )
 
     @property
     def total_slots(self) -> int:
-        return self.M * self.top_k
+        assert self.n_experts is not None
+        assert self.capacity is not None
+        return self.n_experts * self.capacity
 
     @property
     def compute_dtype_resolved(self) -> DType:

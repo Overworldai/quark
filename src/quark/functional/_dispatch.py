@@ -56,6 +56,31 @@ def reset_launcher() -> None:
     _LAUNCHER = None
 
 
+def split_provided_io(
+    inputs: dict[str, Any], outputs: dict[str, Any]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Build the ``(provided, auto_alloc)`` pair that ``call_with_bindings``
+    expects.
+
+    ``inputs`` are always provided (kernel inputs). ``outputs`` is a
+    name→optional-tensor map: entries with a non-None value are pinned
+    output buffers (caller wants them written in place); ``None``
+    entries are added to ``auto_alloc`` so the dispatch layer creates
+    fresh buffers.
+
+    Lets per-kernel functional wrappers stop hand-rolling the same
+    "loop over (name, buf), branch on None" boilerplate.
+    """
+    provided: dict[str, Any] = dict(inputs)
+    auto_alloc: tuple[str, ...] = ()
+    for name, buf in outputs.items():
+        if buf is not None:
+            provided[name] = buf
+        else:
+            auto_alloc = auto_alloc + (name,)
+    return provided, auto_alloc
+
+
 def alloc_from_decl(decl, spec, config, *, like=None):
     """Allocate a fresh tensor sized to ``decl.shape(spec, config)`` in
     ``decl.dtype(spec, config)``.

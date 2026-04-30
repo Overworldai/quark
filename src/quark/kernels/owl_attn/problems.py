@@ -46,4 +46,45 @@ def owl_attn_problems() -> list[Problem]:
             {**common, "H_spatial": 32, "W_spatial": 16, "num_buckets": 16, "pinned_dilation": 8},
             tags={"owl", "dilated", "720p", "bf16"} | _PROD,
         ),
+        # Quilt attention: cache halved (or quartered), so the iter
+        # loop count drops by the same factor. Q stays full-frame.
+        Problem(
+            "quilt2_off0_360p_dense",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "quilt_factor": 2,
+                "quilt_offset": 0,
+            },
+            tags={"owl", "dense", "360p", "bf16", "quilt"} | _PROD,
+        ),
+        Problem(
+            "quilt2_off1_360p_dense",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "quilt_factor": 2,
+                "quilt_offset": 1,
+            },
+            tags={"owl", "dense", "360p", "bf16", "quilt"} | _PROD,
+        ),
+        Problem(
+            "quilt4_off2_360p_dense",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "quilt_factor": 4,
+                "quilt_offset": 2,
+            },
+            tags={"owl", "dense", "360p", "bf16", "quilt"} | _PROD,
+        ),
     ]

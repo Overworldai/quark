@@ -178,7 +178,9 @@ class AutotuneCache:
         if key in self._hot:
             return self._hot[key]
 
-        from_disk = load_from_disk(self.cache_dir, key, self.device.fingerprint())
+        from_disk = load_from_disk(
+            self.cache_dir, key, self.device.fingerprint(), kernel_cls=kernel_cls
+        )
         if from_disk is not None:
             self._hot[key] = from_disk
             return from_disk

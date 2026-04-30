@@ -154,15 +154,63 @@ class KVCacheUpdateKernel(Kernel):
         per_vec_elems = 16 // elem_bytes
         if s.Dh % per_vec_elems != 0:
             return False
+        # Quilt attention constraints. quilt_factor=1 short-circuits all of
+        # this (the kernel collapses to the dense path). For >1, both
+        # tile_T and tpf must split evenly so the cache-row math
+        # ``(t_start + r) // qf`` lines up with the per-tile compaction
+        # of K_out / Vt_out.
+        qf = s.quilt_factor
+        if qf < 1 or (qf & (qf - 1)) != 0:
+            return False  # power of 2 only
+        if s.quilt_offset < 0 or s.quilt_offset >= qf:
+            return False
+        if c.tile_T % qf != 0:
+            return False
+        if s.tpf % qf != 0:
+            return False
+        tile_T_cached = c.tile_T // qf
+        # Compact K_out/Vt_out vec stores need cached tile dim divisible
+        # by the 16B vec_elems chunk. Otherwise the cooperative loop
+        # can't be cleanly cut into per-thread chunks.
+        if tile_T_cached % per_vec_elems != 0 and per_vec_elems > 1:
+            return False
+        # Per-pass divisibility constraints — these used to be runtime
+        # ValueErrors raised in build(); promoting them here lets
+        # autotune skip dominated/invalid configs cleanly. half_Dh,
+        # vec_elems, etc. all use cached tile dims now (the smem
+        # buffers are compacted by quilt_factor).
+        n_threads = c.n_warps * 32
+        half_Dh = s.Dh // 2
+        is_fp8 = s.kv_dtype in (DType.E4M3, DType.E5M2)
+        n_pairs = tile_T_cached * half_Dh
+        if n_pairs % n_threads != 0:
+            return False
+        pairs_per_thread = n_pairs // n_threads
+        if is_fp8 and pairs_per_thread % 2 != 0:
+            return False
+        if is_fp8:
+            n_packed = (tile_T_cached * s.Dh) // 2
+            if n_packed % n_threads != 0:
+                return False
+        else:
+            n_v = tile_T_cached * s.Dh
+            if n_v % n_threads != 0:
+                return False
+        total_K_vecs = (tile_T_cached * s.Dh) // per_vec_elems
+        if total_K_vecs % n_threads != 0:
+            return False
+        total_Vt_vecs = (s.Dh * tile_T_cached) // per_vec_elems
+        if total_Vt_vecs % n_threads != 0:
+            return False
         # Vec-store alignment: the smem row stride (in bytes) must be a
         # multiple of 16 so every `vec_load.b32.v4` address is 16-aligned.
         # - K_out:  row = (Dh + smem_pad) * kv_bytes
-        # - Vt_out: row = (tile_T + smem_pad) * kv_bytes
+        # - Vt_out: row = (tile_T_cached + smem_pad) * kv_bytes
         # `smem_pad=8` with fp8 (1B) bumps row stride by 8B → unaligned →
         # misaligned-address CUDA fault at launch. Reject those combos.
         if ((s.Dh + c.smem_pad) * elem_bytes) % 16 != 0:
             return False
-        if ((c.tile_T + c.smem_pad) * elem_bytes) % 16 != 0:
+        if ((tile_T_cached + c.smem_pad) * elem_bytes) % 16 != 0:
             return False
         # Ring math sanity: dilation must divide num_buckets*pd evenly so the
         # bucket index space is unambiguous (matches world_engine assertion).
@@ -245,12 +293,14 @@ class KVCacheUpdateKernel(Kernel):
         packed_qkv: bool = False,
         n_q_heads: int = 0,
         rope_n_frames: int = 1,
+        quilt_factor: int = 1,
+        quilt_offset: int = 0,
     ) -> KVCacheUpdateSpec:
         """Derive a ``KVCacheUpdateSpec`` from the nine kernel tensors.
 
         The ring / tail layout is determined entirely by (B, n_kv_heads,
-        H_spatial, W_spatial, num_buckets, pinned_dilation) — all of
-        which the caller supplies as kwargs. ``Dh`` is read from K.
+        H_spatial, W_spatial, num_buckets, pinned_dilation, quilt_factor) —
+        all of which the caller supplies as kwargs. ``Dh`` is read from K.
         """
 
         if K.ndim != 2:
@@ -261,7 +311,22 @@ class KVCacheUpdateKernel(Kernel):
         else:
             Dh = int(K.shape[1])
         tpf = H_spatial * W_spatial
-        capacity = num_buckets * tpf + tpf
+        if quilt_factor < 1 or (quilt_factor & (quilt_factor - 1)) != 0:
+            raise ValueError(
+                f"pcf.kv_cache_update: quilt_factor must be a power of 2 (>=1), got {quilt_factor}"
+            )
+        if quilt_offset < 0 or quilt_offset >= quilt_factor:
+            raise ValueError(
+                f"pcf.kv_cache_update: quilt_offset must be in [0, quilt_factor); "
+                f"got offset={quilt_offset} factor={quilt_factor}"
+            )
+        if tpf % quilt_factor != 0:
+            raise ValueError(
+                f"pcf.kv_cache_update: H_spatial*W_spatial={tpf} must be divisible "
+                f"by quilt_factor={quilt_factor}"
+            )
+        tpf_cached = tpf // quilt_factor
+        capacity = num_buckets * tpf_cached + tpf_cached
         if not packed_qkv and tuple(V.shape) != tuple(K.shape):
             raise ValueError(
                 f"pcf.kv_cache_update: V shape {tuple(V.shape)} != K shape {tuple(K.shape)}"
@@ -299,6 +364,8 @@ class KVCacheUpdateKernel(Kernel):
             packed_qkv=packed_qkv,
             n_q_heads=n_q_heads,
             rope_n_frames=rope_n_frames,
+            quilt_factor=quilt_factor,
+            quilt_offset=quilt_offset,
         )
 
     @classmethod
@@ -340,6 +407,13 @@ class KVCacheUpdateKernel(Kernel):
         pd = s.pinned_dilation
         max_segs = s.max_segments
         Hk = s.n_kv_heads
+        # Quilt — qf=1 collapses cleanly: tile_T_cached==tile_T, qoff==0,
+        # tpf_cached==tpf, so every kept-row index equals the dense one
+        # and the whole path becomes the original kernel byte-for-byte.
+        qf = s.quilt_factor
+        qoff = s.quilt_offset
+        tile_T_cached = tile_T // qf
+        tpf_cached = s.tpf_cached
 
         in_dt = s.in_dtype
         kv_dt = s.kv_dtype
@@ -375,9 +449,12 @@ class KVCacheUpdateKernel(Kernel):
             v_in_col_base = bctx.c(0)
 
         bh_x_cap = bh_idx * capacity
-        k_cache_tail_row_base = bh_x_cap + (L + t_start)
+        # Cache row math is in *cache-slot space* (compacted by qf). Each
+        # tile spans tile_T_cached cache rows = tile_T input rows.
+        t_start_cached = t_tile_idx * tile_T_cached
+        k_cache_tail_row_base = bh_x_cap + (L + t_start_cached)
         vt_d_base = bh_idx * Dh
-        vt_col_tail = L + t_start
+        vt_col_tail = L + t_start_cached
 
         # ── frame_t-derived control state (S32) ──
         frame_t_v = qk.load(g_ft, bctx.c(0, dtype=DType.S32), name="frame_t")
@@ -392,19 +469,24 @@ class KVCacheUpdateKernel(Kernel):
         write_step = qk.and_(is_write_frame, is_not_frozen)  # ring write only when not frozen
         bucket = (frame_t_v + bctx.c(pd - 1, dtype=DType.S32)) // pd_c
         slot = bucket % nb_c
-        base_s = slot * bctx.c(tpf, dtype=DType.S32)
+        # Bucket base in cache-slot space; each bucket spans tpf_cached rows.
+        base_s = slot * bctx.c(tpf_cached, dtype=DType.S32)
         # Convert ring base to U32 for index arithmetic with block bases.
         base_u = qk.convert(base_s, DType.U32)
-        k_cache_ring_row_base = bh_x_cap + base_u + t_start
-        vt_col_ring = base_u + t_start
+        k_cache_ring_row_base = bh_x_cap + base_u + t_start_cached
+        vt_col_ring = base_u + t_start_cached
 
         # ── Smem allocs ──
+        # K_in / V_in stay full tile_T (input still has all pixels;
+        # quilt only drops on the write side). K_out / Vt_out are
+        # *compacted* to tile_T_cached so their cooperative 16B vec
+        # store maps 1:1 to contiguous cache slots.
         smem_pad = c.smem_pad
         K_in = qk.smem_alloc("K_in", in_dt, (tile_T, Dh), pad=smem_pad)
         V_in = qk.smem_alloc("V_in", in_dt, (tile_T, Dh), pad=smem_pad)
         # cos/sin computed inline — no smem needed.
-        K_out = qk.smem_alloc("K_out", kv_dt, (tile_T, Dh), pad=smem_pad)
-        Vt_out = qk.smem_alloc("Vt_out", kv_dt, (Dh, tile_T), pad=smem_pad)
+        K_out = qk.smem_alloc("K_out", kv_dt, (tile_T_cached, Dh), pad=smem_pad)
+        Vt_out = qk.smem_alloc("Vt_out", kv_dt, (Dh, tile_T_cached), pad=smem_pad)
 
         # ── cp.async loads ──
         K_in.copy_from(
@@ -427,17 +509,23 @@ class KVCacheUpdateKernel(Kernel):
         qk.barrier("block")
 
         # ── RoPE pass: K_in + cos/sin (fp32) → K_out (kv_dtype) ──
-        # Per thread iterates over (row, c) pair indices in [0, tile_T*half_Dh).
+        # Per thread iterates over (r_cached, c) pair indices in
+        # [0, tile_T_cached*half_Dh). Source row in K_in is
+        # ``r_full = qoff + r_cached * qf`` so RoPE only runs on the
+        # kept pixels (1/qf of the input rows). When qf=1 this collapses
+        # to ``r_full == r_cached``, identical to the dense path.
         # For fp8 kv_dtype, PTX has no scalar fp8 store — only the packed
         # `cvt.<fp8>x2.<src>x2` form. We pack two consecutive RoPE outputs
         # (y0[c], y0[c+1]) and (y1[c], y1[c+1]) into one b16 each per
         # iteration, then b16-store covers the 2 fp8 bytes at K_out[r, c]
         # and K_out[r, c+half_Dh].
-        n_pairs = tile_T * half_Dh
+        n_pairs = tile_T_cached * half_Dh
         if n_pairs % n_threads != 0:
             raise ValueError(f"RoPE: n_pairs={n_pairs} not divisible by n_threads={n_threads}")
         pairs_per_thread = n_pairs // n_threads
         half_Dh_c = bctx.c(half_Dh)
+        qf_c = bctx.c(qf)
+        qoff_c = bctx.c(qoff)
         is_fp8 = kv_dt in (DType.E4M3, DType.E5M2)
         if is_fp8 and pairs_per_thread % 2 != 0:
             raise ValueError(
@@ -450,16 +538,16 @@ class KVCacheUpdateKernel(Kernel):
         W_c = bctx.c(s.W_spatial)
 
         def _rope_one_pair(c_idx_v):
-            """Compute (y0_f32, y1_f32) for one (r, c_idx_v) pair. r is closed
-            over by the caller via ``r_v`` capture."""
-            # Spatial position: absolute token index = t_start + r_v.
-            spatial_idx = t_start + r_v
+            """Compute (y0_f32, y1_f32) for one (r, c_idx_v) pair. r_full
+            and r_cached are closed over by the caller via captures."""
+            # Spatial position: absolute token index = t_start + r_full.
+            spatial_idx = t_start + r_full
             h_idx = spatial_idx // W_c
             w_idx = spatial_idx % W_c
             c2 = c_idx_v * 2
             c2p1 = c2 + 1
-            x0 = qk.convert(K_in[r_v, c2], DType.F32)
-            x1 = qk.convert(K_in[r_v, c2p1], DType.F32)
+            x0 = qk.convert(K_in[r_full, c2], DType.F32)
+            x1 = qk.convert(K_in[r_full, c2p1], DType.F32)
             cv, sv = emit_rope_cos_sin(
                 bctx,
                 h_idx=h_idx,
@@ -478,7 +566,8 @@ class KVCacheUpdateKernel(Kernel):
             for i in range(0, pairs_per_thread, 2):
                 # Two adjacent c_idx values (c_a, c_a+1) on the same row.
                 flat_a = tid * pairs_per_thread + i
-                r_v = flat_a // half_Dh_c
+                r_cached = flat_a // half_Dh_c
+                r_full = qoff_c + r_cached * qf_c
                 c_a = flat_a % half_Dh_c
                 c_b = c_a + 1
                 y0_a, y1_a = _rope_one_pair(c_a)
@@ -488,59 +577,70 @@ class KVCacheUpdateKernel(Kernel):
                 # bytes land at consecutive (r, c_a) and (r, c_a+1).
                 y0_pk = qk.packed_convert(y0_a, y0_b, kv_dt)
                 y1_pk = qk.packed_convert(y1_a, y1_b, kv_dt)
-                K_out[r_v, c_a] = y0_pk
-                K_out[r_v, c_a + half_Dh_c] = y1_pk
+                K_out[r_cached, c_a] = y0_pk
+                K_out[r_cached, c_a + half_Dh_c] = y1_pk
         else:
             for i in range(pairs_per_thread):
                 flat = tid * pairs_per_thread + i
-                r_v = flat // half_Dh_c
+                r_cached = flat // half_Dh_c
+                r_full = qoff_c + r_cached * qf_c
                 c_idx = flat % half_Dh_c
                 y0, y1 = _rope_one_pair(c_idx)
-                K_out[r_v, c_idx] = qk.convert(y0, kv_dt)
-                K_out[r_v, c_idx + half_Dh_c] = qk.convert(y1, kv_dt)
+                K_out[r_cached, c_idx] = qk.convert(y0, kv_dt)
+                K_out[r_cached, c_idx + half_Dh_c] = qk.convert(y1, kv_dt)
 
         # ── V transpose pass: V_in → Vt_out (transposed, kv_dtype) ──
-        # Vt_out is [Dh, tile_T] row-major; storing transposed means
-        # Vt_out[c, r] = V_in[r, c]. For fp8 we pack pairs along the
-        # *inner* dim of Vt_out (= consecutive r's at fixed c) into one
-        # b16 store per packed pair.
+        # Vt_out is [Dh, tile_T_cached] row-major; storing transposed means
+        # Vt_out[c, r_cached] = V_in[qoff + r_cached*qf, c]. The input
+        # row stride in cached space is qf (1 in the dense path).
+        # For fp8 we pack pairs along the *inner* dim of Vt_out
+        # (= consecutive r_cached's at fixed c) into one b16 store per
+        # packed pair — same trick as the dense path, but the two
+        # source values come from rows that are qf apart in V_in.
         if is_fp8:
-            n_packed = (tile_T * Dh) // 2
+            n_packed = (tile_T_cached * Dh) // 2
             if n_packed % n_threads != 0:
                 raise ValueError(
                     f"fp8 V xpose: n_packed={n_packed} not divisible by n_threads={n_threads}"
                 )
             packed_per_thread = n_packed // n_threads
-            half_tile_T_c = bctx.c(tile_T // 2)
+            half_tile_Tc_c = bctx.c(tile_T_cached // 2)
             for i in range(packed_per_thread):
                 pp = tid * packed_per_thread + i
-                cc = pp // half_tile_T_c
-                r_pair = pp % half_tile_T_c
-                r_lo = r_pair * 2
-                r_hi = r_lo + 1
-                v_lo = V_in[r_lo, cc]
-                v_hi = V_in[r_hi, cc]
-                # bf16 → e4m3 packed; store as b16 covering (cc, r_lo) and (cc, r_lo+1).
+                cc = pp // half_tile_Tc_c
+                r_pair = pp % half_tile_Tc_c
+                r_lo_cached = r_pair * 2
+                r_hi_cached = r_lo_cached + 1
+                r_lo_full = qoff_c + r_lo_cached * qf_c
+                r_hi_full = qoff_c + r_hi_cached * qf_c
+                v_lo = V_in[r_lo_full, cc]
+                v_hi = V_in[r_hi_full, cc]
+                # bf16 → e4m3 packed; store as b16 covering
+                # (cc, r_lo_cached) and (cc, r_lo_cached+1).
                 v_pk = qk.packed_convert(v_lo, v_hi, kv_dt)
-                Vt_out[cc, r_lo] = v_pk
+                Vt_out[cc, r_lo_cached] = v_pk
         else:
-            n_v = tile_T * Dh
+            n_v = tile_T_cached * Dh
             if n_v % n_threads != 0:
                 raise ValueError(f"V xpose: n_v={n_v} not divisible by n_threads={n_threads}")
             v_per_thread = n_v // n_threads
             Dh_c = bctx.c(Dh)
             for i in range(v_per_thread):
                 flat = tid * v_per_thread + i
-                r = flat // Dh_c
+                r_cached = flat // Dh_c
                 cc = flat % Dh_c
-                v_in = V_in[r, cc]
+                r_full = qoff_c + r_cached * qf_c
+                v_in = V_in[r_full, cc]
                 v_out = v_in if kv_dt is in_dt else qk.convert(v_in, kv_dt)
-                Vt_out[cc, r] = v_out  # transposed write
+                Vt_out[cc, r_cached] = v_out  # transposed write
 
         qk.barrier("block")
 
         # ── Cooperative 16B vec_store: K_out → K_cache (tail always; ring conditional) ──
-        total_K_vecs = (tile_T * Dh) // vec_elems
+        # K_out is compacted to [tile_T_cached, Dh]; cache rows
+        # ``k_cache_*_row_base`` are already in cache-slot space, so the
+        # ``+ r`` offset just walks tile_T_cached contiguous slots.
+        total_K_vecs = (tile_T_cached * Dh) // vec_elems
         if total_K_vecs % n_threads != 0:
             raise ValueError(
                 f"K vec_store: total_K_vecs={total_K_vecs} not divisible by n_threads={n_threads}"
@@ -560,13 +660,16 @@ class KVCacheUpdateKernel(Kernel):
             qk.vec_store(g_Kc, v, k_cache_ring_row_base + r, col_elem, pred=write_step)
 
         # ── Cooperative 16B vec_store: Vt_out → Vt_cache ──
-        total_Vt_vecs = (Dh * tile_T) // vec_elems
+        # Vt_out is [Dh, tile_T_cached]; ``vt_col_*`` start at the
+        # cache-slot column for this tile, so ``+ t_elem`` walks
+        # tile_T_cached contiguous slots.
+        total_Vt_vecs = (Dh * tile_T_cached) // vec_elems
         if total_Vt_vecs % n_threads != 0:
             raise ValueError(
                 f"Vt vec_store: total_Vt_vecs={total_Vt_vecs} not divisible by n_threads={n_threads}"
             )
         Vt_vecs_per_thread = total_Vt_vecs // n_threads
-        cols_per_row_Vt = tile_T // vec_elems
+        cols_per_row_Vt = tile_T_cached // vec_elems
         cpr_Vt_c = bctx.c(cols_per_row_Vt)
         for i in range(Vt_vecs_per_thread):
             vid = tid * Vt_vecs_per_thread + i
@@ -595,7 +698,10 @@ class KVCacheUpdateKernel(Kernel):
         seg_pred = qk.and_(is_first_tile, is_first_head)
         seg_pred = qk.and_(seg_pred, is_first_thread)
 
-        tpf_s = bctx.c(tpf, dtype=DType.S32)
+        # Segments live in cache-slot space — use tpf_cached (post-quilt
+        # per-frame token count). L is already cached (= num_buckets *
+        # tpf_cached) since it's derived from spec.L.
+        tpf_s = bctx.c(tpf_cached, dtype=DType.S32)
         L_s = bctx.c(L, dtype=DType.S32)
         two_s = bctx.c(2, dtype=DType.S32)
         three_s = bctx.c(3, dtype=DType.S32)

@@ -74,7 +74,25 @@ class Waypoint15Config:
     # When False, everything stays in the "half" dtype (bf16 by default)
     # from weights through KV cache through attention MMAs — the safe
     # fallback for devices without fp8 support or for precision debugging.
+    # ``QUARK_MOE_NO_FP8=1`` separately opts the MoE block out of fp8
+    # while leaving everything else fp8.
     use_fp8: bool = True
+
+    # Spatial-quilting factor for the kv_cache + owl_attn path. ``1``
+    # is the no-op default (every token participates in attention every
+    # layer); higher values stagger which token positions write/read the
+    # KV ring per layer (per-layer offset = layer_idx % quilt_factor).
+    quilt_factor: int = 1
+
+    # Per-block MoE — swap dense MLP for ``nn.MoE``. Per-expert hidden
+    # = ``mlp_dim / moe_top_k`` so active params match dense. bf16-only
+    # regardless of ``use_fp8`` (set ``QUARK_MOE_NO_FP8=1`` to opt out
+    # explicitly). ``moe_routing`` picks the routing kernel — see
+    # ``nn.MoE`` for the matrix of behaviors per mode.
+    moe: bool = False
+    moe_n_experts: int = 8
+    moe_top_k: int = 2
+    moe_routing: str = "correct"
 
     @property
     def Dh(self):
@@ -151,6 +169,11 @@ class Waypoint15Config:
             "fourier_dim",
             "n_buttons",
             "ctrl_conditioning_period",
+            "moe",
+            "moe_n_experts",
+            "moe_top_k",
+            "moe_routing",
+            "quilt_factor",
         )
         kwargs = {name: we_cfg[name] for name in _SCALAR_FIELDS if name in we_cfg}
         if "patch" in we_cfg:
@@ -229,6 +252,10 @@ class TransformerBlock(nn.Module):
         #     doesn't support it.
         kv_cache_dt = "e4m3" if cfg.use_fp8 else half_dt
         owl_compute_dt = "e4m3" if cfg.use_fp8 else None
+        # Quilt offset alternates by layer so the model in aggregate
+        # sees every pixel. layer_idx 0 keeps residue 0, layer 1 keeps
+        # residue 1, …, wrapping every quilt_factor blocks.
+        quilt_offset = layer_idx % cfg.quilt_factor
         self.kv_cache = nn.KVCacheUpdate(
             B=1,
             n_kv_heads=cfg.n_kv_heads,
@@ -241,6 +268,8 @@ class TransformerBlock(nn.Module):
             packed_qkv=True,
             rope_n_frames=rope_n_frames,
             dtype=kv_cache_dt,
+            quilt_factor=cfg.quilt_factor,
+            quilt_offset=quilt_offset,
         )
         self.attn = nn.OwlAttn(
             B=1,
@@ -253,6 +282,8 @@ class TransformerBlock(nn.Module):
             packed_qkv=True,
             rope_n_frames=rope_n_frames,
             compute_dtype=owl_compute_dt,
+            quilt_factor=cfg.quilt_factor,
+            quilt_offset=quilt_offset,
         )
         out_dt = "f16" if cfg.use_f16 else "bf16"
         self.out_proj = nn.Linear(cfg.n_heads * cfg.Dh, d, out_dtype=out_dt)
@@ -285,7 +316,18 @@ class TransformerBlock(nn.Module):
         # config wins the autotune race for its spec — cuBLAS applies
         # the bf16→e4m3 cast on-stream when it's picked; PTX uses its
         # own compute_dtype smem down-cast when it wins.
-        self.mlp = nn.MLP(d, cfg.mlp_dim, d, out_dtype=out_dt)
+        if cfg.moe:
+            self.mlp = nn.MoE(
+                M=cfg.tpf,
+                d_model=d,
+                d_intermediate=cfg.mlp_dim // cfg.moe_top_k,
+                n_experts=cfg.moe_n_experts,
+                top_k=cfg.moe_top_k,
+                routing=cfg.moe_routing,
+                out_dtype=half_dt,
+            )
+        else:
+            self.mlp = nn.MLP(d, cfg.mlp_dim, d, out_dtype=out_dt)
         self.mlp_gate = nn.AdaGateResidual()
 
     def forward(
@@ -391,16 +433,17 @@ class Waypoint15(nn.Module):
         """Pre-compute per-sigma cond LUTs. Call after loading weights.
 
         ``fp8`` defaults to ``cfg.use_fp8`` so Linear weight quantization
-        stays consistent with the KV cache / OwlAttn paths (which were
-        committed at ``__init__`` time based on the same flag). Caller
-        can still override with ``prepare(fp8=False)`` for mix-and-match
-        — but that will desync from attn and is rarely what you want.
+        stays consistent with the KV cache / OwlAttn paths.
         """
+        from quark.models._waypoint_15_io import (
+            compute_noise_emb_numpy,
+            prepare_cond_luts,
+        )
+
         cfg = self.cfg
-        d = cfg.d_model
         kwargs.setdefault("fp8", cfg.use_fp8)
 
-        noise_lut = pcf.precompute_noise_lut(
+        pcf.precompute_noise_lut(
             list(cfg.scheduler_sigmas),
             self.noise_freq.data,
             self.noise_fc1.weight.data,
@@ -411,133 +454,11 @@ class Waypoint15(nn.Module):
         # Noise embeddings in numpy f32 from the already-loaded bf16
         # weights. bf16 → f32 is lossless so there's no precision win
         # from re-downloading f32 weights from the hub.
-        self._compute_noise_emb_numpy(cfg)
-
-        self._prepare_cond_luts(cfg, d, noise_lut)
+        compute_noise_emb_numpy(self, cfg)
+        prepare_cond_luts(self, cfg, cfg.d_model)
 
         # Recurse into children (Linear.prepare handles fp8 + shuffle).
         super().prepare(**kwargs)
-
-    def _compute_noise_emb_numpy(self, cfg):
-        """Compute noise embeddings in numpy f32 using the loaded weights."""
-        import math
-
-        import numpy as np
-
-        _sync()
-
-        # Compute freqs from config (WE's NoiseConditioner.__init__):
-        # freq = logspace(0, -1, steps=fourier_dim//2, base=10000)
-        half = cfg.fourier_dim // 2
-        freqs = np.array(
-            [10000.0 ** (-i / max(half - 1, 1)) for i in range(half)],
-            dtype=np.float32,
-        )
-
-        def _to_f32(w):
-            if hasattr(w, "to_numpy"):
-                return w.astype("f32").to_numpy()
-            if _IS_METAL:
-                import mlx.core as mx
-
-                return np.array(w.astype(mx.float32))
-            return np.array(w, dtype=np.float32)
-
-        w1 = _to_f32(self.noise_fc1.weight.data)
-        w2 = _to_f32(self.noise_fc2.weight.data)
-
-        sqrt2 = math.sqrt(2.0)
-        sigmas = list(cfg.scheduler_sigmas)
-        n = len(sigmas)
-        fourier_dim = len(freqs) * 2
-
-        # Fourier features in f32.
-        fourier = np.zeros((n, fourier_dim), dtype=np.float32)
-        for i, s in enumerate(sigmas):
-            phase = np.array([float(s) * 1000.0 * f for f in freqs], dtype=np.float32)
-            fourier[i, : len(freqs)] = sqrt2 * np.sin(phase)
-            fourier[i, len(freqs) :] = sqrt2 * np.cos(phase)
-
-        # MLP in f32: h = silu(fourier @ W1.T), emb = h @ W2.T
-        h = fourier @ w1.T
-        h = h * (1.0 / (1.0 + np.exp(-h)))  # silu
-        emb = h @ w2.T  # [n, d] in f32
-
-        self._noise_emb_np = [emb[i].astype(np.float64) for i in range(n)]
-
-    def _prepare_cond_luts(self, cfg, d, noise_lut):
-        """Precompute per-block cond LUTs via numpy f32."""
-        import numpy as np
-
-        def _to_f32_np(t):
-            if hasattr(t, "to_numpy"):
-                # QuarkTensor.
-                return t.astype("f32").to_numpy()
-            if _IS_METAL:
-                import mlx.core as mx
-
-                return np.array(t.astype(mx.float32)) if hasattr(t, "astype") else np.array(t)
-            return np.array(t, dtype=np.float32)
-
-        # _noise_emb_np is computed in f32 by _compute_noise_emb_f32() above.
-        out_dt = "f16" if cfg.use_f16 else "bf16"
-
-        def _np_to_device(arr_f32, dt):
-            if _IS_METAL:
-                import mlx.core as mx
-
-                if dt == "bf16":
-                    u16 = (arr_f32.view(np.uint32) >> 16).astype(np.uint16)
-                    return mx.array(u16).view(mx.bfloat16)
-                return mx.array(arr_f32.astype(np.float16 if dt == "f16" else np.float32))
-
-            from quark.runtime.tensor import QuarkTensor as _PT
-
-            return _PT.from_numpy(arr_f32, dtype=dt)
-
-        # Per-block: separate attn and mlp cond heads with different bias_in.
-        # Use f32 noise embeddings from _compute_noise_emb_f32().
-        for block in cast("list[TransformerBlock]", self.blocks):
-            attn_bias = _to_f32_np(block.attn_cond_bias_in.data)
-            mlp_bias = _to_f32_np(block.mlp_cond_bias_in.data)
-            proj_ws = [
-                _to_f32_np(cast("nn.Linear", block.cond_projs[j]).weight.data) for j in range(6)
-            ]
-            block_lut = []
-            for si in range(len(cfg.scheduler_sigmas)):
-                emb = self._noise_emb_np[si]  # f64 from f32 noise computation
-                # attn path: emb + attn_bias → silu → projs 0-2
-                h_attn = emb + attn_bias
-                h_attn = h_attn * (1.0 / (1.0 + np.exp(-h_attn)))
-                # mlp path: emb + mlp_bias → silu → projs 3-5
-                h_mlp = emb + mlp_bias
-                h_mlp = h_mlp * (1.0 / (1.0 + np.exp(-h_mlp)))
-                projs = []
-                for j in range(6):
-                    h = h_attn if j < 3 else h_mlp
-                    projs.append(h @ proj_ws[j].T)
-                block_lut.append(
-                    tuple(_np_to_device(p.reshape(1, d).astype(np.float32), out_dt) for p in projs)
-                )
-            block._cond_lut = block_lut
-
-        # Out-norm: silu(noise_emb) @ fc.weight.T — NO per-block bias_in.
-        on_w = _to_f32_np(self.out_norm_proj.weight.data)  # [2*d, d]
-        self._out_norm_luts = []
-        for si in range(len(cfg.scheduler_sigmas)):
-            emb = self._noise_emb_np[si]  # f64
-            h = emb * (1.0 / (1.0 + np.exp(-emb)))  # silu(emb), no bias
-            ab = h @ on_w.T  # [2*d]
-            s_on = ab[:d].reshape(1, d)
-            b_on = ab[d:].reshape(1, d)
-
-            self._out_norm_luts.append(
-                (
-                    _np_to_device(s_on.astype(np.float32), out_dt),
-                    _np_to_device(b_on.astype(np.float32), out_dt),
-                )
-            )
-        _sync()
 
     def set_frame_t(self, value: int, stream: int = 0) -> None:
         """Update frame_t on all KV caches (async memset on stream)."""

@@ -23,6 +23,9 @@ def moe_outproj_problems() -> list[Problem]:
     base = {"D": 2048, "H": 2048, "n_experts": 16, "top_k": 4}
     otg = {"owl", "moe"}
     shuf = {"b_shuffle": True}
+    # W1.5 MoE shapes: E=8, top_k=2, H = mlp_ratio*D/top_k = 4096.
+    w15 = {"D": 2048, "H": 4096, "n_experts": 8, "top_k": 2}
+    w15tg = {"w15", "moe"}
     return [
         # bf16 — Metal production path.
         Problem("owl_360p", {"M": 128, **base}, tags=otg | {"bf16"} | _METAL),
@@ -55,4 +58,9 @@ def moe_outproj_problems() -> list[Problem]:
             tags=otg | {"mixed"} | _CUDA,
             config_overrides=shuf,
         ),
+        # W1.5 MoE — bf16-only path (moe_inproj fused-silu epilogue
+        # can't store fp8 yet, so the whole MoE block stays bf16
+        # regardless of cfg.use_fp8).
+        Problem("w15_360p", {"M": 128, **w15}, tags=w15tg | {"bf16"} | _CUDA),
+        Problem("w15_720p", {"M": 512, **w15}, tags=w15tg | {"bf16"} | _CUDA),
     ]

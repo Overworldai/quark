@@ -47,6 +47,8 @@ def _owl_attn_impl(
     compute_dtype=None,
     max_segments=3,
     packed_qkv=False,
+    quilt_factor=1,
+    quilt_offset=0,
     frame_t=None,
     out=None,
 ):
@@ -68,6 +70,8 @@ def _owl_attn_impl(
         compute_dtype=compute_dtype,
         max_segments=max_segments,
         packed_qkv=packed_qkv,
+        quilt_factor=quilt_factor,
+        quilt_offset=quilt_offset,
     )
     if frame_t is None:
         # Cache a process-wide zero sentinel so callers that don't pass
@@ -111,6 +115,8 @@ def owl_attn(
     compute_dtype=None,
     max_segments=3,
     packed_qkv=False,
+    quilt_factor=1,
+    quilt_offset=0,
     frame_t=None,
     *,
     out=None,
@@ -132,6 +138,8 @@ def owl_attn(
         compute_dtype=compute_dtype,
         max_segments=max_segments,
         packed_qkv=packed_qkv,
+        quilt_factor=quilt_factor,
+        quilt_offset=quilt_offset,
         frame_t=frame_t,
         out=out,
     )

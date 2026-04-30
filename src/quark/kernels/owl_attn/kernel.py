@@ -1,35 +1,6 @@
 """owl_attn — segment-sparse flash attention with ortho-RoPE on Q.
 
 EXEMPT FROM 500-LINE RULE
-
-Consumer of the kv_cache_update kernel. Per call:
-  Inputs:
-    Q          [B*Hq*tpf, Dh]                a_dtype    (pre-RoPE)
-    K_cache    [B*Hk*capacity, Dh]           kv_dtype   (post-RoPE; cached)
-    Vt_cache   [B*Hk*Dh, capacity]           kv_dtype   (transposed cache)
-    cos        [tpf, Dh//2]                  f32        (per-frame slice)
-    sin        [tpf, Dh//2]                  f32
-    segments   [B*max_segments*2]            s32        ((start, length) pairs)
-    n_segments [B]                           s32        (== 2 in steady state)
-  Output:
-    output     [B*Hq*tpf, Dh]                out_dtype
-
-Kernel architecture (extends `attn`):
-  Grid: (n_q_tiles, B*Hk, 1) ; n_q_tiles = tpf / BlockQRows
-  Block: NumWarps*32 threads ; NumWarps = gqa_ratio * NCW
-
-  1. cp.async Q → smem (per-warp slice).
-  2. cp.async cos / sin → smem (block-shared, BlockQRows × Dh//2).
-  3. async_wait + barrier.
-  4. Q-RoPE pass: each thread reads pairs from Q_smem (a_dtype),
-     applies fp32 ortho-RoPE with concat-output layout, casts back
-     to a_dtype, writes y0/y1 to Q_smem at (r, c) and (r, c+half_Dh).
-     Same convention K_cache uses (kv_cache_update writes K with concat).
-  5. barrier; load_matrix → register fragments.
-  6. Per segment (python-unrolled), inner for_loop over KvTile chunks:
-     cp.async K (then GEMM1), cp.async V^T (then softmax + GEMM2).
-     Accumulators carry through all segment loops.
-  7. ``qk.store_acc(per_warp=True, row_scale=l)`` epilogue.
 """
 
 from __future__ import annotations
@@ -214,7 +185,7 @@ class OwlAttnKernel(Kernel):
         from quark.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = OwlAttnSpec(**problem)
-        B, Hk, tpf, Dh = spec.B, spec.n_kv_heads, spec.tpf, spec.Dh
+        B, Hk, _, Dh = spec.B, spec.n_kv_heads, spec.tpf, spec.Dh
         cap = spec.capacity
         rng = np.random.default_rng(seed)
 
@@ -227,8 +198,10 @@ class OwlAttnKernel(Kernel):
             (rng.standard_normal((B * Hk * Dh, cap)) * 0.3).astype(np.float32), spec.kv_dtype
         )
 
+        # Steady-state segments are sized in cache-slot space (post-quilt).
         L = spec.L
-        seg_rows = [[0, L], [L, tpf]] + [[0, 0]] * (spec.max_segments - 2)
+        tpf_cached = spec.tpf_cached
+        seg_rows = [[0, L], [L, tpf_cached]] + [[0, 0]] * (spec.max_segments - 2)
         seg_per_batch = [v for row in seg_rows for v in row]
         segments = np.array([seg_per_batch] * B, dtype=np.int32).reshape(B * spec.max_segments * 2)
         n_segments = np.full(B, 2, dtype=np.int32)
@@ -267,6 +240,8 @@ class OwlAttnKernel(Kernel):
         compute_dtype: DType | str | None = None,
         max_segments: int = 3,
         packed_qkv: bool = False,
+        quilt_factor: int = 1,
+        quilt_offset: int = 0,
     ) -> OwlAttnSpec:
         """Derive an ``OwlAttnSpec`` from the kernel-input tensors."""
 
@@ -279,7 +254,22 @@ class OwlAttnKernel(Kernel):
         else:
             Dh = int(Q.shape[1])
         tpf = H_spatial * W_spatial
-        capacity = num_buckets * tpf + tpf
+        if quilt_factor < 1 or (quilt_factor & (quilt_factor - 1)) != 0:
+            raise ValueError(
+                f"pcf.owl_attn: quilt_factor must be a power of 2 (>=1), got {quilt_factor}"
+            )
+        if quilt_offset < 0 or quilt_offset >= quilt_factor:
+            raise ValueError(
+                f"pcf.owl_attn: quilt_offset must be in [0, quilt_factor); "
+                f"got offset={quilt_offset} factor={quilt_factor}"
+            )
+        if tpf % quilt_factor != 0:
+            raise ValueError(
+                f"pcf.owl_attn: H_spatial*W_spatial={tpf} must be divisible "
+                f"by quilt_factor={quilt_factor}"
+            )
+        tpf_cached = tpf // quilt_factor
+        capacity = num_buckets * tpf_cached + tpf_cached
         if tuple(K_cache.shape) != (B * n_kv_heads * capacity, Dh):
             raise ValueError(
                 f"pcf.owl_attn: K_cache shape {tuple(K_cache.shape)} != "
@@ -312,6 +302,8 @@ class OwlAttnKernel(Kernel):
             compute_dtype=DType.coerce(compute_dtype),
             max_segments=max_segments,
             packed_qkv=packed_qkv,
+            quilt_factor=quilt_factor,
+            quilt_offset=quilt_offset,
         )
 
     @classmethod

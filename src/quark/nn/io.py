@@ -126,7 +126,14 @@ def load_safetensors(
     """Load a ``.safetensors`` file into a ``{name: QuarkTensor}`` dict.
 
     ``dtype``: optional target dtype. When set, tensors whose source
-    dtype differs are cast via the GPU elementwise kernel after load.
+    dtype differs are routed through the per-tensor convert path —
+    upload to a small per-tensor source buffer, GPU cast into the
+    final target buffer, release the source. The shared pool only
+    allocates for tensors already at ``dtype``. This is critical for
+    e.g. f32 checkpoints loaded as bf16: peak GPU memory stays at
+    ``one_source_tensor + running_bf16_total`` instead of a 17 GB f32
+    pool plus a parallel 8.5 GB bf16 cast output (which OOM'd on
+    32 GB cards).
     ``names``: optional allowlist — tensors whose names aren't in this
     set are skipped.
 
@@ -136,8 +143,10 @@ def load_safetensors(
     with async HtoD on a dedicated stream. The pool's ``cuMemFree``
     fires once the last tensor referencing it is dropped.
 
-    Slow path (F64, I16): per-tensor host-side conversion + separate
-    device allocation. Rare; doesn't block the pooled fast path.
+    Per-tensor convert path: F64 / I16 (on-disk width != any pc-dtype)
+    and any source-dtype-mismatched tensor when ``dtype`` is set. Each
+    tensor gets its own cuMemAlloc + memcpy_htod, optionally followed
+    by a GPU cast into the target dtype.
     """
     from quark.runtime.cuda import CudaRuntime
     from quark.runtime.tensor import (
@@ -162,9 +171,20 @@ def load_safetensors(
     rt = CudaRuntime.instance()
     t0 = _tick("parse_header", t0)
 
-    # Triage every requested tensor into pooled vs. host-convert.
-    pooled: list[tuple[str, str, tuple[int, ...], int, int]] = []
-    convert: list[tuple[str, str, str, tuple[int, ...], int, int]] = []
+    # Triage every requested tensor into pooled vs. per-tensor convert.
+    # Convert path covers two cases:
+    #   1. Source dtype's on-disk byte width != target's (F64, I16) —
+    #      always a host-side struct conversion regardless of caller's
+    #      ``dtype=``.
+    #   2. Caller asked for ``dtype=`` and source pc-dtype doesn't match
+    #      (e.g. an F32 checkpoint loaded with ``dtype="bf16"``). For
+    #      these we'd otherwise have to allocate the full source pool
+    #      AND a separate post-load cast output, doubling peak device
+    #      memory. Routing them to the per-tensor convert path keeps
+    #      peak at one tensor's source size + the running target-dtype
+    #      total.
+    pooled: list = []
+    convert: list = []
     for name, info in header.items():
         if allow is not None and name not in allow:
             continue
@@ -175,8 +195,12 @@ def load_safetensors(
         pc_dtype, _ = mapping
         shape = tuple(info["shape"])
         start, end = info["data_offsets"]
-        if sf_dtype in _CONVERT_DTYPES:
-            convert.append((name, sf_dtype, pc_dtype, shape, start, end - start))
+        needs_dtype_change = dtype is not None and pc_dtype != dtype
+        if sf_dtype in _CONVERT_DTYPES or needs_dtype_change:
+            # Final pc_dtype after host-side conversion is the caller's
+            # target when one is set, else the natural pc_dtype.
+            target_pc = dtype if needs_dtype_change else pc_dtype
+            convert.append((name, sf_dtype, target_pc, shape, start, end - start))
         else:
             pooled.append((name, pc_dtype, shape, start, end - start))
 
@@ -300,37 +324,61 @@ def load_safetensors(
         pool_storage.release()
         t0 = _tick("build views", t0)
 
-    # ── Host-convert slow path ──────────────────────────────────
+    # ── Per-tensor convert path ─────────────────────────────────
+    # Two flavors mixed in this loop:
+    #
+    #   A. Source on-disk byte width != target pc-dtype (F64, I16).
+    #      Host-side struct conversion to the natural pc-dtype, then
+    #      per-tensor cuMemAlloc + memcpy_htod via from_bytes.
+    #
+    #   B. Caller asked for ``dtype=`` and source pc-dtype doesn't
+    #      match (e.g. F32 checkpoint loaded as bf16). Upload the
+    #      *source* tensor to a small per-tensor device buffer, run
+    #      the GPU cast kernel into the final target-dtype tensor,
+    #      release the source. Peak device memory stays at one
+    #      source tensor + running target total — no full-source pool.
     if convert:
         import mmap as _mmap
 
+        from quark.runtime.kernels import cast as _device_cast
+
         with open(path_str, "rb") as f:
             mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+        mv = memoryview(mm)
         try:
-            mv = memoryview(mm)
             for name, sf_dtype, pc_dtype, shape, start, src_nbytes in convert:
-                raw = bytes(mv[data_offset + start : data_offset + start + src_nbytes])
+                src_pc, _ = _SF_DTYPE_TO_PC[sf_dtype]
                 if sf_dtype == "F64":
+                    raw = bytes(mv[data_offset + start : data_offset + start + src_nbytes])
                     numel = src_nbytes // 8
                     vals = struct.unpack(f"<{numel}d", raw)
                     raw = struct.pack(f"<{numel}f", *vals)
+                    tensors[name] = QuarkTensor.from_bytes(raw, shape, src_pc)
                 elif sf_dtype == "I16":
+                    raw = bytes(mv[data_offset + start : data_offset + start + src_nbytes])
                     numel = src_nbytes // 2
                     vals = struct.unpack(f"<{numel}h", raw)
                     raw = struct.pack(f"<{numel}i", *vals)
-                tensors[name] = QuarkTensor.from_bytes(raw, shape, pc_dtype)
+                    tensors[name] = QuarkTensor.from_bytes(raw, shape, src_pc)
+                else:
+                    # Same on-disk width as src_pc; just upload as src_pc.
+                    raw = bytes(mv[data_offset + start : data_offset + start + src_nbytes])
+                    tensors[name] = QuarkTensor.from_bytes(raw, shape, src_pc)
+
+                # If caller asked for a different pc-dtype than what we
+                # just landed, run the GPU cast kernel and drop the
+                # source. ``cast`` returns a fresh device tensor of
+                # ``pc_dtype``; the source tensor goes out of scope here
+                # and its storage is released by QuarkTensor.__del__.
+                if tensors[name].dtype != pc_dtype:
+                    tensors[name] = _device_cast(tensors[name], pc_dtype)
         finally:
+            # ``memoryview`` keeps an exported pointer into ``mm``;
+            # mmap.close raises BufferError until every view is
+            # explicitly released.
+            mv.release()
             mm.close()
-        t0 = _tick("convert slow path", t0)
-
-    # ── Optional post-load cast ─────────────────────────────────
-    if dtype is not None:
-        from quark.runtime.kernels import cast
-
-        for name, t in list(tensors.items()):
-            if t.dtype != dtype:
-                tensors[name] = cast(t, dtype)
-        t0 = _tick("post-load cast", t0)
+        t0 = _tick("convert path", t0)
 
     if profile:
         total = sum(phase_t.values())

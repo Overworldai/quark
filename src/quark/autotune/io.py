@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 _KILL_SWITCH_ENV = "QUARK_DISABLE_AUTOTUNE"
 _CACHE_DIR_ENV = "QUARK_CACHE_DIR"
+_REVALIDATE_ENV = "QUARK_AUTOTUNE_REVALIDATE"
 
 
 def default_cache_dir() -> Path:
@@ -43,6 +44,19 @@ def default_bundled_dir() -> Path:
 
 def autotune_disabled() -> bool:
     val = os.environ.get(_KILL_SWITCH_ENV, "")
+    return val.lower() in ("1", "true", "yes", "on")
+
+
+def _revalidate_source() -> bool:
+    """``QUARK_AUTOTUNE_REVALIDATE`` opt-in: re-check that a cached
+    config's stored ``source_hash`` matches the current kernel source.
+    Default is OFF so casual edits to a kernel (e.g. perf tweaks,
+    tuning the kernel body) don't blow away the cache and force a
+    fresh autotune (which is what runs the multi-second numpy
+    reference). Turn it on when you know the kernel's *output*
+    contract has changed and you want stale entries discarded.
+    """
+    val = os.environ.get(_REVALIDATE_ENV, "")
     return val.lower() in ("1", "true", "yes", "on")
 
 
@@ -124,11 +138,18 @@ def resolve_config_cls(kernel_qualname: Optional[str]) -> Optional[type]:
 
 
 def make_key(kernel_cls, spec, device_fingerprint: str) -> tuple:
+    """Cache-lookup key — intentionally excludes ``source_hash(kernel_cls)``.
+
+    The on-disk filename is derived from this key, so dropping the
+    source hash means a kernel-source edit doesn't change the filename
+    — cached configs survive across edits. ``source_hash`` is still
+    written into the JSON payload at save time and consulted on load
+    when ``QUARK_AUTOTUNE_REVALIDATE`` is set.
+    """
     return (
         kernel_cls.__qualname__,
         spec_fingerprint(spec),
         device_fingerprint,
-        source_hash(kernel_cls),
     )
 
 
@@ -143,7 +164,22 @@ def key_to_filename(key: tuple) -> str:
 # ---------------------------------------------------------------------------
 
 
-def load_from_disk(cache_dir: Path, key: tuple, device_fingerprint: str) -> Optional[Any]:
+def load_from_disk(
+    cache_dir: Path,
+    key: tuple,
+    device_fingerprint: str,
+    *,
+    kernel_cls: Optional[type] = None,
+) -> Optional[Any]:
+    """Read a cached config from disk.
+
+    ``source_hash`` validation is opt-in via ``QUARK_AUTOTUNE_REVALIDATE``:
+    by default a kernel-source edit doesn't invalidate the entry, so we
+    don't repeatedly pay for a fresh autotune (and its multi-second
+    numpy reference) every time the kernel body is tweaked. Pass
+    ``kernel_cls`` so the env-gated validation has the current source
+    available.
+    """
     path = cache_dir / key_to_filename(key)
     if not path.exists():
         return None
@@ -151,10 +187,11 @@ def load_from_disk(cache_dir: Path, key: tuple, device_fingerprint: str) -> Opti
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if payload.get("source_hash") != key[3]:
-        return None
     if payload.get("device") != device_fingerprint:
         return None
+    if _revalidate_source() and kernel_cls is not None:
+        if payload.get("source_hash") != source_hash(kernel_cls):
+            return None
     config_payload = payload.get("config")
     if not isinstance(config_payload, dict):
         return None
@@ -186,7 +223,9 @@ def save_to_disk(
         "kernel": kernel_cls.__qualname__,
         "spec": spec_to_json_dict(spec),
         "device": device_fingerprint,
-        "source_hash": key[3],
+        # Stored for opt-in revalidation under QUARK_AUTOTUNE_REVALIDATE;
+        # not part of the cache key (see ``make_key``).
+        "source_hash": source_hash(kernel_cls),
         "config": config_to_json_dict(config),
         "runtime_us": runtime_us,
         "timestamp": int(time.time()),

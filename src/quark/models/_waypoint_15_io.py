@@ -158,10 +158,40 @@ def remap_world_engine_state_dict(raw_sd: dict, cfg) -> dict:
         sd[f"blocks.{i}.qkv_proj.weight"] = _cat([q_w, k_w, v_w], dim=0)
         sd[f"blocks.{i}.out_proj.weight"] = raw_sd[p + "attn.out_proj.weight"]
 
-        fc1 = p + ("mlp.fc1.weight" if p + "mlp.fc1.weight" in raw_sd else "dit_mlp.fc1.weight")
-        fc2 = p + ("mlp.fc2.weight" if p + "mlp.fc2.weight" in raw_sd else "dit_mlp.fc2.weight")
-        sd[f"blocks.{i}.mlp.fc1.weight"] = raw_sd[fc1]
-        sd[f"blocks.{i}.mlp.fc2.weight"] = raw_sd[fc2]
+        # MLP block — either dense (mlp.fc1 / mlp.fc2) or MoE
+        # (mlp.router.weight + mlp.expert_in + mlp.expert_out). Sniff the
+        # checkpoint instead of the cfg so a "dense weights into MoE
+        # model" mistake fails loud here rather than at forward time.
+        moe_router_key = next(
+            (
+                p + prefix + "router.weight"
+                for prefix in ("mlp.", "dit_mlp.")
+                if p + prefix + "router.weight" in raw_sd
+            ),
+            None,
+        )
+        if moe_router_key is not None:
+            # MoE branch — flatten [E, H, D] / [E, D, H] to the [E*H, D]
+            # / [E*D, H] layout the moe_inproj/outproj kernels expect.
+            # Same memory, just collapse the leading two dims.
+            base = moe_router_key[: -len("router.weight")]
+            sd[f"blocks.{i}.mlp.router.weight"] = raw_sd[moe_router_key]
+            ein = raw_sd[base + "expert_in"]
+            eout = raw_sd[base + "expert_out"]
+            E = cfg.moe_n_experts
+            H = cfg.mlp_dim // cfg.moe_top_k
+            D = cfg.d_model
+            if ein.ndim == 3:
+                ein = _reshape(ein, E * H, D)
+            if eout.ndim == 3:
+                eout = _reshape(eout, E * D, H)
+            sd[f"blocks.{i}.mlp.expert_in"] = ein
+            sd[f"blocks.{i}.mlp.expert_out"] = eout
+        else:
+            fc1 = p + ("mlp.fc1.weight" if p + "mlp.fc1.weight" in raw_sd else "dit_mlp.fc1.weight")
+            fc2 = p + ("mlp.fc2.weight" if p + "mlp.fc2.weight" in raw_sd else "dit_mlp.fc2.weight")
+            sd[f"blocks.{i}.mlp.fc1.weight"] = raw_sd[fc1]
+            sd[f"blocks.{i}.mlp.fc2.weight"] = raw_sd[fc2]
 
         if cfg.value_residual and p + "attn.v_lamb" in raw_sd:
             lamb = raw_sd[p + "attn.v_lamb"]
@@ -287,3 +317,133 @@ def build_ctrl_buffer(model):
         return dev
 
     return dev, fill
+
+
+# ---------------------------------------------------------------
+# Noise embedding + per-block cond LUT precompute (numpy f32)
+# ---------------------------------------------------------------
+
+
+def _to_f32_np(t):
+    """Pull a backend-native tensor down to a numpy f32 array."""
+    import numpy as _np
+
+    if hasattr(t, "to_numpy"):
+        return t.astype("f32").to_numpy()
+    if _IS_METAL:
+        import mlx.core as mx
+
+        return _np.array(t.astype(mx.float32)) if hasattr(t, "astype") else _np.array(t)
+    return _np.array(t, dtype=_np.float32)
+
+
+def _np_to_device(arr_f32, dt: str):
+    """Move an f32 numpy array to the active backend at ``dt``."""
+    import numpy as _np
+
+    if _IS_METAL:
+        import mlx.core as mx
+
+        if dt == "bf16":
+            u16 = (arr_f32.view(_np.uint32) >> 16).astype(_np.uint16)
+            return mx.array(u16).view(mx.bfloat16)
+        return mx.array(arr_f32.astype(_np.float16 if dt == "f16" else _np.float32))
+    from quark.runtime.tensor import QuarkTensor
+
+    return QuarkTensor.from_numpy(arr_f32, dtype=dt)
+
+
+def compute_noise_emb_numpy(model, cfg) -> None:
+    """Populate ``model._noise_emb_np`` from already-loaded bf16 weights.
+
+    Replays world_engine's ``NoiseConditioner.forward`` in numpy f32 —
+    bf16 → f32 is lossless so there's no precision win from re-loading
+    f32 weights. Stays in f32 (not f64): every per-block matmul in
+    ``prepare_cond_luts`` mixes this against f32 projection weights;
+    promoting to f64 here would force a 16MB scratch alloc per matmul
+    × 30 matmuls/block × 24 blocks ≈ 60s of pure-numpy upcast cost.
+    """
+    import math
+
+    import numpy as np
+
+    from quark.runtime.sync import synchronize
+
+    synchronize()
+
+    half = cfg.fourier_dim // 2
+    freqs = np.array(
+        [10000.0 ** (-i / max(half - 1, 1)) for i in range(half)],
+        dtype=np.float32,
+    )
+
+    w1 = _to_f32_np(model.noise_fc1.weight.data)
+    w2 = _to_f32_np(model.noise_fc2.weight.data)
+
+    sqrt2 = math.sqrt(2.0)
+    sigmas = list(cfg.scheduler_sigmas)
+    n = len(sigmas)
+    fourier_dim = len(freqs) * 2
+
+    fourier = np.zeros((n, fourier_dim), dtype=np.float32)
+    for i, s in enumerate(sigmas):
+        phase = np.array([float(s) * 1000.0 * f for f in freqs], dtype=np.float32)
+        fourier[i, : len(freqs)] = sqrt2 * np.sin(phase)
+        fourier[i, len(freqs) :] = sqrt2 * np.cos(phase)
+
+    h = fourier @ w1.T
+    h = h * (1.0 / (1.0 + np.exp(-h)))  # silu
+    emb = h @ w2.T  # [n, d] f32
+
+    model._noise_emb_np = [emb[i].copy() for i in range(n)]  # f32 [d] each
+
+
+def prepare_cond_luts(model, cfg, d: int) -> None:
+    """Precompute per-block cond LUTs and the out-norm LUT in numpy f32.
+
+    Each TransformerBlock gets ``block._cond_lut[si]`` = a 6-tuple of
+    half-precision device tensors (the projected (silu(emb + bias)) for
+    sigmas[si]). The out-norm path emits ``model._out_norm_luts[si]``
+    = (s_on, b_on) for the AdaRMSNorm at the model output.
+    """
+    import numpy as np
+
+    from quark.runtime.sync import synchronize
+
+    out_dt = "f16" if cfg.use_f16 else "bf16"
+
+    # Per-block: separate attn and mlp cond heads with different bias_in.
+    # Use f32 noise embeddings from compute_noise_emb_numpy().
+    for block in model.blocks:
+        attn_bias = _to_f32_np(block.attn_cond_bias_in.data)
+        mlp_bias = _to_f32_np(block.mlp_cond_bias_in.data)
+        proj_ws = [_to_f32_np(block.cond_projs[j].weight.data) for j in range(6)]
+        block_lut = []
+        for si in range(len(cfg.scheduler_sigmas)):
+            emb = model._noise_emb_np[si]
+            # attn path: emb + attn_bias → silu → projs 0-2
+            h_attn = emb + attn_bias
+            h_attn = h_attn * (1.0 / (1.0 + np.exp(-h_attn)))
+            # mlp path: emb + mlp_bias → silu → projs 3-5
+            h_mlp = emb + mlp_bias
+            h_mlp = h_mlp * (1.0 / (1.0 + np.exp(-h_mlp)))
+            projs = [(h_attn if j < 3 else h_mlp) @ proj_ws[j].T for j in range(6)]
+            block_lut.append(
+                tuple(_np_to_device(p.reshape(1, d).astype(np.float32), out_dt) for p in projs)
+            )
+        block._cond_lut = block_lut
+
+    # Out-norm: silu(noise_emb) @ fc.weight.T — NO per-block bias_in.
+    on_w = _to_f32_np(model.out_norm_proj.weight.data)  # [2*d, d]
+    model._out_norm_luts = []
+    for si in range(len(cfg.scheduler_sigmas)):
+        emb = model._noise_emb_np[si]
+        h = emb * (1.0 / (1.0 + np.exp(-emb)))  # silu(emb), no bias
+        ab = h @ on_w.T  # [2*d]
+        model._out_norm_luts.append(
+            (
+                _np_to_device(ab[:d].reshape(1, d).astype(np.float32), out_dt),
+                _np_to_device(ab[d:].reshape(1, d).astype(np.float32), out_dt),
+            )
+        )
+    synchronize()

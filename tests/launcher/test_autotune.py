@@ -276,20 +276,26 @@ class TestLookupDiskTier:
         jsons = list((tmp_path / "cache").glob("*.json"))
         assert len(jsons) == 1
 
-    def test_source_hash_change_invalidates_disk(self, tmp_path, monkeypatch):
+    def test_source_hash_change_invalidates_disk_under_revalidate(self, tmp_path, monkeypatch):
         cache = _fresh_cache(tmp_path)
         spec = _Spec(M=64, N=128)
         cfg = _Config()
         cache.store(_ToyKernel, spec, cfg)
 
-        # Mutate the source hash by monkey-patching ``source_hash`` at
-        # the io module so subsequent reads build a different cache key.
-        # The on-disk file's source_hash field no longer matches, so
-        # the load fails.
+        # Mutate the stored source_hash so the on-disk file's value no
+        # longer matches the current kernel source. With
+        # QUARK_AUTOTUNE_REVALIDATE off (default), the cache still
+        # accepts the entry; with it on, the load is rejected.
         from quark.autotune import io as io_module
 
         monkeypatch.setattr(io_module, "source_hash", lambda cls: "deadbeef" + ("0" * 8))
         cache.clear_hot()
+
+        monkeypatch.delenv("QUARK_AUTOTUNE_REVALIDATE", raising=False)
+        assert cache.lookup(_ToyKernel, spec) == cfg
+
+        cache.clear_hot()
+        monkeypatch.setenv("QUARK_AUTOTUNE_REVALIDATE", "1")
         assert cache.lookup(_ToyKernel, spec) is None
 
 

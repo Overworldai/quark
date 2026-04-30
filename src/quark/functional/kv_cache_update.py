@@ -36,6 +36,8 @@ def _impl(
     packed_qkv=False,
     n_q_heads=0,
     rope_n_frames=1,
+    quilt_factor=1,
+    quilt_offset=0,
 ):
     cls = _cls()
     spec = cls.spec_from_tensors(
@@ -58,6 +60,8 @@ def _impl(
         packed_qkv=packed_qkv,
         n_q_heads=n_q_heads,
         rope_n_frames=rope_n_frames,
+        quilt_factor=quilt_factor,
+        quilt_offset=quilt_offset,
     )
     result = call_with_bindings(
         cls,
@@ -99,8 +103,14 @@ def kv_cache_update(
     packed_qkv=False,
     n_q_heads=0,
     rope_n_frames=1,
+    quilt_factor=1,
+    quilt_offset=0,
 ):
-    """In-place RoPE + KV-cache update. frozen=1 skips ring writes."""
+    """In-place RoPE + KV-cache update. frozen=1 skips ring writes.
+
+    Quilt attention: when ``quilt_factor>1`` (power of 2), the cache
+    only stores pixels with ``pixel_idx % quilt_factor == quilt_offset``.
+    Cache capacity shrinks by ``quilt_factor``."""
     return _impl(
         K,
         V,
@@ -121,6 +131,8 @@ def kv_cache_update(
         packed_qkv=packed_qkv,
         n_q_heads=n_q_heads,
         rope_n_frames=rope_n_frames,
+        quilt_factor=quilt_factor,
+        quilt_offset=quilt_offset,
     )
 
 

@@ -127,9 +127,9 @@ class MoeInprojKernel(Kernel):
         from quark.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = MoeInprojSpec(**problem)
-        M, D, H, n_experts, top_k = spec.M, spec.D, spec.H, spec.n_experts, spec.top_k
-        total = M * top_k
-        slots_per_expert = total // n_experts
+        M, D, H, n_experts, _ = spec.M, spec.D, spec.H, spec.n_experts, spec.top_k
+        total = spec.total_slots
+        slots_per_expert = spec.capacity
 
         rng = np.random.default_rng(seed)
         token_ids = (np.arange(total) % M).astype(np.int32)
@@ -138,6 +138,7 @@ class MoeInprojKernel(Kernel):
         # gets written (matters on Metal where mx.fast.metal_kernel
         # allocates outputs uninitialized and uncovered slots diverge
         # from the reference).
+        assert slots_per_expert is not None
         wl_entries = [
             (grp_start, grp_start // slots_per_expert) for grp_start in range(0, total, 32)
         ]
@@ -185,10 +186,17 @@ class MoeInprojKernel(Kernel):
                 f"pcf.moe_inproj: W_in.shape[0] ({nW}) not divisible by n_experts ({n_experts})"
             )
         H = nW // n_experts
-        total_slots = M * top_k
-        if int(token_ids.shape[0]) != total_slots:
+        ts = int(token_ids.shape[0])
+        if ts % n_experts != 0:
             raise ValueError(
-                f"pcf.moe_inproj: token_ids shape {tuple(token_ids.shape)} != ({total_slots},)"
+                f"pcf.moe_inproj: token_ids shape {tuple(token_ids.shape)} not "
+                f"divisible by n_experts ({n_experts})"
+            )
+        capacity = ts // n_experts
+        if ts < M * top_k:
+            raise ValueError(
+                f"pcf.moe_inproj: token_ids buffer ({ts}) too small for M*top_k "
+                f"({M * top_k}); need capacity*n_experts >= M*top_k"
             )
         a_dt = DType.from_backend(X.dtype)
         return MoeInprojSpec(
@@ -201,6 +209,7 @@ class MoeInprojKernel(Kernel):
             b_dtype=DType.from_backend(W_in.dtype),
             out_dtype=DType.coerce(out_dtype) or a_dt,
             compute_dtype=DType.coerce(compute_dtype),
+            capacity=capacity,
         )
 
     @classmethod
@@ -213,6 +222,9 @@ class MoeInprojKernel(Kernel):
         # device's legal shape set — keep ``mma_k`` off the tune space
         # so the autotuner can't produce a (mma_k=32, main_shape=k16)
         # mismatch where config fields disagree.
+        # b_shuffle pinned to False — runtime weight shuffling is gated
+        # off (see Linear.prepare). Problems that explicitly need the
+        # shuffled path can pin via config_overrides.
         return {
             "BM": [32, 64],
             "BN": [64, 128, 256],
@@ -222,7 +234,6 @@ class MoeInprojKernel(Kernel):
             "a_pad": [0, 8, 16],
             "b_pad": [0, 8, 16],
             "vec_epilogue": [False, True],
-            "b_shuffle": [False, True],
         }
 
     # ── build() ──
@@ -237,70 +248,83 @@ class MoeInprojKernel(Kernel):
 
         bctx, n_base = self.bctx, self.n_base
         grp_start, expert = qk.work_list_load(g.work_list, block_idx("y"))
-        b_row_base = expert * s.H + n_base
 
-        toks = qk.index_cache("toks_cache", g.token_ids, count=c.BM, base=grp_start)
-        barrier("block")
+        # Sentinel-skip for ``moe_router_correct`` filler chunks. The
+        # work_list expert is U32 by API convention (it's used below as
+        # a row offset), so re-cast to S32 here to make the ``>= 0``
+        # compare detect the -1 sentinel as signed. ``expert`` is
+        # uniform across the block (single gmem load at block entry),
+        # so this is a clean uniform branch.
+        is_valid = qk.cmp("ge", qk.bitcast(expert, DType.S32), bctx.c(0, dtype=DType.S32))
+        with qk.if_(is_valid, carried=[]) as (_, _, arms):
+            with arms.then_():
+                b_row_base = expert * s.H + n_base
 
-        stages = SmemPlan.staged_pairs(
-            compute_ir,
-            a_shape=(c.BM, c.BK),
-            b_shape=(c.BN, c.BK),
-            a_pad=c.a_pad,
-            b_pad=c.b_pad,
-            mma_cfg=mma_cfg,
-            n_warps=c.n_warps,
-            b_shuffled=c.b_shuffle,
-            n_stages=c.n_stages,
-        )
-        acc = Accumulators.from_mma(mma_cfg, BM=c.BM, BN=c.BN, n_warps=c.n_warps)
-        mma = MmaBody(shape=mma_cfg, acc=acc, BK=c.BK, b_shuffled=c.b_shuffle)
-        BN_per_warp = (c.BN // mma_cfg.shape.n // c.n_warps) * mma_cfg.shape.n
-        bk_stride_a = c.BK
-        bk_stride_b = (c.BK + c.b_pad) if (c.b_shuffle and c.b_pad > 0) else c.BK
-        K_outer = s.D // c.BK
+                toks = qk.index_cache("toks_cache", g.token_ids, count=c.BM, base=grp_start)
+                barrier("block")
 
-        def produce(ictx: IterCtx) -> None:
-            plan = ictx.stage
-            k_col_a = ictx.iter_idx * bk_stride_a
-            k_col_b = k_col_a if bk_stride_b == bk_stride_a else ictx.iter_idx * bk_stride_b
-            plan.a.gather_from(g.X, index=toks, col=k_col_a, cast=a_cast)
-            plan.b.load_from(g.W_in, row=b_row_base, col=k_col_b, cast=b_cast)
+                stages = SmemPlan.staged_pairs(
+                    compute_ir,
+                    a_shape=(c.BM, c.BK),
+                    b_shape=(c.BN, c.BK),
+                    a_pad=c.a_pad,
+                    b_pad=c.b_pad,
+                    mma_cfg=mma_cfg,
+                    n_warps=c.n_warps,
+                    b_shuffled=c.b_shuffle,
+                    n_stages=c.n_stages,
+                )
+                acc = Accumulators.from_mma(mma_cfg, BM=c.BM, BN=c.BN, n_warps=c.n_warps)
+                mma = MmaBody(shape=mma_cfg, acc=acc, BK=c.BK, b_shuffled=c.b_shuffle)
+                BN_per_warp = (c.BN // mma_cfg.shape.n // c.n_warps) * mma_cfg.shape.n
+                bk_stride_a = c.BK
+                bk_stride_b = (c.BK + c.b_pad) if (c.b_shuffle and c.b_pad > 0) else c.BK
+                K_outer = s.D // c.BK
 
-        PipelineBody(
-            stages=stages,
-            produce=produce,
-            consume=mma,
-            carry=acc,
-        ).run(n_iters=K_outer, n_stages=c.n_stages)
+                def produce(ictx: IterCtx) -> None:
+                    plan = ictx.stage
+                    k_col_a = ictx.iter_idx * bk_stride_a
+                    k_col_b = k_col_a if bk_stride_b == bk_stride_a else ictx.iter_idx * bk_stride_b
+                    plan.a.gather_from(g.X, index=toks, col=k_col_a, cast=a_cast)
+                    plan.b.load_from(g.W_in, row=b_row_base, col=k_col_b, cast=b_cast)
 
-        warp_col_base = n_base + bctx.warp_id * BN_per_warp
+                PipelineBody(
+                    stages=stages,
+                    produce=produce,
+                    consume=mma,
+                    carry=acc,
+                ).run(n_iters=K_outer, n_stages=c.n_stages)
 
-        # SiLU + cast + store. ``activation="silu"`` fuses silu inside
-        # the per-element store body — required on MSL until the
-        # lowerer can compose frag-derived values (memory:
-        # project_lowerer_frag_compose). Vectorized through staging
-        # smem when c.vec_epilogue, else direct scalar.
-        if c.vec_epilogue:
-            silu_stage = qk.smem_alloc("silu_stage", s.out_dtype, (c.BM, c.BN))
-            qk.store_acc(
-                g.H_out,
-                acc,
-                row=grp_start,
-                col=warp_col_base,
-                cast=s.out_dtype,
-                activation="silu",
-                stage_in_smem=True,
-                staging_smem=silu_stage,
-                smem_col_offset=bctx.warp_id * BN_per_warp,
-                gmem_col_base_full=n_base,
-            )
-        else:
-            qk.store_acc(
-                g.H_out,
-                acc,
-                row=grp_start,
-                col=warp_col_base,
-                cast=s.out_dtype,
-                activation="silu",
-            )
+                warp_col_base = n_base + bctx.warp_id * BN_per_warp
+
+                # SiLU + cast + store. ``activation="silu"`` fuses silu inside
+                # the per-element store body — required on MSL until the
+                # lowerer can compose frag-derived values (memory:
+                # project_lowerer_frag_compose). Vectorized through staging
+                # smem when c.vec_epilogue, else direct scalar.
+                if c.vec_epilogue:
+                    silu_stage = qk.smem_alloc("silu_stage", s.out_dtype, (c.BM, c.BN))
+                    qk.store_acc(
+                        g.H_out,
+                        acc,
+                        row=grp_start,
+                        col=warp_col_base,
+                        cast=s.out_dtype,
+                        activation="silu",
+                        stage_in_smem=True,
+                        staging_smem=silu_stage,
+                        smem_col_offset=bctx.warp_id * BN_per_warp,
+                        gmem_col_base_full=n_base,
+                    )
+                else:
+                    qk.store_acc(
+                        g.H_out,
+                        acc,
+                        row=grp_start,
+                        col=warp_col_base,
+                        cast=s.out_dtype,
+                        activation="silu",
+                    )
+                qk.yield_()
+            with arms.else_():
+                qk.yield_()

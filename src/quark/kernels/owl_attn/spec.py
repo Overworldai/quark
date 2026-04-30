@@ -42,6 +42,12 @@ class OwlAttnSpec(KernelSpec):
     # [B*tpf, n_q_heads*Dh]. The kernel indexes into the packed Q
     # columns using per-head column offsets rather than head-strided rows.
     packed_qkv: bool = False
+    # Quilt attention — see KVCacheUpdateSpec for the full description.
+    # owl_attn doesn't read these directly, but they shrink ``L`` /
+    # ``capacity`` so the cache shape, segment lengths, and the iter
+    # loop count all line up with the matching kv_cache_update spec.
+    quilt_factor: int = 1
+    quilt_offset: int = 0
     # RoPE cos/sin are computed inline from (h, w, frame_t, Dh).
     # No precomputed tables — frame_t is a runtime device buffer.
 
@@ -70,16 +76,21 @@ class OwlAttnSpec(KernelSpec):
         return self.H_spatial * self.W_spatial
 
     @property
+    def tpf_cached(self) -> int:
+        """Per-frame token count stored in K/V cache (after quilt)."""
+        return self.tpf // self.quilt_factor
+
+    @property
     def seq_len(self) -> int:
         return self.tpf  # one frame per call
 
     @property
     def L(self) -> int:
-        return self.num_buckets * self.tpf
+        return self.num_buckets * self.tpf_cached
 
     @property
     def capacity(self) -> int:
-        return self.L + self.tpf
+        return self.L + self.tpf_cached
 
     @property
     def total_q(self) -> int:

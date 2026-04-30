@@ -43,6 +43,14 @@ class KVCacheUpdateSpec(KernelSpec):
     # Number of frames in the cos/sin RoPE table. 1 = pre-sliced (legacy),
     # >1 = full table (the kernel indexes via frame_t * tpf internally).
     rope_n_frames: int = 1
+    # Quilt attention: a power-of-2 sparsity factor that drops every
+    # ``quilt_factor``-th pixel from the cache. ``quilt_offset`` selects
+    # which residue class (``pixel_idx % quilt_factor == quilt_offset``)
+    # this layer keeps; alternating layers use different offsets so the
+    # model in aggregate still sees every pixel through the residual
+    # stream. quilt_factor=1 (default) is the dense / non-quilt path.
+    quilt_factor: int = 1
+    quilt_offset: int = 0
 
     def __post_init__(self):
         for field in ("in_dtype", "kv_dtype"):
@@ -55,12 +63,17 @@ class KVCacheUpdateSpec(KernelSpec):
         return self.H_spatial * self.W_spatial
 
     @property
+    def tpf_cached(self) -> int:
+        """Per-frame token count actually stored in cache (after quilt)."""
+        return self.tpf // self.quilt_factor
+
+    @property
     def L(self) -> int:
-        return self.num_buckets * self.tpf
+        return self.num_buckets * self.tpf_cached
 
     @property
     def capacity(self) -> int:
-        return self.L + self.tpf
+        return self.L + self.tpf_cached
 
     @property
     def qkv_dim(self) -> int:

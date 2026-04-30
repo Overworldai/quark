@@ -22,6 +22,13 @@ def work_list_load(work_list: GlobalTensor, work_idx: Value) -> tuple[Value, Val
     pair to read::
 
         grp_start, expert = qk.work_list_load(g.work_list, block_idx("y"))
+
+    Both values are returned as ``U32`` (downstream code uses them as
+    row offsets / smem indices). Routers that emit a sentinel-skip
+    marker (``expert == -1`` for filler chunks) must bitcast back to
+    S32 before comparing — see the inproj/outproj kernels for the
+    pattern. The bitcast here is cosmetic for grp_start but required
+    for expert to keep the row-arithmetic dtype consistent.
     """
     bctx = active_bctx()
     wl_base = qk.mul(work_idx, bctx.c(2))

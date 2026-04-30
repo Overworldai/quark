@@ -99,4 +99,61 @@ def kv_cache_update_problems() -> list[Problem]:
             },
             tags={"owl", "dilated", "720p", "fp8"} | _CUDA,
         ),
+        # Quilt attention: per-layer KV cache stores 1/quilt_factor of
+        # tpf, alternating across blocks. Cover offset 0 and offset 1
+        # at qf=2, plus a qf=4 spot-check.
+        Problem(
+            "quilt2_off0_360p_dense",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "quilt_factor": 2,
+                "quilt_offset": 0,
+            },
+            tags={"owl", "dense", "360p", "bf16", "quilt"} | _METAL,
+        ),
+        Problem(
+            "quilt2_off1_360p_dense",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "quilt_factor": 2,
+                "quilt_offset": 1,
+            },
+            tags={"owl", "dense", "360p", "bf16", "quilt"} | _METAL,
+        ),
+        Problem(
+            "quilt2_off0_360p_dense_fp8",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "kv_dtype": "e4m3",
+                "quilt_factor": 2,
+                "quilt_offset": 0,
+            },
+            tags={"owl", "dense", "360p", "fp8", "quilt"} | _CUDA,
+        ),
+        Problem(
+            "quilt4_off2_360p_dense_fp8",
+            {
+                **common,
+                "H_spatial": 16,
+                "W_spatial": 8,
+                "num_buckets": 16,
+                "pinned_dilation": 1,
+                "kv_dtype": "e4m3",
+                "quilt_factor": 4,
+                "quilt_offset": 2,
+            },
+            tags={"owl", "dense", "360p", "fp8", "quilt"} | _CUDA,
+        ),
     ]

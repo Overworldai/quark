@@ -230,12 +230,15 @@ def shuffle_b_for_frag_load(W, K_CHUNK: int, mma_k: int):
 
 def _shuffle_quark(W, K_CHUNK: int, mma_k: int):
     """QuarkTensor path — copy to numpy, shuffle, copy back."""
+    from quark.ir import DType
     from quark.runtime.tensor import QuarkTensor
 
     shape = tuple(W.shape)
-    # View as bytes via the raw copy-to-host.
+    # View as bytes via the raw copy-to-host. ``DType.bytes`` instead
+    # of ``W.nbytes // numel`` because QuarkTensor doesn't expose
+    # ``.nbytes`` as a top-level attribute (only on ``_storage``).
     raw = W.contiguous().to_bytes()
-    elem_bytes = W.nbytes // (W.numel() or 1)
+    elem_bytes = DType(W.dtype).bytes
     N, K = shape
     W_bytes = np.frombuffer(raw, dtype=np.uint8).reshape(N, K * elem_bytes).copy()
     # Reshape + shuffle as in _shuffle_numpy, byte-level.
@@ -403,8 +406,10 @@ class ShuffledWeight:
         # ─── Normalize input → (byte-view np.ndarray, elem_bytes, dtype handle) ───
         if hasattr(W, "to_bytes") and isinstance(getattr(W, "dtype", None), str):
             # QuarkTensor path
+            from quark.ir import DType
+
             N, K = tuple(W.shape)
-            elem_bytes = W.nbytes // (W.numel() or 1)
+            elem_bytes = DType(W.dtype).bytes
             W_np_bytes = (
                 np.frombuffer(W.contiguous().to_bytes(), dtype=np.uint8)
                 .reshape(N, K * elem_bytes)

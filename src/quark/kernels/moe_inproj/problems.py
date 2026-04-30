@@ -24,8 +24,11 @@ def moe_inproj_problems() -> list[Problem]:
     }
     owl = {"D": 2048, "H": 2048, "n_experts": 16, "top_k": 4, **bf16}
     owl_e4m3 = {"D": 2048, "H": 2048, "n_experts": 16, "top_k": 4, **c_e4m3}
+    # W1.5 MoE shapes: E=8, top_k=2, H = mlp_ratio*D/top_k = 4096.
+    w15 = {"D": 2048, "H": 4096, "n_experts": 8, "top_k": 2, **bf16}
     shuf = {"b_shuffle": True}
     otg = {"owl", "moe"}
+    w15tg = {"w15", "moe"}
     return [
         # bf16 — Metal production path (and a CUDA bf16 regression gate).
         Problem("owl_360p", {"M": 128, **owl}, tags=otg | {"bf16"} | _METAL),
@@ -48,4 +51,9 @@ def moe_inproj_problems() -> list[Problem]:
             tags=otg | {"mixed"} | _CUDA,
             config_overrides=shuf,
         ),
+        # W1.5 MoE — bf16-only path (the fused-silu epilogue can't yet
+        # store fp8, so the W1.5 MoE block stays bf16 even when the
+        # rest of the model runs in fp8).
+        Problem("w15_360p", {"M": 128, **w15}, tags=w15tg | {"bf16"} | _CUDA),
+        Problem("w15_720p", {"M": 512, **w15}, tags=w15tg | {"bf16"} | _CUDA),
     ]

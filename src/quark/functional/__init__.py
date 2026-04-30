@@ -26,6 +26,9 @@ from quark.functional.head_rmsnorm import head_rmsnorm
 from quark.functional.kv_cache_update import kv_cache_update
 from quark.functional.moe_inproj import moe_inproj
 from quark.functional.moe_outproj import moe_outproj
+from quark.functional.moe_router import moe_router
+from quark.functional.moe_router_correct import moe_router_correct
+from quark.functional.moe_router_shared import moe_router_shared
 from quark.functional.noise_cond import precompute_noise_lut
 from quark.functional.owl_attn import owl_attn
 from quark.functional.patchify import patchify, patchify_2x2
@@ -53,6 +56,9 @@ __all__ = [
     "kv_cache_update",
     "moe_inproj",
     "moe_outproj",
+    "moe_router",
+    "moe_router_correct",
+    "moe_router_shared",
     "owl_attn",
     "patchify",
     "patchify_2x2",

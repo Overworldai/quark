@@ -570,14 +570,21 @@ class KVCacheUpdate(Module):
         packed_qkv: bool,
         rope_n_frames: int = 1,  # kept for compat but unused (inline RoPE)
         dtype: str = "bf16",
+        quilt_factor: int = 1,
+        quilt_offset: int = 0,
     ):
         tpf = H_spatial * W_spatial
-        cap = num_buckets * tpf + tpf
-        L = num_buckets * tpf
+        if tpf % quilt_factor != 0:
+            raise ValueError(
+                f"KVCacheUpdate: tpf={tpf} not divisible by quilt_factor={quilt_factor}"
+            )
+        tpf_cached = tpf // quilt_factor
+        cap = num_buckets * tpf_cached + tpf_cached
+        L = num_buckets * tpf_cached
 
         self.K_cache = _zeros(B * n_kv_heads * cap, Dh, dtype=dtype)
         self.Vt_cache = _zeros(B * n_kv_heads * Dh, cap, dtype=dtype)
-        self.segments = _tensor([0, 0, L, tpf, 0, 0], dtype="s32")
+        self.segments = _tensor([0, 0, L, tpf_cached, 0, 0], dtype="s32")
         self.n_segments = _tensor([2], dtype="s32")
         self.frame_t = _zeros(1, dtype="s32")
         self.frozen = _zeros(1, dtype="s32")
@@ -591,6 +598,8 @@ class KVCacheUpdate(Module):
             pinned_dilation=pinned_dilation,
             packed_qkv=packed_qkv,
             n_q_heads=n_q_heads,
+            quilt_factor=quilt_factor,
+            quilt_offset=quilt_offset,
         )
 
     def forward(self, qkv, frame_t=None, frozen=False):
@@ -664,6 +673,8 @@ class OwlAttn(Module):
         packed_qkv: bool,
         rope_n_frames: int = 1,  # kept for compat but unused (inline RoPE)
         compute_dtype: str | None = "e4m3",
+        quilt_factor: int = 1,
+        quilt_offset: int = 0,
     ):
         self._kw = dict(
             B=B,
@@ -674,6 +685,8 @@ class OwlAttn(Module):
             num_buckets=num_buckets,
             pinned_dilation=pinned_dilation,
             packed_qkv=packed_qkv,
+            quilt_factor=quilt_factor,
+            quilt_offset=quilt_offset,
         )
         # MMA / smem compute dtype. ``"e4m3"`` drives both GEMMs in fp8
         # regardless of Q's arrival dtype (caller must also pin the KV
