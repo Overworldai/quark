@@ -190,9 +190,24 @@ class PtxLowerer:
         self,
         ptx_version: str | None = None,
         target_sm: int = 89,
+        caps: object | None = None,
     ) -> None:
         self.target_sm = target_sm
         self.ptx_version = ptx_version or self._default_ptx_version(target_sm)
+        # Optional DeviceCaps — stashed so visitors can query
+        # caps.subgroup_width / atomic_add_vector / etc. rather than
+        # hardcoding 32/31 at the lowerer level. The factory in
+        # ``lower/ptx/__init__.py`` populates this; legacy callers that
+        # pass only target_sm continue to get ``caps=None`` and hit the
+        # subgroup_width fallback in ``_subgroup_width``.
+        self.caps = caps
+
+    @property
+    def _subgroup_width(self) -> int:
+        """Subgroup width from caps, defaulting to 32 (NV warp)."""
+        if self.caps is not None:
+            return int(self.caps.subgroup_width)
+        return 32
 
     @staticmethod
     def _default_ptx_version(target_sm: int) -> str:
@@ -776,9 +791,11 @@ class PtxLowerer:
         PTX has four physical shuffle modes (up/down/bfly/idx); we map
         our IR `xor` kind to `bfly` (they're the same operation). The
         `clamp` parameter is 0 for `up` (lanes that would read out of
-        range keep their own value) and 31 (warp-wrap) for everything
-        else — matching the convention in `ops/reduce.py`. The
-        member-mask is -1, meaning "all 32 lanes".
+        range keep their own value) and ``W-1`` for everything else —
+        partitions the warp into contiguous groups of ``W`` lanes that
+        shuffle among themselves, with ``W = caps.subgroup_width``
+        (always 32 on current CUDA; future sub-warp backends pin
+        smaller widths). The member-mask stays -1 (all warp lanes).
         """
         kind = op.attrs["kind"]
         param = int(op.attrs["param"])
@@ -786,7 +803,7 @@ class PtxLowerer:
         (out,) = op.results
         # xor is the same operation as bfly in PTX.
         ptx_mode = "bfly" if kind == "xor" else kind
-        clamp = 0 if ptx_mode == "up" else 31
+        clamp = 0 if ptx_mode == "up" else self._subgroup_width - 1
         dst_reg = ctx.regs.name_for(out)
         src_reg = ctx.regs.name_for(src)
         ctx.emit(f"shfl.sync.{ptx_mode}.b32 {dst_reg}, {src_reg}, {param}, {clamp}, -1;")
@@ -819,12 +836,16 @@ class PtxLowerer:
             raise NotImplementedError(f"SubgroupReduceOp: op {reduce_op!r}")
 
         cur = src_reg
-        for offset in (16, 8, 4, 2, 1):
+        W = self._subgroup_width
+        clamp = W - 1
+        offset = W // 2
+        while offset >= 1:
             other = ctx.regs.declare(cls)
-            ctx.emit(f"shfl.sync.bfly.b32 {other}, {cur}, {offset}, 31, -1;")
+            ctx.emit(f"shfl.sync.bfly.b32 {other}, {cur}, {offset}, {clamp}, -1;")
             nxt = ctx.regs.declare(cls)
             ctx.emit(f"{mnemonic}.{combine_suffix} {nxt}, {cur}, {other};")
             cur = nxt
+            offset //= 2
 
         # Bind the final accumulator register to the result Value so any
         # downstream reader sees it without an extra mov.
@@ -840,8 +861,9 @@ class PtxLowerer:
         lane = int(op.attrs["lane"])
         src = op.operands[0]
         (out,) = op.results
+        clamp = self._subgroup_width - 1
         ctx.emit(
-            f"shfl.sync.idx.b32 {ctx.regs.name_for(out)}, {ctx.regs.name_for(src)}, {lane}, 31, -1;"
+            f"shfl.sync.idx.b32 {ctx.regs.name_for(out)}, {ctx.regs.name_for(src)}, {lane}, {clamp}, -1;"
         )
 
     # ------------------------------------------------------------------
@@ -1487,9 +1509,10 @@ class PtxLowerer:
                 for extra in comps[2:]:
                     ctx.emit(f"{kind}.{suffix} {res_reg}, {res_reg}, {extra};")
             # Butterfly shuffle reduce.
+            clamp_hex = hex(self._subgroup_width - 1)
             for dist in butterfly:
                 tmp = ctx.regs.declare("f32")
-                ctx.emit(f"shfl.sync.bfly.b32 {tmp}, {res_reg}, {dist}, 0x1f, 0xffffffff;")
+                ctx.emit(f"shfl.sync.bfly.b32 {tmp}, {res_reg}, {dist}, {clamp_hex}, 0xffffffff;")
                 ctx.emit(f"{kind}.{suffix} {res_reg}, {res_reg}, {tmp};")
 
     def _visit_mma(self, op: MmaOp, ctx: _FnCtx) -> None:
@@ -1500,15 +1523,18 @@ class PtxLowerer:
         / Builder.mma); `name_for` returns the braced `{%b0, %b1, ...}`
         form directly.
         """
+        from quark.device import DeviceFamily
+        from quark.ir.mma_registry import payload_for
+
         shape_id = op.attrs["shape_id"]
         module = ctx.module
         if module is None or shape_id not in module.kernel_shapes:
             raise RuntimeError(f"MmaOp: shape {shape_id!r} not in module.kernel_shapes")
-        shape = module.kernel_shapes[shape_id]
-        if not shape.ptx:
+        mnemonic = payload_for(shape_id, DeviceFamily.CUDA)
+        if not mnemonic:
             raise NotImplementedError(
-                f"MmaOp: MmaShape {shape_id!r} has no `ptx` suffix registered "
-                f"(needed for PTX lowering)"
+                f"MmaOp: shape {shape_id!r} has no PTX payload on its "
+                f"MmaConfig.cuda field in quark.ir.mma_registry (needed for PTX lowering)"
             )
         a, b_frag, c = op.operands
         (d,) = op.results
@@ -1521,7 +1547,7 @@ class PtxLowerer:
             return "{" + ", ".join(ctx.regs.components(v)) + "}"
 
         ctx.emit(
-            f"mma.sync.aligned.{shape.ptx} "
+            f"mma.sync.aligned.{mnemonic} "
             f"{_braced(d)}, "
             f"{_braced(a)}, "
             f"{_braced(b_frag)}, "

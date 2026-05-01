@@ -126,16 +126,21 @@ class Function:
 
 @dataclass(frozen=True)
 class MmaShape:
-    """A logical matmul tile shape + per-backend resolution table.
+    """A logical matmul tile shape — backend-neutral.
 
     The `*_regs` counts describe per-thread register counts in the
     NVIDIA fragment layout (used by the PTX lowerer). Other backends
     ignore them and pattern-match on `(m, n, k, a_dtype, b_dtype)` via
     their own dispatch table.
 
-    `ptx` / `hip` / `msl` / `opencl` are target intrinsic names; None
-    means "fall back to scalar FMA loop at lowering time" — which is
-    always correct, just slower.
+    Backend-specific mnemonics / tiling strings used to live on this
+    class (``ptx`` / ``hip`` / ``msl`` / ``opencl`` fields). They now
+    live on the corresponding ``MmaConfig`` in
+    ``quark.ir.mma_registry`` as per-backend fields named after
+    ``DeviceFamily.<X>.value`` (``cuda``, ``metal``, …), grouped
+    next to each backend's ``min_*`` gate. Use ``payload_for()`` to
+    look them up generically. The IR no longer needs to know what
+    PTX or MSL look like.
     """
 
     name: str
@@ -148,10 +153,6 @@ class MmaShape:
     a_regs: int = 0
     b_regs: int = 0
     c_regs: int = 0
-    ptx: str | None = None
-    hip: str | None = None
-    msl: str | None = None
-    opencl: str | None = None
 
 
 # ---------------------------------------------------------------------------

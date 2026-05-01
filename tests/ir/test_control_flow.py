@@ -190,7 +190,6 @@ class TestWorkedKLoop:
                 a_dtype=DType.BF16,
                 b_dtype=DType.BF16,
                 acc_dtype=DType.F32,
-                ptx="mma.sync.aligned.m16n8k16",
             )
         )
         b.begin_function("gemm")

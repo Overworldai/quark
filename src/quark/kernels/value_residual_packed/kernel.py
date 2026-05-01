@@ -14,6 +14,7 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import PipelineBody, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
+from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
@@ -23,7 +24,6 @@ from quark.kernels.value_residual_packed.problems import value_residual_packed_p
 from quark.kernels.value_residual_packed.reference import value_residual_packed_reference_numpy
 from quark.kernels.value_residual_packed.spec import ValueResidualPackedSpec
 
-_WARP = 32
 _CP_BYTES = 16
 
 

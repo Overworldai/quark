@@ -23,6 +23,7 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
+from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.ada_rmsnorm.baselines import ada_rmsnorm_baselines
 from quark.kernels.ada_rmsnorm.config import AdaRMSNormConfig
@@ -32,7 +33,6 @@ from quark.kernels.ada_rmsnorm.spec import AdaRMSNormSpec
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
 
-_WARP = 32
 _CP_BYTES = 16
 
 

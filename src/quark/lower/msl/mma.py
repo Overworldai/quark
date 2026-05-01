@@ -11,6 +11,7 @@ extraction pipeline for kernel epilogues.
 
 from __future__ import annotations
 
+from quark.device import DeviceFamily as _DeviceFamily
 from quark.ir import (
     FragApplyOp,
     FragConvertOp,
@@ -21,13 +22,20 @@ from quark.ir import (
     StoreMatrixOp,
     YieldOp,
 )
+from quark.ir.mma_registry import payload_for as _payload_for
 
 from .lower import _MslCtx, _tensor_buf_name
 from .types import msl_type
 
 
-def _parse_msl_tiling(msl_str: str) -> tuple[str, int, int, int]:
-    """Parse the MmaShape.msl field: 'frag_dtype:m_frags:n_frags:k_frags'."""
+def _msl_tiling_for(shape) -> str | None:
+    return _payload_for(shape.name, _DeviceFamily.METAL)
+
+
+def _parse_msl_tiling(msl_str: str | None) -> tuple[str, int, int, int]:
+    """Parse an MSL tiling spec: 'frag_dtype:m_frags:n_frags:k_frags'."""
+    if msl_str is None:
+        raise ValueError("_parse_msl_tiling: no MSL tiling registered for shape")
     parts = msl_str.split(":")
     return parts[0], int(parts[1]), int(parts[2]), int(parts[3])
 
@@ -187,17 +195,17 @@ def visit_mma(self, op: MmaOp, ctx: _MslCtx) -> None:
     if module is None or shape_id not in module.kernel_shapes:
         raise RuntimeError(f"MmaOp: shape {shape_id!r} not in module.kernel_shapes")
     shape = module.kernel_shapes[shape_id]
-    if not shape.msl:
+    if not _msl_tiling_for(shape):
         raise NotImplementedError(
             f"MmaOp: MmaShape {shape_id!r} has no `msl` field — "
             f"Metal simdgroup lowering not available for this shape"
         )
     ctx.uses_simdgroup_matrix = True
-    _, mf, nf, kf = _parse_msl_tiling(shape.msl)
+    _, mf, nf, kf = _parse_msl_tiling(_msl_tiling_for(shape))
 
     a, b_frag, c = op.operands
     (d,) = op.results
-    frag_dtype_str, _, _, _ = _parse_msl_tiling(shape.msl)
+    frag_dtype_str, _, _, _ = _parse_msl_tiling(_msl_tiling_for(shape))
     # If an operand arrived PTX-style (b32-packed bf16×2 per lane,
     # typically from the online-softmax P-fragment path in owl_attn),
     # unpack it into a real simdgroup_matrix array. `frag_values`
@@ -429,10 +437,10 @@ def visit_frag_convert(self, op: FragConvertOp, ctx: _MslCtx) -> None:
     if module is None or shape_id not in module.kernel_shapes:
         raise RuntimeError(f"FragConvertOp: shape {shape_id!r} not in module.kernel_shapes")
     shape = module.kernel_shapes[shape_id]
-    if not shape.msl:
+    if not _msl_tiling_for(shape):
         raise NotImplementedError(f"FragConvertOp: MmaShape {shape_id!r} has no `msl` field")
     ctx.uses_simdgroup_matrix = True
-    dst_frag_dtype_str, mf, nf, kf_shape = _parse_msl_tiling(shape.msl)
+    dst_frag_dtype_str, mf, nf, kf_shape = _parse_msl_tiling(_msl_tiling_for(shape))
     kf = len(src_frags)
     # Sanity check: each source ACC tile covers 8 K-cols; full A-frag
     # covers kf * 8 K-cols which must match shape's kf.
@@ -682,10 +690,10 @@ def visit_load_matrix(self, op: LoadMatrixOp, ctx: _MslCtx) -> None:
     if module is None or shape_id not in module.kernel_shapes:
         raise RuntimeError(f"LoadMatrixOp: shape {shape_id!r} not in module.kernel_shapes")
     shape = module.kernel_shapes[shape_id]
-    if not shape.msl:
+    if not _msl_tiling_for(shape):
         raise NotImplementedError(f"LoadMatrixOp: MmaShape {shape_id!r} has no `msl` field")
     ctx.uses_simdgroup_matrix = True
-    frag_dtype_str, mf, nf, kf = _parse_msl_tiling(shape.msl)
+    frag_dtype_str, mf, nf, kf = _parse_msl_tiling(_msl_tiling_for(shape))
 
     if which == "a":
         n_frags = mf * kf
@@ -768,10 +776,10 @@ def visit_store_matrix(self, op: StoreMatrixOp, ctx: _MslCtx) -> None:
     if module is None or shape_id not in module.kernel_shapes:
         raise RuntimeError(f"StoreMatrixOp: shape {shape_id!r} not in module.kernel_shapes")
     shape = module.kernel_shapes[shape_id]
-    if not shape.msl:
+    if not _msl_tiling_for(shape):
         raise NotImplementedError(f"StoreMatrixOp: MmaShape {shape_id!r} has no `msl` field")
     ctx.uses_simdgroup_matrix = True
-    _, mf, nf, _ = _parse_msl_tiling(shape.msl)
+    _, mf, nf, _ = _parse_msl_tiling(_msl_tiling_for(shape))
     n_frags = mf * nf
 
     frag = _frag_name(frag_val, ctx)

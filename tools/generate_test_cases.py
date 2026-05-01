@@ -37,7 +37,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from quark.device import DeviceFamily
 from quark.ir import BufferType, Builder, DType, GlobalTensor, MmaShape
+from quark.ir.mma_registry import register_backend_payload
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -111,8 +113,9 @@ _SHAPE_M16N8K16_BF16 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
 )
+register_backend_payload("m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32")
+
 _SHAPE_M16N8K16_F16 = MmaShape(
     name="m16n8k16_f16",
     m=16,
@@ -124,8 +127,9 @@ _SHAPE_M16N8K16_F16 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.f16.f16.f32",
 )
+register_backend_payload("m16n8k16_f16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.f16.f16.f32")
+
 _SHAPE_M16N8K8_BF16 = MmaShape(
     name="m16n8k8_bf16",
     m=16,
@@ -137,8 +141,9 @@ _SHAPE_M16N8K8_BF16 = MmaShape(
     a_regs=2,
     b_regs=1,
     c_regs=4,
-    ptx="m16n8k8.row.col.f32.bf16.bf16.f32",
 )
+register_backend_payload("m16n8k8_bf16", DeviceFamily.CUDA, "m16n8k8.row.col.f32.bf16.bf16.f32")
+
 _SHAPE_M16N8K16_E4M3 = MmaShape(
     name="m16n8k16_e4m3",
     m=16,
@@ -150,8 +155,9 @@ _SHAPE_M16N8K16_E4M3 = MmaShape(
     a_regs=2,
     b_regs=1,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.e4m3.e4m3.f32",
 )
+register_backend_payload("m16n8k16_e4m3", DeviceFamily.CUDA, "m16n8k16.row.col.f32.e4m3.e4m3.f32")
+
 _SHAPE_M16N8K32_E4M3 = MmaShape(
     name="m16n8k32_e4m3",
     m=16,
@@ -163,8 +169,9 @@ _SHAPE_M16N8K32_E4M3 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k32.row.col.f32.e4m3.e4m3.f32",
 )
+register_backend_payload("m16n8k32_e4m3", DeviceFamily.CUDA, "m16n8k32.row.col.f32.e4m3.e4m3.f32")
+
 _SHAPE_M16N8K16_E5M2 = MmaShape(
     name="m16n8k16_e5m2",
     m=16,
@@ -176,8 +183,9 @@ _SHAPE_M16N8K16_E5M2 = MmaShape(
     a_regs=2,
     b_regs=1,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.e5m2.e5m2.f32",
 )
+register_backend_payload("m16n8k16_e5m2", DeviceFamily.CUDA, "m16n8k16.row.col.f32.e5m2.e5m2.f32")
+
 
 _A_OFFS_K16 = ((0, 0), (8, 0), (0, 8), (8, 8))
 _B_OFFS_K16 = ((0, 0), (0, 8))

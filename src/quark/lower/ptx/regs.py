@@ -19,6 +19,7 @@ a vec as a scalar) can share storage without emitting spurious movs.
 from __future__ import annotations
 
 from quark.ir import DType, Value
+from quark.lower._common import NameAllocator
 
 # ---------------------------------------------------------------------------
 # DType → PTX register class + operation suffix
@@ -112,8 +113,16 @@ def _prefix_for(cls: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class RegAllocator:
+class RegAllocator(NameAllocator):
     """Per-Function PTX register allocator.
+
+    Subclasses the shared :class:`NameAllocator` for the counter-per-
+    prefix machinery and adds the PTX-specific bits:
+
+      * ``.reg`` declaration block via :meth:`declarations`,
+      * register-class keying (``reg_class(dtype)`` picks the bucket),
+      * braced vec form for ``name_for`` on width > 1,
+      * leading ``%`` on every emitted name.
 
     Terminology:
       - "components" — the tuple of reg names behind one Value. Scalars
@@ -122,105 +131,66 @@ class RegAllocator:
         a single `%f0` for a scalar or `{%f0, %f1, %f2, %f3}` for a vec
         (the braced form accepted by `ld.global.v4.*`).
 
-    Public API:
-      - `name_for(value)` → str (canonical form)
-      - `components(value)` → tuple[str, ...]
-      - `bind(value, names)` — register `value` with pre-allocated names
-      - `alias(target, source)` — target shares source's components
-      - `declare(cls)` — allocate an anonymous scratch reg
-      - `declarations()` → list of `.reg` decl lines
+    Public API (beyond the shared base):
+      - ``declare(cls)`` — allocate an anonymous scratch reg in ``cls``
+      - ``declarations()`` → list of ``.reg`` decl lines
     """
 
     def __init__(self) -> None:
-        # Per-value component tuple.
-        self._components: dict[int, tuple[str, ...]] = {}
-        # Per-class list of declared names for the .reg block.
+        super().__init__()
+        # Per-class list of declared names for the .reg block. Kept
+        # outside the shared base because MSL has no analogous concept.
         self._by_class: dict[str, list[str]] = {}
-        self._counter: dict[str, int] = {}
 
-    # -- allocation ----------------------------------------------------
+    # -- name formatting (override base) -------------------------------
 
-    def declare(self, cls: str) -> str:
-        """Allocate one fresh anonymous register in `cls`."""
-        n = self._counter.get(cls, 0)
-        self._counter[cls] = n + 1
-        name = f"%{_prefix_for(cls)}{n}"
-        self._by_class.setdefault(cls, []).append(name)
-        return name
+    def _format_name(self, prefix: str, n: int) -> str:
+        # PTX registers carry a leading ``%``.
+        return f"%{prefix}{n}"
 
     def name_for(self, value: Value) -> str:
-        """Return the canonical PTX form for a Value.
+        """Canonical PTX form: scalar → ``%f0``, vec → ``{%f0, %f1, …}``.
 
-        Scalars → `%f0`. Vectors → `{%f0, %f1, %f2, %f3}`. First access
-        lazily allocates component registers; subsequent accesses are
-        stable."""
-        comps = self._components.get(value.id)
-        if comps is None:
-            comps = self._allocate_components(value)
-            self._components[value.id] = comps
+        Overrides the base because PTX vec-typed ops consume a single
+        braced token, not the first component.
+        """
+        comps = self.components(value)
         if len(comps) == 1:
             return comps[0]
         return "{" + ", ".join(comps) + "}"
 
-    def components(self, value: Value) -> tuple[str, ...]:
-        """Return the tuple of component reg names for a Value,
-        allocating on first access."""
-        comps = self._components.get(value.id)
-        if comps is None:
-            comps = self._allocate_components(value)
-            self._components[value.id] = comps
-        return comps
+    # -- allocation ----------------------------------------------------
+
+    def declare(self, cls: str) -> str:
+        """Allocate one fresh anonymous register in ``cls``. Tracks the
+        name in ``_by_class`` so it appears in the ``.reg`` decl block."""
+        prefix = _prefix_for(cls)
+        name = self.fresh(prefix)
+        self._by_class.setdefault(cls, []).append(name)
+        return name
 
     def _allocate_components(self, value: Value) -> tuple[str, ...]:
         cls = reg_class(value.dtype)
         return tuple(self.declare(cls) for _ in range(value.width))
 
-    # -- binding / aliasing -------------------------------------------
+    # -- bind: preserves strict (no-force) semantics ------------------
 
-    def bind(self, value: Value, names: tuple[str, ...]) -> None:
-        """Register `value`'s components as `names`. No new regs are
-        allocated. Fails if `value` already has a binding."""
-        existing = self._components.get(value.id)
-        if existing is not None and existing != names:
-            raise RuntimeError(
-                f"RegAllocator.bind: Value {value.id} already bound to "
-                f"{existing}, cannot rebind to {names}"
+    def bind(self, value: Value, names: tuple[str, ...], *, force: bool = False) -> None:
+        """PTX requires tight width matching — reject binds that don't
+        match the Value's declared width. (MSL keeps the ``force=``
+        escape hatch for re-declared loop carries; PTX has no analogous
+        scenario, so we accept ``force=`` in the signature for shared-
+        base compat but reject ``force=True`` when called with it.)"""
+        if force:
+            raise ValueError(
+                "RegAllocator.bind: force=True has no use case in PTX; "
+                "rebind via _components directly if the Value was never bound."
             )
         if len(names) != value.width:
             raise ValueError(f"RegAllocator.bind: Value width {value.width} vs {len(names)} names")
-        self._components[value.id] = names
-
-    def alias(self, target: Value, source: Value) -> tuple[str, ...]:
-        """Bind `target` to `source`'s component tuple."""
-        src_components = self.components(source)
-        if target.width != source.width:
-            # Allow a scalar target aliased onto one component of a vec
-            # only via `alias_component` — not this method.
-            raise ValueError(
-                f"RegAllocator.alias: width mismatch — source width "
-                f"{source.width}, target width {target.width}"
-            )
-        self.bind(target, src_components)
-        return src_components
-
-    def alias_component(self, target: Value, source: Value, component_index: int) -> str:
-        """Bind scalar `target` to one component of vec `source`."""
-        if target.width != 1:
-            raise ValueError("RegAllocator.alias_component: target must be a scalar Value")
-        src_components = self.components(source)
-        if not (0 <= component_index < len(src_components)):
-            raise IndexError(
-                f"RegAllocator.alias_component: index {component_index} "
-                f"out of range for width {len(src_components)}"
-            )
-        name = src_components[component_index]
-        self.bind(target, (name,))
-        return name
+        super().bind(value, names, force=force)
 
     # -- introspection -------------------------------------------------
-
-    def has(self, value: Value) -> bool:
-        return value.id in self._components
 
     def declarations(self) -> list[str]:
         """Return sorted `.reg` declaration lines, one per class."""

@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING, Any
 from quark.device import Device, DeviceFamily, current_device
 from quark.ir import DType, Module
 from quark.launcher.param_spec import ParamSpec, ProgramFootprint
-from quark.lower.ptx import PtxLowerer
 
 if TYPE_CHECKING:
     from quark.autotune import AutotuneCache
@@ -530,17 +529,25 @@ class Launcher:
     def _lower(self, ir_or_program, kernel):
         """Lower the kernel's emit() output to a backend-specific artifact.
 
+        Dispatches through the family-keyed ``LOWERERS`` registry (see
+        ``quark.lower.base``). Each backend registers a factory that
+        maps ``DeviceCaps`` to a lowerer instance, so adding a new
+        backend is a one-line ``@register_lowerer`` call — no edits
+        here.
+
         CUDA: IR Module -> PtxLowerer -> LoweredKernel
         Metal: IR Module -> MslLowerer -> LoweredMslKernel
         """
         if isinstance(ir_or_program, Module):
-            if self.device.family is DeviceFamily.METAL:
-                from quark.lower.msl import MslLowerer
+            from quark.lower import get_lowerer
+            from quark.lower.legalize import legalize
 
-                return MslLowerer(self.device.caps).lower_module(ir_or_program)
-            cc = self.device.caps.compute_capability
-            target_sm = (cc[0] * 10 + cc[1]) if cc is not None else 89
-            return PtxLowerer(target_sm=target_sm).lower_module(ir_or_program)
+            # Legalization: expand ops the backend can't emit natively
+            # into equivalent IR it can. No-op when no rewrites are
+            # registered (phase-2.1 default). Rewrites land in phase 2.2.
+            legalize(ir_or_program, self.device.caps)
+            lowerer = get_lowerer(self.device.family, self.device.caps)
+            return lowerer.lower_module(ir_or_program)
         raise NotImplementedError(
             "Launcher._lower: legacy Program-based emit() not yet "
             "supported by the driver path. Migrate the kernel to "

@@ -24,6 +24,7 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
+from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.ada_gate_residual.baselines import ada_gate_residual_baselines
 from quark.kernels.ada_gate_residual.config import AdaGateResidualConfig
@@ -33,7 +34,6 @@ from quark.kernels.ada_gate_residual.spec import AdaGateResidualSpec
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
 
-_WARP = 32
 _CP_BYTES = 16
 
 

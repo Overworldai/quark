@@ -138,7 +138,7 @@ class CudaDriver:
             family=DeviceFamily.CUDA,
             name=name,
             compute_unit_count=sm_count,
-            warp_size=32,
+            subgroup_width=32,
             max_threads_per_block=max_threads,
             max_smem_per_block=max_smem_optin,
             max_regs_per_thread=255,

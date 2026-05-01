@@ -37,7 +37,28 @@ class DeviceFamily(Enum):
     ROCM = "rocm"
     OPENCL = "opencl"
     METAL = "metal"
+    # Intel GPUs (Arc discrete + Xe integrated). Distinct from OPENCL
+    # because the target IR is SPIR-V compute shaders driven via
+    # Vulkan / Level Zero, not CL's SPIR-V flavor — the driver picks,
+    # the register table keys on this family. See
+    # PORTABILITY_PLAN.md §3.
+    INTEL_GPU = "intel_gpu"
     CPU = "cpu"
+
+
+# Default subgroup (warp/simd/execution-lane) width assumed at kernel
+# import time. The 5 elementwise/normalization kernels currently hardcode
+# this into their ``is_valid()`` tile-size checks because ``is_valid()``
+# runs before any device context is attached to the kernel. Once we plumb
+# caps into ``is_valid_for``, each kernel can consult the device's actual
+# ``caps.subgroup_width`` instead and this constant goes away.
+#
+# 32 is correct for every backend currently wired up (NV / Metal / Apple
+# GPU / CDNA) and for the SPIR-V v1 plan (see PORTABILITY_PLAN.md §3.4 —
+# Intel pinned to SIMD32 via ``reqd_sub_group_size(32)`` for v1). RDNA
+# wave64 and Intel non-pinned builds are the failure modes the plan
+# already calls out; they require the is_valid_for caps work first.
+DEFAULT_SUBGROUP_WIDTH: int = 32
 
 
 class ChipGeneration(Enum):
@@ -153,7 +174,11 @@ class DeviceCaps:
     family: DeviceFamily
     name: str
     compute_unit_count: int  # SMs / CUs / cores / logical CPUs
-    warp_size: int  # 32 for NVIDIA/CDNA/Apple, 32-or-64 RDNA, 1 CPU
+    # Execution-lane grouping width. 32 on NVIDIA/CDNA/Apple, 32-or-64 on
+    # RDNA, 1 on CPU, 8/16/32 on Intel (driver-chosen). Vendor-neutral name
+    # per the portability plan; see ``warp_size`` property below for the
+    # legacy alias.
+    subgroup_width: int
     max_threads_per_block: int
     max_smem_per_block: int  # bytes, dynamic
     max_regs_per_thread: Optional[int]
@@ -206,6 +231,33 @@ class DeviceCaps:
     # scalar and vector-atomic paths gated on real hardware support.
     atomic_add_vector: frozenset[tuple] = field(default_factory=frozenset)
 
+    # Packed bf16×2 FMA (``fma.rn.bf16x2`` on CUDA sm_80+). Distinct
+    # from the vector-atomic-add flag above: this gates the *compute*
+    # op, which ships one generation earlier than the vector-atomic
+    # red-op. Non-CUDA backends leave this False — the legalization
+    # pass rewrites ``ArithOp(kind="fma_bf16x2")`` and
+    # ``ArithOp(kind="cvt_rn_bf16x2_f32")`` into scalar F32 chains
+    # when this is False. See PORTABILITY_PLAN.md §2.2.
+    has_fma_bf16x2: bool = False
+
+    # Packed bf16×2 atomic add (``red.add.noftz.bf16x2`` on CUDA
+    # sm_90+). Convenience alias of ``(BF16, 2) in atomic_add_vector``
+    # — kept as a named bool so the legalization pass call sites read
+    # like ``if not caps.has_atomic_add_bf16x2:`` instead of
+    # tuple-membership checks. Populated by the driver probe.
+    has_atomic_add_bf16x2: bool = False
+
+    # Native single-op subgroup reduction (``simd_sum`` / ``simd_max`` on
+    # Metal; ``OpGroupNonUniformAdd`` on SPIR-V). CUDA's only primitive
+    # is ``shfl.sync.bfly.b32``, so the PTX lowerer expands
+    # :class:`SubgroupReduceOp` inline to a butterfly chain — that's
+    # ``has_native_subgroup_reduce=False``. When a future backend with
+    # a native reduce arrives, the legalization pass keeps the op as-is
+    # and the lowerer emits the intrinsic; backends without the native
+    # form get the butterfly expansion from the legalize pass. See
+    # PORTABILITY_PLAN.md §2.2 / §3.
+    has_native_subgroup_reduce: bool = False
+
     supported_dtypes: frozenset[str] = field(default_factory=frozenset)
 
     # CPU-specific ISA feature set (empty for GPU)
@@ -220,6 +272,13 @@ class DeviceCaps:
     def has(self, feature: str) -> bool:
         """Check whether a CPU ISA feature flag is set."""
         return feature in self.cpu_features
+
+    @property
+    def warp_size(self) -> int:
+        """Deprecated alias for ``subgroup_width``. Kept for one release
+        so existing call sites (`caps.warp_size`) continue to work while
+        downstream code migrates to the vendor-neutral name."""
+        return self.subgroup_width
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +407,7 @@ def _probe_cuda_via_libcuda(index: int) -> Device:
         family=DeviceFamily.CUDA,
         name=rt.get_device_name(index),
         compute_unit_count=rt.get_device_attribute(index, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
-        warp_size=32,
+        subgroup_width=32,
         max_threads_per_block=rt.get_device_attribute(
             index, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK
         ),
@@ -364,6 +423,10 @@ def _probe_cuda_via_libcuda(index: int) -> Device:
         matmul_shapes=_shapes_for_chip_gen(chip_gen_from_cuda_cc(cc_major, cc_minor)),
         atomic_add_dtypes=_atomic_add_dtypes_for_cuda(cc_major, cc_minor),
         atomic_add_vector=_atomic_add_vector_for_cuda(cc_major, cc_minor),
+        # Compute / atomic packed-bf16 gates. Ampere+ (sm_80) exposes
+        # ``fma.rn.bf16x2``; Hopper+ (sm_90) exposes the vector atomic.
+        has_fma_bf16x2=cc_major >= 8,
+        has_atomic_add_bf16x2=cc_major >= 9,
         supported_dtypes=_default_dtypes_for(arch_tag),
         cpu_features=frozenset(),
         chip_gen=chip_gen_from_cuda_cc(cc_major, cc_minor),
@@ -504,7 +567,7 @@ def make_test_device(
         family=family,
         name=name,
         compute_unit_count=compute_unit_count,
-        warp_size=warp_size,
+        subgroup_width=warp_size,
         max_threads_per_block=max_threads_per_block,
         max_smem_per_block=max_smem_per_block,
         max_regs_per_thread=255 if family is not DeviceFamily.METAL else None,

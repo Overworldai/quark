@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 
+from quark.device import DeviceFamily
 from quark.ir import (
     Builder,
     DType,
@@ -19,6 +20,7 @@ from quark.ir import (
     MmaShape,
     validate_module,
 )
+from quark.ir.mma_registry import register_backend_payload
 from quark.lower.ptx import PtxLowerer
 
 _M16N8K16_BF16 = MmaShape(
@@ -32,8 +34,8 @@ _M16N8K16_BF16 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
 )
+register_backend_payload("m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32")
 
 
 _A_OFFS = ((0, 0), (8, 0), (0, 8), (8, 8))

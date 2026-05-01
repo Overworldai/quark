@@ -16,6 +16,7 @@ from typing import ClassVar
 
 import quark.lang as qk
 from quark.blocks import TensorDecl
+from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
@@ -25,7 +26,6 @@ from quark.kernels.rmsnorm.problems import rmsnorm_problems
 from quark.kernels.rmsnorm.reference import rmsnorm_reference_numpy
 from quark.kernels.rmsnorm.spec import RMSNormSpec
 
-_WARP = 32
 _CP_BYTES = 16
 
 

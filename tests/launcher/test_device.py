@@ -32,7 +32,7 @@ class TestDeviceCaps:
             family=DeviceFamily.CUDA,
             name="RTX 5090",
             compute_unit_count=170,
-            warp_size=32,
+            subgroup_width=32,
             max_threads_per_block=1024,
             max_smem_per_block=228 * 1024,
             max_regs_per_thread=255,

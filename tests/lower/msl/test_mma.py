@@ -1,6 +1,8 @@
 """Tests for MMA (simdgroup_matrix) MSL lowering."""
 
+from quark.device import DeviceFamily
 from quark.ir import Builder, DType, MmaShape
+from quark.ir.mma_registry import register_backend_payload
 from quark.lower.msl import MslLowerer
 from tests.lower.msl.conftest import METAL_CAPS_FAKE
 
@@ -78,9 +80,11 @@ class TestMmaBf16:
             a_regs=4,
             b_regs=2,
             c_regs=4,
-            ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
-            msl="half:2:1:2",
         )
+        register_backend_payload(
+            "m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32"
+        )
+        register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "half:2:1:2")
         a_offsets = ((0, 0), (8, 0), (0, 8), (8, 8))
         b_offsets = ((0, 0), (0, 8))
         cd_offsets = ((0, 0), (0, 1), (8, 0), (8, 1))
@@ -105,9 +109,11 @@ class TestMmaBf16:
             a_regs=4,
             b_regs=2,
             c_regs=4,
-            ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
-            msl="half:2:1:2",
         )
+        register_backend_payload(
+            "m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32"
+        )
+        register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "half:2:1:2")
         a_offsets = ((0, 0), (8, 0), (0, 8), (8, 8))
         b_offsets = ((0, 0), (0, 8))
         cd_offsets = ((0, 0), (0, 1), (8, 0), (8, 1))
@@ -126,9 +132,11 @@ class TestMmaBf16:
             a_regs=4,
             b_regs=2,
             c_regs=4,
-            ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
-            msl="half:2:1:2",
         )
+        register_backend_payload(
+            "m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32"
+        )
+        register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "half:2:1:2")
         a_offsets = ((0, 0), (8, 0), (0, 8), (8, 8))
         b_offsets = ((0, 0), (0, 8))
         cd_offsets = ((0, 0), (0, 1), (8, 0), (8, 1))
@@ -183,8 +191,9 @@ class TestMmaNoMsl:
             a_regs=4,
             b_regs=2,
             c_regs=4,
-            ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
-            msl=None,
+        )
+        register_backend_payload(
+            "test_no_msl", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32"
         )
         import pytest
 

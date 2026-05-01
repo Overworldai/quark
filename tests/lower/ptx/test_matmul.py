@@ -25,6 +25,7 @@ import re
 
 import pytest
 
+from quark.device import DeviceFamily
 from quark.ir import (
     BufferType,
     Builder,
@@ -33,6 +34,7 @@ from quark.ir import (
     MmaShape,
     validate_module,
 )
+from quark.ir.mma_registry import register_backend_payload
 from quark.lower.ptx import PtxLowerer
 
 # ---------------------------------------------------------------------------
@@ -50,8 +52,8 @@ _M16N8K16_BF16 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
 )
+register_backend_payload("m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32")
 
 _M16N8K16_E4M3 = MmaShape(
     name="m16n8k16_e4m3",
@@ -64,8 +66,8 @@ _M16N8K16_E4M3 = MmaShape(
     a_regs=2,
     b_regs=1,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.e4m3.e4m3.f32",
 )
+register_backend_payload("m16n8k16_e4m3", DeviceFamily.CUDA, "m16n8k16.row.col.f32.e4m3.e4m3.f32")
 
 _M16N8K32_E4M3 = MmaShape(
     name="m16n8k32_e4m3",
@@ -78,8 +80,8 @@ _M16N8K32_E4M3 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k32.row.col.f32.e4m3.e4m3.f32",
 )
+register_backend_payload("m16n8k32_e4m3", DeviceFamily.CUDA, "m16n8k32.row.col.f32.e4m3.e4m3.f32")
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +505,9 @@ class TestAccumulatorCarrierDtype:
             a_regs=2,
             b_regs=1,
             c_regs=4,
-            ptx="m16n8k16.row.col.s32.s8.s8.s32",
+        )
+        register_backend_payload(
+            "m16n8k16_s8_s32", DeviceFamily.CUDA, "m16n8k16.row.col.s32.s8.s8.s32"
         )
         b = _builder_with(s32_shape)
         b.smem_alloc("A", DType.S8, (32, 16))
@@ -525,7 +529,9 @@ class TestAccumulatorCarrierDtype:
             a_regs=4,
             b_regs=2,
             c_regs=2,  # f16 accumulator: 2 f16x2 regs
-            ptx="m16n8k16.row.col.f16.f16.f16.f16",
+        )
+        register_backend_payload(
+            "m16n8k16_f16_f16", DeviceFamily.CUDA, "m16n8k16.row.col.f16.f16.f16.f16"
         )
         b = _builder_with(f16_shape)
         C = b.smem_alloc("C", DType.F16, (16, 8))
@@ -600,7 +606,7 @@ class TestMma:
         bf = b.load_matrix(A, "shapeless", which="b", reg_offsets=B_BF16_K16_COL_T)
         c = b.load_matrix(A, "shapeless", which="c", reg_offsets=CD_F32_ROW)
         b.mma("shapeless", a, bf, c)
-        with pytest.raises(NotImplementedError, match="no `ptx`"):
+        with pytest.raises(NotImplementedError, match="no PTX payload"):
             _lower(b)
 
 

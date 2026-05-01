@@ -1,94 +1,66 @@
 """Variable-name allocator for MSL codegen.
 
-Replaces the PTX RegAllocator. MSL uses C-style local variables —
-no register classes, no `.reg` declaration blocks. Names are allocated
-per-prefix with a simple counter.
+MSL uses C-style local variables — no register classes, no ``.reg``
+declaration blocks. The shared :class:`NameAllocator` provides the
+counter-per-prefix mechanics; this module specializes the prefix
+selection (dtype-keyed instead of register-class-keyed) and the
+vector allocation policy (one base name plus ``_i`` suffixes).
 """
 
 from __future__ import annotations
 
 from quark.ir import DType, Value
+from quark.lower._common import NameAllocator
 
 
-class NameAlloc:
+class NameAlloc(NameAllocator):
     """Counter-based local-variable name allocator for MSL.
 
-    Each IR Value.id maps to a single C-style local name. Width-N
-    vector Values get N component names (v0_0, v0_1, …) for cases
-    where the lowerer decomposes vectors into scalars.
+    Each IR ``Value.id`` maps to one or more C-style local names.
+    Scalars get a single name; width-N vectors get a base name plus
+    ``_i`` suffixes (``v0_0``, ``v0_1``, …) for cases where the
+    lowerer decomposes vectors into scalars.
     """
 
-    def __init__(self) -> None:
-        self._counters: dict[str, int] = {}
-        self._names: dict[int, tuple[str, ...]] = {}
-
-    def fresh(self, prefix: str) -> str:
-        """Allocate a fresh name with the given prefix."""
-        n = self._counters.get(prefix, 0)
-        self._counters[prefix] = n + 1
-        return f"{prefix}{n}"
-
     def name_for(self, value: Value) -> str:
-        """Return the canonical MSL name for a scalar Value.
+        """Return the canonical MSL name for ``value``.
 
-        First access allocates; subsequent accesses return the same name.
-        For width-1 Values, returns a single name. For width-N, returns
-        the first component (use `components()` for all of them).
+        For width-1 Values, returns the single name. For width-N
+        returns the *first* component — most MSL visitors iterate
+        components explicitly rather than consuming a braced form
+        the way PTX does. Use ``components()`` for all N.
         """
-        comps = self._names.get(value.id)
-        if comps is None:
-            comps = self._allocate(value)
-        return comps[0]
+        return self.components(value)[0]
 
-    def components(self, value: Value) -> tuple[str, ...]:
-        """Return all component names for a Value."""
-        comps = self._names.get(value.id)
-        if comps is None:
-            comps = self._allocate(value)
-        return comps
+    @property
+    def _names(self) -> dict[int, tuple[str, ...]]:
+        """Back-compat alias for the shared base's ``_components`` dict.
 
-    def bind(self, value: Value, names: tuple[str, ...], *, force: bool = False) -> None:
-        """Bind a Value to pre-existing names (for aliasing / carry vars).
-
-        Set ``force=True`` to override an existing binding (used when
-        a for-loop carry variable is re-declared from scalar to fragment).
+        MSL mma visitors (``quark.lower.msl.mma``) reach into this
+        private attribute to re-bind loop-body locals across walks of
+        the ``FragApplyOp`` body. Keep the old name available so those
+        call sites continue to work without touching the MMA emitter.
         """
-        existing = self._names.get(value.id)
-        if existing is not None and existing != names and not force:
-            raise RuntimeError(
-                f"NameAlloc.bind: Value {value.id} already bound to "
-                f"{existing}, cannot rebind to {names}"
-            )
-        self._names[value.id] = names
+        return self._components
 
-    def alias(self, target: Value, source: Value) -> tuple[str, ...]:
-        """Bind `target` to `source`'s names."""
-        src_names = self.components(source)
-        self.bind(target, src_names)
-        return src_names
+    # -- backend-specific bind: supports ``force=`` override -----------
 
-    def alias_component(self, target: Value, source: Value, index: int) -> str:
-        """Bind scalar `target` to one component of `source`."""
-        src = self.components(source)
-        name = src[index]
-        self.bind(target, (name,))
-        return name
+    # MSL keeps the ``force=`` escape hatch inherited from the shared
+    # base — no override needed. PTX's subclass explicitly rejects
+    # ``force=``; MSL leaves it available for the loop-carry re-
+    # declaration path.
 
-    def has(self, value: Value) -> bool:
-        return value.id in self._names
+    # -- allocation ----------------------------------------------------
 
-    def _allocate(self, value: Value) -> tuple[str, ...]:
-        """Allocate names for a Value based on its dtype."""
+    def _allocate_components(self, value: Value) -> tuple[str, ...]:
         prefix = _PREFIX.get(value.dtype, "v")
         if value.width == 1:
-            name = self.fresh(prefix)
-            self._names[value.id] = (name,)
-            return (name,)
-        # Vector: allocate N component names
+            return (self.fresh(prefix),)
+        # Vector: one base name + component suffixes. Avoids burning
+        # N separate counters and keeps related components clustered
+        # in emitted MSL.
         base = self.fresh(prefix)
-        comps = tuple(f"{base}_{i}" for i in range(value.width))
-        self._names[value.id] = comps
-        return comps
+        return tuple(f"{base}_{i}" for i in range(value.width))
 
 
 # Prefix per dtype. Uses `_pc_` (quark) namespace to guarantee no

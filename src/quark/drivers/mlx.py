@@ -74,7 +74,7 @@ class MlxDriver:
             family=DeviceFamily.METAL,
             name=str(info.get("device_name", info.get("architecture", "apple-gpu"))),
             compute_unit_count=0,  # MLX doesn't expose CU count directly
-            warp_size=32,  # SIMD width on Apple silicon
+            subgroup_width=32,  # SIMD width on Apple silicon
             max_threads_per_block=1024,
             max_smem_per_block=32 * 1024,  # 32 KiB on all current Apple silicon
             max_regs_per_thread=None,
@@ -111,6 +111,12 @@ class MlxDriver:
             # No vector / packed atomic ops on Metal. Kernels wanting
             # packed epilogues must fall back to the scalar atomic path.
             atomic_add_vector=frozenset(),
+            # Apple exposes ``simd_sum`` / ``simd_max`` / ``simd_min`` /
+            # ``simd_prefix_exclusive_sum`` as first-class SIMD-group
+            # reductions — no butterfly expansion needed at lowering
+            # time. The legalization pass keeps SubgroupReduceOp intact
+            # for the MSL lowerer to emit directly.
+            has_native_subgroup_reduce=True,
             supported_dtypes=frozenset(
                 {"f32", "f16", "bf16", "u32", "s32", "u8", "s8", "u16", "s16"}
             ),

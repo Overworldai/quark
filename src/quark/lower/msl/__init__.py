@@ -4,9 +4,19 @@ Walks a quark IR `Module` and emits an MSL kernel body suitable for
 `mx.fast.metal_kernel`. See `lower.py` for the visitor implementation.
 """
 
+from quark.device import DeviceFamily
+from quark.lower.base import register_lowerer
+
 from .lower import LoweredMslKernel, MslLowerer
 from .names import NameAlloc
 from .types import msl_type
+
+
+@register_lowerer(DeviceFamily.METAL)
+def _make_msl_lowerer(caps) -> MslLowerer:
+    """Adapter: DeviceCaps → MslLowerer."""
+    return MslLowerer(caps)
+
 
 __all__ = [
     "LoweredMslKernel",

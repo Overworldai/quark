@@ -13,6 +13,7 @@ checks. Runtime layout probes (which DO need a device) live in
 
 from __future__ import annotations
 
+from quark.device import DeviceFamily
 from quark.ir.frag_tile import (
     FragLayout,
     RegisterTile,
@@ -21,6 +22,7 @@ from quark.ir.frag_tile import (
     ptx_lane_to_a_frag_positions,
     ptx_lane_to_acc_position,
 )
+from quark.ir.mma_registry import register_backend_payload
 from quark.kernels.gemm.mma_shapes import _BF16_K16
 
 # ---------------------------------------------------------------------------
@@ -211,9 +213,9 @@ _M16N8K16_BF16 = MmaShape(
     a_regs=4,
     b_regs=2,
     c_regs=4,
-    ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
-    msl="bfloat16_t:2:1:2",
 )
+register_backend_payload("m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32")
+register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "bfloat16_t:2:1:2")
 
 _A_OFFS = ((0, 0), (8, 0), (0, 8), (8, 8))
 _B_OFFS = ((0, 0), (0, 8))

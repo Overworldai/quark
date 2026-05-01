@@ -350,8 +350,11 @@ class MslLowerer:
         # Pre-detect MMA usage so for-loop result declarations can
         # allocate simdgroup_matrix arrays for accumulator carries.
         if module and module.kernel_shapes:
+            from quark.device import DeviceFamily
+            from quark.ir.mma_registry import payload_for
+
             for shape in module.kernel_shapes.values():
-                if shape.msl:
+                if payload_for(shape.name, DeviceFamily.METAL) is not None:
                     ctx.uses_simdgroup_matrix = True
                     break
         self._classify_params(fn, ctx)

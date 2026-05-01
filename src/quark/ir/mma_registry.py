@@ -1,5 +1,12 @@
 """MMA shape registry — the single source of truth.
 
+EXEMPT FROM 500-LINE RULE: this file is the canonical per-shape
+table — one ``MmaConfig`` row per MMA Quark can lower, carrying
+layout offsets + chip gates + per-backend lowering payloads
+(``cuda``, ``metal``, …). Splitting means "add a new MMA" returns
+to a multi-file edit, which is the exact drift this file exists
+to prevent. Hard cap 800 still applies.
+
 Collects every MMA descriptor Quark can lower, along with the
 per-chip gates that determine which hardware supports each shape.
 Replaces two parallel tables that had drifted:
@@ -18,17 +25,19 @@ Per MMA_SHAPES proposal Stage M1.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Optional
 
-from quark.device import ChipGeneration
+from quark.device import ChipGeneration, DeviceFamily
 from quark.ir.module import MmaShape
 from quark.ir.types import DType
 
 
 @dataclass(frozen=True)
 class MmaConfig:
-    """One MMA descriptor + its per-register lane metadata + chip gates.
+    """One MMA descriptor + its per-register lane metadata + per-backend
+    gate & lowering payload.
 
     ``shape`` is the IR-level descriptor the lowerer consumes.
     ``a_offsets`` / ``b_offsets`` / ``cd_offsets`` are the per-register
@@ -36,14 +45,31 @@ class MmaConfig:
     ``lane_col_step`` is the elements-per-b32 count: 2 for bf16/fp16,
     4 for 8-bit.
 
-    ``min_ptx_cc`` / ``min_metal_gen`` are the chip gates. ``None`` means
-    "unrestricted on that backend". ``shapes_for_chip`` filters the
-    descriptor list against the active device's ``ChipGeneration``:
-    CUDA chips pass iff ``chip.cuda_cc() >= min_ptx_cc``; Metal chips
-    pass iff ``chip >= min_metal_gen`` in the enum's declaration order.
-    A descriptor with both fields ``None`` is rejected by any chip
-    (mis-registered); a descriptor with ``min_ptx_cc=None`` passes on
-    every Metal chip if its ``min_metal_gen`` passes, and vice versa.
+    Backend fields come in **gate + payload pairs**, grouped by family.
+    The payload field name equals ``DeviceFamily.<X>.value`` so
+    ``payload_for(shape_id, family)`` can resolve it with ``getattr``.
+
+    * ``min_cuda_cc`` + ``cuda``    — CUDA  (PTX mnemonic suffix)
+    * ``min_metal_gen`` + ``metal`` — Metal (MSL tiling
+      ``"<frag_dtype>:<mf>:<nf>:<kf>"`` consumed by ``_parse_msl_tiling``)
+
+    Gate semantics: ``min_*=None`` means the shape has no path on that
+    backend at all. ``shapes_for_chip`` filters the descriptor list
+    against the active device's ``ChipGeneration``: CUDA chips pass iff
+    ``chip.cuda_cc() >= min_cuda_cc``; Metal chips pass iff
+    ``chip >= min_metal_gen`` in the enum's declaration order. A
+    descriptor with every gate ``None`` is rejected by any chip
+    (mis-registered).
+
+    Payload semantics: the value is a backend-opaque string that the
+    lowerer parses. ``None`` (default) means no lowering — if the gate
+    passes but the payload is ``None``, lowering fails with a clear
+    error (see ``payload_for``'s callers).
+
+    ``min_ptx_cc`` is kept as a read-only property alias of
+    ``min_cuda_cc`` for one release so downstream dashboards / registries
+    that introspect the field keep working. Prefer the vendor-neutral
+    name at new call sites.
     """
 
     shape: MmaShape
@@ -51,10 +77,14 @@ class MmaConfig:
     b_offsets: tuple[tuple[int, int], ...]
     cd_offsets: tuple[tuple[int, int], ...]
     lane_col_step: int  # elements per b32 reg — drives smem-base math
-    # Per-backend minimum chip that supports this shape. None = shape
-    # not available on that backend at all (e.g. fp8 MMAs on Metal).
-    min_ptx_cc: Optional[tuple[int, int]] = None
+
+    # --- CUDA backend ---
+    min_cuda_cc: Optional[tuple[int, int]] = None
+    cuda: Optional[str] = None  # PTX mnemonic suffix after ``mma.sync.aligned.``
+
+    # --- Metal backend ---
     min_metal_gen: Optional[ChipGeneration] = None
+    metal: Optional[str] = None  # MSL tiling ``"<frag_dtype>:<mf>:<nf>:<kf>"``
 
     @property
     def shape_id(self) -> str:
@@ -63,6 +93,11 @@ class MmaConfig:
     @property
     def mma_k(self) -> int:
         return self.shape.k
+
+    @property
+    def min_ptx_cc(self) -> Optional[tuple[int, int]]:
+        """Deprecated alias for ``min_cuda_cc``."""
+        return self.min_cuda_cc
 
 
 # ---------------------------------------------------------------------------
@@ -90,15 +125,15 @@ _BF16_M8N8K8 = MmaConfig(
         a_regs=1,  # 1 bf16x2 b32 per lane × 32 lanes = 64 = 8m × 8k
         b_regs=1,  # 1 bf16x2 b32 per lane × 32 lanes = 64 = 8n × 8k
         c_regs=2,  # 2 f32 per lane × 32 lanes = 64 = 8m × 8n
-        ptx=None,
-        msl="bfloat16_t:1:1:1",
     ),
     a_offsets=((0, 0),),
     b_offsets=((0, 0),),
     cd_offsets=((0, 0), (0, 1)),  # Apple 8x8 acc: 2 elements per lane
     lane_col_step=2,
-    min_ptx_cc=None,  # no PTX path
+    min_cuda_cc=None,  # no PTX path
+    cuda=None,
     min_metal_gen=ChipGeneration.METAL_M3,
+    metal="bfloat16_t:1:1:1",
 )
 
 # ---------------------------------------------------------------------------
@@ -122,13 +157,13 @@ _BF16_M16N8K8 = MmaConfig(
         a_regs=2,  # 2 bf16x2 b32 = 4 bf16 per lane = 16m × 8k
         b_regs=1,  # 1 bf16x2 b32 = 2 bf16 per lane = 8n × 8k
         c_regs=4,  # same acc layout as all m16n8 shapes
-        ptx="m16n8k8.row.col.f32.bf16.bf16.f32",
     ),
     a_offsets=((0, 0), (8, 0)),
     b_offsets=((0, 0),),
     cd_offsets=((0, 0), (0, 1), (8, 0), (8, 1)),
     lane_col_step=2,
-    min_ptx_cc=(8, 0),  # Ampere+
+    min_cuda_cc=(8, 0),  # Ampere+
+    cuda="m16n8k8.row.col.f32.bf16.bf16.f32",
     # No MSL emission for m16n8 on Metal — use m8n8k8 or the
     # existing m16n8k16 (which internally tiles to 2x simdgroup_matrix).
     min_metal_gen=None,
@@ -150,19 +185,20 @@ _BF16_K16 = MmaConfig(
         a_regs=4,
         b_regs=2,
         c_regs=4,
-        ptx="m16n8k16.row.col.f32.bf16.bf16.f32",
-        msl="bfloat16_t:2:1:2",
     ),
     a_offsets=((0, 0), (8, 0), (0, 8), (8, 8)),
     b_offsets=((0, 0), (0, 8)),
     cd_offsets=((0, 0), (0, 1), (8, 0), (8, 1)),
     lane_col_step=2,
-    min_ptx_cc=(8, 0),  # Ampere+
-    # No Metal — m8n8k8 dominates on every M3 autotune problem, so
-    # keeping m16n8k16 in Metal's shape set just wastes autotune time.
-    # The MSL lowerer still supports the shape if a future kernel opts
-    # in explicitly via ``main_shape``.
+    min_cuda_cc=(8, 0),  # Ampere+
+    cuda="m16n8k16.row.col.f32.bf16.bf16.f32",
+    # No Metal in shapes_for_chip — m8n8k8 dominates on every M3 autotune
+    # problem, so keeping m16n8k16 in Metal's shape set just wastes
+    # autotune time. But the MSL lowerer still supports the shape if a
+    # future kernel opts in explicitly via ``main_shape``, so we carry
+    # the MSL payload for that path.
     min_metal_gen=None,
+    metal="bfloat16_t:2:1:2",
 )
 
 # ---------------------------------------------------------------------------
@@ -181,17 +217,20 @@ _F16_K16 = MmaConfig(
         a_regs=4,
         b_regs=2,
         c_regs=4,
-        ptx="m16n8k16.row.col.f32.f16.f16.f32",
-        msl="half:2:1:2",
     ),
     a_offsets=((0, 0), (8, 0), (0, 8), (8, 8)),
     b_offsets=((0, 0), (0, 8)),
     cd_offsets=((0, 0), (0, 1), (8, 0), (8, 1)),
     lane_col_step=2,
-    min_ptx_cc=(7, 5),  # Turing+ (m16n8k16 f16 MMA)
-    # No Metal — see m16n8k16_bf16 note. m8n8k8_f16 would be the
-    # Metal-native choice; register when a kernel actually wants fp16.
+    min_cuda_cc=(7, 5),  # Turing+ (m16n8k16 f16 MMA)
+    cuda="m16n8k16.row.col.f32.f16.f16.f32",
+    # No Metal in shapes_for_chip — see m16n8k16_bf16 note.
+    # m8n8k8_f16 would be the Metal-native choice; register when a
+    # kernel actually wants fp16. Carry the MSL payload for
+    # ``main_shape`` opt-in; the m_frags/n_frags/k_frags tuple is
+    # identical to bf16 since only the frag-element type changes.
     min_metal_gen=None,
+    metal="half:2:1:2",
 )
 
 # ---------------------------------------------------------------------------
@@ -210,7 +249,6 @@ _E4M3_K16 = MmaConfig(
         a_regs=2,
         b_regs=1,
         c_regs=4,
-        ptx="m16n8k16.row.col.f32.e4m3.e4m3.f32",
     ),
     a_offsets=((0, 0), (8, 0)),
     b_offsets=((0, 0),),
@@ -218,7 +256,8 @@ _E4M3_K16 = MmaConfig(
     lane_col_step=4,
     # m16n8k16 fp8 requires PTX ISA 8.7+ (Blackwell sm_120). Ada
     # (sm_89) only supports fp8 via m16n8k32 — see _E4M3_K32.
-    min_ptx_cc=(12, 0),
+    min_cuda_cc=(12, 0),
+    cuda="m16n8k16.row.col.f32.e4m3.e4m3.f32",
 )
 
 # ---------------------------------------------------------------------------
@@ -237,13 +276,13 @@ _E5M2_K16 = MmaConfig(
         a_regs=2,
         b_regs=1,
         c_regs=4,
-        ptx="m16n8k16.row.col.f32.e5m2.e5m2.f32",
     ),
     a_offsets=((0, 0), (8, 0)),
     b_offsets=((0, 0),),
     cd_offsets=((0, 0), (0, 1), (8, 0), (8, 1)),
     lane_col_step=4,
-    min_ptx_cc=(12, 0),  # Blackwell — Ada has fp8 MMAs only at k=32
+    min_cuda_cc=(12, 0),  # Blackwell — Ada has fp8 MMAs only at k=32
+    cuda="m16n8k16.row.col.f32.e5m2.e5m2.f32",
 )
 
 # ---------------------------------------------------------------------------
@@ -262,13 +301,13 @@ _E4M3_K32 = MmaConfig(
         a_regs=4,
         b_regs=2,
         c_regs=4,
-        ptx="m16n8k32.row.col.f32.e4m3.e4m3.f32",
     ),
     a_offsets=((0, 0), (8, 0), (0, 16), (8, 16)),
     b_offsets=((0, 0), (0, 16)),
     cd_offsets=((0, 0), (0, 1), (8, 0), (8, 1)),
     lane_col_step=4,
-    min_ptx_cc=(8, 9),
+    min_cuda_cc=(8, 9),
+    cuda="m16n8k32.row.col.f32.e4m3.e4m3.f32",
 )
 
 # ---------------------------------------------------------------------------
@@ -287,13 +326,13 @@ _E5M2_K32 = MmaConfig(
         a_regs=4,
         b_regs=2,
         c_regs=4,
-        ptx="m16n8k32.row.col.f32.e5m2.e5m2.f32",
     ),
     a_offsets=((0, 0), (8, 0), (0, 16), (8, 16)),
     b_offsets=((0, 0), (0, 16)),
     cd_offsets=((0, 0), (0, 1), (8, 0), (8, 1)),
     lane_col_step=4,
-    min_ptx_cc=(8, 9),
+    min_cuda_cc=(8, 9),
+    cuda="m16n8k32.row.col.f32.e5m2.e5m2.f32",
 )
 
 # ---------------------------------------------------------------------------
@@ -313,7 +352,6 @@ _BF16xE4M3_K16 = MmaConfig(
         a_regs=4,
         b_regs=1,
         c_regs=4,
-        ptx="m16n8k16.row.col.f32.bf16.e4m3.f32",
     ),
     a_offsets=((0, 0), (8, 0), (0, 8), (8, 8)),
     b_offsets=((0, 0),),
@@ -322,7 +360,8 @@ _BF16xE4M3_K16 = MmaConfig(
     # Mixed bf16×e4m3 at m16n8k16 uses the kind::f8f6f4 encoding
     # added in PTX ISA 8.7 (sm_120+). Ada/Hopper have no native mixed
     # form here — a precast-to-fp8 path would use _E4M3_K32 on those.
-    min_ptx_cc=(12, 0),
+    min_cuda_cc=(12, 0),
+    cuda="m16n8k16.row.col.f32.bf16.e4m3.f32",
 )
 
 
@@ -344,6 +383,73 @@ ALL_SHAPES: tuple[MmaConfig, ...] = (
     _E5M2_K32,
     _BF16xE4M3_K16,
 )
+
+# Reverse index for O(1) shape_id → config lookups. Built once at
+# module import; never mutated (tests extend the override table
+# below, not this map).
+_BY_SHAPE_ID: dict[str, MmaConfig] = {cfg.shape_id: cfg for cfg in ALL_SHAPES}
+
+
+# ---------------------------------------------------------------------------
+# Per-backend lowering payload lookup
+#
+# Production payloads are declared on each ``MmaConfig`` as backend-
+# named fields (``cuda``, ``metal``, ...). Field names are keyed on
+# ``DeviceFamily.<X>.value`` so ``payload_for`` can resolve them
+# generically via ``getattr(cfg, family.value)``. ``_SUPPORTED_FAMILIES``
+# names exactly the families that have a field on ``MmaConfig``; a
+# module-import assertion below verifies this up-front so a typo
+# like ``min_cuda_cc=(8, 0)`` paired with ``cuba="..."`` cannot ship.
+#
+# ``_PAYLOAD_OVERRIDES`` is a thin test-time side table. It takes
+# precedence over the ``MmaConfig`` field so tests can stand up an
+# ad-hoc shape (``test_no_msl``, ``custom_s8_shape``) or exercise a
+# non-shipped variant of an existing shape, without mutating frozen
+# dataclass instances.
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_FAMILIES: tuple[DeviceFamily, ...] = (DeviceFamily.CUDA, DeviceFamily.METAL)
+
+_MMA_CONFIG_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in dataclasses.fields(MmaConfig))
+for _fam in _SUPPORTED_FAMILIES:
+    assert _fam.value in _MMA_CONFIG_FIELD_NAMES, (
+        f"MmaConfig has no payload field for DeviceFamily.{_fam.name} — "
+        f"expected a field named {_fam.value!r} "
+        f"(must equal ``DeviceFamily.{_fam.name}.value``)"
+    )
+
+
+_PAYLOAD_OVERRIDES: dict[tuple[str, DeviceFamily], str] = {}
+
+
+def payload_for(shape_id: str, family: DeviceFamily) -> Optional[str]:
+    """Backend lowering payload for ``(shape_id, family)``, or ``None``
+    if the shape has no path on that backend.
+
+    Precedence: ``_PAYLOAD_OVERRIDES`` (test-time) > ``MmaConfig``
+    field (production). Backends call this to decide whether they
+    can lower a kernel that declares ``shape_id``; ``None`` feeds
+    ``is_valid_for(caps)`` rejection at the family's dispatch layer.
+    """
+    override = _PAYLOAD_OVERRIDES.get((shape_id, family))
+    if override is not None:
+        return override
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        return None
+    return getattr(cfg, family.value, None)
+
+
+def register_backend_payload(shape_id: str, family: DeviceFamily, payload: str) -> None:
+    """Register or override the lowering payload for ``(shape_id, family)``.
+
+    Used by tests that either construct ad-hoc ``MmaShape`` instances
+    (shape not in ``ALL_SHAPES``) or want to exercise a non-default
+    payload for an existing shape. Production code does NOT call this —
+    production payloads are declared on the shipped ``MmaConfig`` rows.
+    Idempotent; replaces any prior override silently.
+    """
+    _PAYLOAD_OVERRIDES[(shape_id, family)] = payload
 
 
 def _dtype_key(d: DType) -> str:
@@ -428,11 +534,11 @@ def _metal_gen_index(gen: ChipGeneration) -> int:
 
 def _supports(cfg: MmaConfig, gen: ChipGeneration) -> bool:
     if gen.is_cuda:
-        if cfg.min_ptx_cc is None:
+        if cfg.min_cuda_cc is None:
             return False
         cc = gen.cuda_cc()
         assert cc is not None  # invariant for is_cuda=True
-        return cc >= cfg.min_ptx_cc
+        return cc >= cfg.min_cuda_cc
     if gen.is_metal:
         if cfg.min_metal_gen is None:
             return False
@@ -459,5 +565,7 @@ __all__ = (
     "ALL_SHAPES",
     "MmaConfig",
     "lookup_mma",
+    "payload_for",
+    "register_backend_payload",
     "shapes_for_chip",
 )

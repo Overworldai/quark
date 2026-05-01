@@ -75,7 +75,7 @@ class TestCudaDriverProbe:
         driver = CudaDriver()
         caps = driver.device.caps
         assert caps.compute_unit_count > 0
-        assert caps.warp_size == 32
+        assert caps.subgroup_width == 32
         assert caps.max_threads_per_block >= 256
         assert caps.max_smem_per_block >= 48 * 1024
         assert caps.compute_capability is not None
