@@ -106,19 +106,21 @@ def test_unknown_routing_rejected():
 
 
 # ---------------------------------------------------------------
-# Env-gated MoE-specific fp8 opt-out
+# MoE-specific fp8 opt-out (via ``moe_fp8`` kwarg)
 # ---------------------------------------------------------------
 
 
-def test_moe_fp8_disabled_env(monkeypatch):
-    """``QUARK_MOE_NO_FP8=1`` makes ``prepare(fp8=True)`` a no-op for the
-    MoE block (and not promote ``_fp8`` on it). Other Linears in the
-    model get fp8 normally."""
-    from quark.nn.moe import _moe_fp8_disabled
+def test_moe_fp8_kwarg_keeps_experts_bf16():
+    """``MoE.prepare(fp8=True, moe_fp8=False)`` keeps experts in bf16 even
+    when the surrounding model passes ``fp8=True``. Mirrors what
+    ``Waypoint15.prepare`` does when ``cfg.quant.moe == "bf16"``.
 
-    monkeypatch.setenv("QUARK_MOE_NO_FP8", "1")
-    assert _moe_fp8_disabled() is True
-    monkeypatch.setenv("QUARK_MOE_NO_FP8", "0")
-    assert _moe_fp8_disabled() is False
-    monkeypatch.delenv("QUARK_MOE_NO_FP8", raising=False)
-    assert _moe_fp8_disabled() is False
+    Scoped to the ``effective_fp8 == False`` branch so the assertion
+    runs on both Metal (no e4m3 in the allocator) and CUDA. The
+    ``moe_fp8=True`` quantize path is exercised by the CUDA-only
+    waypoint smoke tests.
+    """
+    moe = MoE(M=128, d_model=64, d_intermediate=32, n_experts=4, top_k=2, routing="balanced")
+    assert getattr(moe, "_fp8", False) is False
+    moe.prepare(fp8=True, moe_fp8=False)
+    assert getattr(moe, "_fp8", False) is False, "moe_fp8=False must keep experts bf16"

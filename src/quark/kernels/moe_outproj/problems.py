@@ -60,7 +60,7 @@ def moe_outproj_problems() -> list[Problem]:
         ),
         # W1.5 MoE — bf16-only path (moe_inproj fused-silu epilogue
         # can't store fp8 yet, so the whole MoE block stays bf16
-        # regardless of cfg.use_fp8).
+        # regardless of cfg.quant.moe).
         Problem("w15_360p", {"M": 128, **w15}, tags=w15tg | {"bf16"} | _CUDA),
         Problem("w15_720p", {"M": 512, **w15}, tags=w15tg | {"bf16"} | _CUDA),
     ]

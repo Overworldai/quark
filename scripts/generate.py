@@ -460,12 +460,15 @@ def main():
     cfg = _make_config(args.preset)
     import dataclasses as _dc
 
+    from quark.models.waypoint_15 import QuantConfig
+
+    # ``--fp8`` (default) drives end-to-end fp8: Linear weight
+    # quantization AND the KV cache dtype / OwlAttn MMA path. ``--bf16``
+    # picks the safe fallback (no fp8 anywhere).
     if args.bf16:
-        cfg = _dc.replace(cfg, use_f16=False)
-    # ``--fp8`` now drives both Linear weight quantization AND the KV
-    # cache dtype / OwlAttn MMA path. Without it everything stays in
-    # half_dt end-to-end (safe fallback).
-    cfg = _dc.replace(cfg, use_fp8=args.fp8)
+        cfg = _dc.replace(cfg, quant=QuantConfig.all_bf16())
+    elif not args.fp8:
+        cfg = _dc.replace(cfg, quant=QuantConfig.all_bf16())
     # ctrl_conditioning is always True — even with default CtrlInput(),
     # the MLPFusion on every 3rd block transforms x through its own weights.
 
@@ -473,7 +476,7 @@ def main():
     H, W = cfg.height * ph, cfg.width * pw
     C = cfg.channels
     tpf = cfg.tpf
-    half_dt = "f16" if cfg.use_f16 else "bf16"
+    half_dt = "bf16"
 
     print(f"preset: {args.preset} — {tpf} tokens/frame")
     print(f"  latent grid: {cfg.height}x{cfg.width}, {args.n_frames} frames")
@@ -483,8 +486,8 @@ def main():
     print(f"loading model from {args.repo} …")
     t0 = time.perf_counter()
     repo_suffix = "-360P" if args.preset == "360p" else ""
-    model = Waypoint15.from_world_engine_hub(args.repo + repo_suffix, cfg=cfg, dtype="bf16")
-    model.prepare(shuffle=args.b_shuffle)  # fp8 defaults to cfg.use_fp8
+    model = Waypoint15.from_pretrained(args.repo + repo_suffix, cfg=cfg, dtype="bf16")
+    model.prepare(shuffle=args.b_shuffle)  # fp8 defaults to cfg.quant.linear
     _sync()
     print(f"  model ready ({time.perf_counter() - t0:.1f}s)")
 

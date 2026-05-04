@@ -3,8 +3,8 @@
 Kept separate from ``waypoint_15.py`` so the model definition stays
 under the 800-line hard cap. Nothing here is meant to be imported
 directly — ``Waypoint15`` / ``Waypoint15Config`` re-export the
-public names (``remap_world_engine_state_dict``,
-``Waypoint15.make_ctrl_buffer``, ``Waypoint15.from_world_engine_hub``).
+public names (``remap_state_dict``, ``Waypoint15.make_ctrl_buffer``,
+``Waypoint15.from_pretrained``).
 """
 
 from __future__ import annotations
@@ -90,12 +90,12 @@ def _tile_b_to_patched(b, C: int, ph: int, pw: int):
 
 
 # ---------------------------------------------------------------
-# State-dict remap (world_engine → quark)
+# State-dict remap (upstream training-format → quark layout)
 # ---------------------------------------------------------------
 
 
-def remap_world_engine_state_dict(raw_sd: dict, cfg) -> dict:
-    """Translate a world_engine-saved state dict into the layout
+def remap_state_dict(raw_sd: dict, cfg) -> dict:
+    """Translate an upstream-format state dict into the layout
     ``Waypoint15`` expects (merged ``qkv_proj``, split ``ctrl_fusion``,
     per-block ``attn_cond`` / ``mlp_cond`` heads, flattened patch /
     unpatch weights, tiled unpatchify bias, padded ctrl-emb fc1, …).
@@ -225,7 +225,7 @@ def remap_world_engine_state_dict(raw_sd: dict, cfg) -> dict:
         raw_k = int(fc1_w.shape[1])
         padded_k = ((raw_k + 15) // 16) * 16
         if padded_k > raw_k:
-            half_dt = "f16" if cfg.use_f16 else "bf16"
+            half_dt = "bf16"
             if _IS_METAL:
                 import mlx.core as mx
 
@@ -410,7 +410,7 @@ def prepare_cond_luts(model, cfg, d: int) -> None:
 
     from quark.runtime.sync import synchronize
 
-    out_dt = "f16" if cfg.use_f16 else "bf16"
+    out_dt = "bf16"
 
     # Per-block: separate attn and mlp cond heads with different bias_in.
     # Use f32 noise embeddings from compute_noise_emb_numpy().

@@ -44,6 +44,39 @@ class CtrlInput:
 
 
 @dataclass(frozen=True)
+class QuantConfig:
+    """Per-component quantization knobs for ``Waypoint15``.
+
+    Each field is ``"fp8"`` or ``"bf16"``. Defaults match what we ship
+    on sm_89+ (Ada / Hopper). Drop to ``"bf16"`` selectively when
+    debugging precision or running on devices without fp8 MMA support.
+
+    - ``linear``       — Linear weights quantized to e4m3 in ``prepare()``.
+    - ``kv_cache``     — KV ring buffer dtype.
+    - ``attn_compute`` — OwlAttn MMA compute dtype (cast Q/K/V on load).
+    - ``moe``          — opt the MoE block out of fp8 independently
+                          (e.g. when the runtime smem cast on the input
+                          tile dominates and only the cuBLAS gemms win).
+    """
+
+    linear: str = "fp8"
+    kv_cache: str = "fp8"
+    attn_compute: str = "fp8"
+    moe: str = "fp8"
+
+    def __post_init__(self) -> None:
+        for name in ("linear", "kv_cache", "attn_compute", "moe"):
+            v = getattr(self, name)
+            if v not in ("fp8", "bf16"):
+                raise ValueError(f"QuantConfig.{name}: must be 'fp8' or 'bf16', got {v!r}")
+
+    @classmethod
+    def all_bf16(cls) -> QuantConfig:
+        """Safe fallback — all components in bf16."""
+        return cls(linear="bf16", kv_cache="bf16", attn_compute="bf16", moe="bf16")
+
+
+@dataclass(frozen=True)
 class Waypoint15Config:
     d_model: int = 2048
     n_layers: int = 24
@@ -65,18 +98,12 @@ class Waypoint15Config:
     n_buttons: int = 256
     ctrl_conditioning: bool = True
     ctrl_conditioning_period: int = 3
-    use_f16: bool = True  # False → bf16 weights + f32 output (safe baseline)
-    # End-to-end fp8 mode. When True (default on sm_89+):
-    #   - Linear weights are quantized to e4m3 by ``prepare()``
-    #   - KV cache is stored as e4m3
-    #   - OwlAttn runs both MMAs in e4m3 (Q/K/V all cast to e4m3
-    #     internally)
-    # When False, everything stays in the "half" dtype (bf16 by default)
-    # from weights through KV cache through attention MMAs — the safe
-    # fallback for devices without fp8 support or for precision debugging.
-    # ``QUARK_MOE_NO_FP8=1`` separately opts the MoE block out of fp8
-    # while leaving everything else fp8.
-    use_fp8: bool = True
+
+    # Per-component quantization. See ``QuantConfig`` — defaults to
+    # end-to-end fp8 on sm_89+; ``QuantConfig.all_bf16()`` for the
+    # safe fallback. Replaces the old ``use_fp8`` bool + the
+    # ``QUARK_NO_FP8`` / ``QUARK_MOE_NO_FP8`` env-var knobs.
+    quant: QuantConfig = field(default_factory=QuantConfig)
 
     # Spatial-quilting factor for the kv_cache + owl_attn path. ``1``
     # is the no-op default (every token participates in attention every
@@ -85,10 +112,9 @@ class Waypoint15Config:
     quilt_factor: int = 1
 
     # Per-block MoE — swap dense MLP for ``nn.MoE``. Per-expert hidden
-    # = ``mlp_dim / moe_top_k`` so active params match dense. bf16-only
-    # regardless of ``use_fp8`` (set ``QUARK_MOE_NO_FP8=1`` to opt out
-    # explicitly). ``moe_routing`` picks the routing kernel — see
-    # ``nn.MoE`` for the matrix of behaviors per mode.
+    # = ``mlp_dim / moe_top_k`` so active params match dense. ``moe_routing``
+    # picks the routing kernel — see ``nn.MoE`` for the matrix of
+    # behaviors per mode.
     moe: bool = False
     moe_n_experts: int = 8
     moe_top_k: int = 2
@@ -136,20 +162,18 @@ class Waypoint15Config:
         return self.global_pinned_dilation if self.is_global(layer) else 1
 
     @classmethod
-    def from_world_engine(cls, we_cfg, **overrides) -> Waypoint15Config:
-        """Build a ``Waypoint15Config`` from a ``world_engine`` model config.
+    def from_dict(cls, cfg: dict, **overrides) -> Waypoint15Config:
+        """Build a ``Waypoint15Config`` from a plain mapping.
 
-        ``we_cfg`` is either an OmegaConf node or a plain dict (or any
-        mapping that supports ``in`` + ``__getitem__``). Only the fields
-        that ``Waypoint15Config`` knows about are copied — everything
-        else on the source config (``ae_uri``, ``prompt_conditioning``,
-        ``base_fps``, …) is the caller's concern.
+        Only the fields that ``Waypoint15Config`` knows about are
+        copied — everything else on the source dict (``ae_uri``,
+        ``prompt_conditioning``, ``base_fps``, …) is the caller's
+        concern (``quark.Engine`` reads them off the raw dict directly).
 
-        ``we_cfg.ctrl_conditioning`` is the *controller spec* on the
-        world_engine side and truthiness decides whether quark should
-        wire up the ctrl path; ``cfg.ctrl_conditioning`` on this side is
-        a plain bool. ``overrides`` wins over the mapped values so
-        callers can tweak e.g. ``use_f16`` without rebuilding the dict.
+        ``cfg["ctrl_conditioning"]`` is the *controller spec* in the
+        upstream training format and truthiness decides whether quark
+        should wire up the ctrl path; on this side the field is a
+        plain bool. ``overrides`` wins over the mapped values.
         """
         _SCALAR_FIELDS = (
             "d_model",
@@ -175,15 +199,23 @@ class Waypoint15Config:
             "moe_routing",
             "quilt_factor",
         )
-        kwargs = {name: we_cfg[name] for name in _SCALAR_FIELDS if name in we_cfg}
-        if "patch" in we_cfg:
-            kwargs["patch"] = tuple(we_cfg["patch"])
-        if "scheduler_sigmas" in we_cfg:
-            kwargs["scheduler_sigmas"] = tuple(we_cfg["scheduler_sigmas"])
-        if "ctrl_conditioning" in we_cfg:
-            kwargs["ctrl_conditioning"] = we_cfg["ctrl_conditioning"] is not None
+        kwargs = {name: cfg[name] for name in _SCALAR_FIELDS if name in cfg}
+        if "patch" in cfg:
+            kwargs["patch"] = tuple(cfg["patch"])
+        if "scheduler_sigmas" in cfg:
+            kwargs["scheduler_sigmas"] = tuple(cfg["scheduler_sigmas"])
+        if "ctrl_conditioning" in cfg:
+            kwargs["ctrl_conditioning"] = cfg["ctrl_conditioning"] is not None
         kwargs.update(overrides)
         return cls(**kwargs)
+
+    @classmethod
+    def from_yaml(cls, model_uri: str, **overrides) -> Waypoint15Config:
+        """Load a ``config.yaml`` (local dir / path / HF repo id) and
+        build a ``Waypoint15Config`` from it. ``overrides`` wins."""
+        from quark.models.config import load_yaml_config
+
+        return cls.from_dict(load_yaml_config(model_uri), **overrides)
 
 
 def _check_dtype(t, expected: str, where: str) -> None:
@@ -202,10 +234,9 @@ def _check_dtype(t, expected: str, where: str) -> None:
         )
 
 
-# Public re-export — see ``quark.models._waypoint_15_io``. Kept in the
-# model module's namespace so ``from quark.models.waypoint_15 import
-# remap_world_engine_state_dict`` keeps working.
-from quark.models._waypoint_15_io import remap_world_engine_state_dict  # noqa: E402
+# Public re-export — checkpoint key remap from the upstream training
+# format into the layout this module expects.
+from quark.models._waypoint_15_io import remap_state_dict  # noqa: E402
 
 # ---------------------------------------------------------------
 # Transformer block
@@ -215,8 +246,11 @@ from quark.models._waypoint_15_io import remap_world_engine_state_dict  # noqa: 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg: Waypoint15Config, layer_idx: int, rope_n_frames: int):
         d = cfg.d_model
-        half_dt = "f16" if cfg.use_f16 else "bf16"
-        out_dt = "f16" if cfg.use_f16 else "bf16"
+        # Residual stream and intermediate activations are bf16 throughout.
+        # The fp16 path got removed in the standalone refactor — bf16 is
+        # what the weights ship as and what the VAE / ctrl pipe wants.
+        half_dt = "bf16"
+        out_dt = "bf16"
 
         # Per-block conditioning: separate attn and mlp cond heads, each with
         # their own bias_in. WE has attn_cond_head and mlp_cond_head.
@@ -242,16 +276,18 @@ class TransformerBlock(nn.Module):
         self.head_norm = nn.HeadRMSNorm(cfg.n_heads, cfg.n_kv_heads, cfg.Dh)
         if cfg.value_residual:
             self.v_residual = nn.ValueResidualPacked(cfg.v_col_offset, cfg.v_width)
-        # KV cache + owl_attn MMAs are driven by ``cfg.use_fp8``:
+        # KV cache + owl_attn MMAs are driven by ``cfg.quant``:
         #   fp8 path: e4m3 cache + e4m3 MMAs; Q is cast to e4m3 during
         #     the Q-RoPE pass (packed_convert) inside owl_attn. Cache
         #     bandwidth halves + sm_89+ fp8 MMA throughput win.
         #   bf16 path: kv cache, Q, K, V all in half_dt; MMAs inherit
         #     that from the tensor dtypes (compute_dtype=None). The
         #     safe fallback when fp8 is misbehaving or the device
-        #     doesn't support it.
-        kv_cache_dt = "e4m3" if cfg.use_fp8 else half_dt
-        owl_compute_dt = "e4m3" if cfg.use_fp8 else None
+        #     doesn't support it. The two fields are independent so
+        #     callers can mix (e.g. fp8 cache + bf16 compute) — see
+        #     ``QuantConfig``.
+        kv_cache_dt = "e4m3" if cfg.quant.kv_cache == "fp8" else half_dt
+        owl_compute_dt = "e4m3" if cfg.quant.attn_compute == "fp8" else None
         # Quilt offset alternates by layer so the model in aggregate
         # sees every pixel. layer_idx 0 keeps residue 0, layer 1 keeps
         # residue 1, …, wrapping every quilt_factor blocks.
@@ -285,18 +321,16 @@ class TransformerBlock(nn.Module):
             quilt_factor=cfg.quilt_factor,
             quilt_offset=quilt_offset,
         )
-        out_dt = "f16" if cfg.use_f16 else "bf16"
         self.out_proj = nn.Linear(cfg.n_heads * cfg.Dh, d, out_dtype=out_dt)
         self.attn_gate = nn.AdaGateResidual()
 
         if cfg.ctrl_conditioning and layer_idx % cfg.ctrl_conditioning_period == 0:
-            # ctrl_fusion stays bf16 end-to-end regardless of ``cfg.use_f16`` —
-            # weights are bf16, so an f16 out_dtype would force a f16→bf16
-            # cast of fc1_c's cond input and fc2's h input on every call (3
-            # extra elementwise kernel launches per block × 5 NFE × 24
-            # blocks). Keeping it all bf16 matches the weights and removes
-            # those casts. Caller rmsnorm preserves dtype so cond stays bf16
-            # from ctrl_emb all the way through.
+            # ctrl_fusion is bf16 end-to-end — weights are bf16 so a
+            # different out_dtype would force a per-call cast of
+            # fc1_c's cond input and fc2's h input (3 extra elementwise
+            # kernel launches per block × 5 NFE × 24 blocks). Caller
+            # rmsnorm preserves dtype so cond stays bf16 from ctrl_emb
+            # all the way through.
             self.ctrl_fusion = nn.MLPFusion(d, out_dtype="bf16")
             # Two RMSNorms per ctrl_fusion: one on the (per-block) x input,
             # one on the (shared) ctrl_emb. Each owns a cached output
@@ -354,9 +388,6 @@ class TransformerBlock(nn.Module):
 
         # ── Controller conditioning ──
         if ctrl_emb is not None and hasattr(self, "ctrl_fusion"):
-            # ctrl_fusion is pinned to bf16 end-to-end regardless of
-            # cfg.use_f16 — see TransformerBlock.__init__ comment. So
-            # both rmsnorm inputs AND the ctrl_emb must be bf16 here.
             _check_dtype(ctrl_emb, "bf16", "ctrl_emb (ctrl_fusion path)")
             _check_dtype(x, "bf16", "x (ctrl_fusion path)")
             x = self.ctrl_residual(
@@ -393,7 +424,7 @@ class Waypoint15(nn.Module):
         self.unpatchify = nn.Unpatchify(d, cfg.channels, cfg.height * ph, cfg.width * pw, ph, pw)
 
         # Output norm projection (not per-block).
-        out_dt = "f16" if cfg.use_f16 else "bf16"
+        out_dt = "bf16"
         self.out_norm_proj = nn.Linear(d, 2 * d, out_dtype=out_dt)
 
         # Controller input embedding (only when ctrl_conditioning enabled).
@@ -432,8 +463,10 @@ class Waypoint15(nn.Module):
     def prepare(self, **kwargs):
         """Pre-compute per-sigma cond LUTs. Call after loading weights.
 
-        ``fp8`` defaults to ``cfg.use_fp8`` so Linear weight quantization
-        stays consistent with the KV cache / OwlAttn paths.
+        ``fp8`` defaults to ``cfg.quant.linear == "fp8"``; ``moe_fp8``
+        independently controls MoE expert weight quantization (defaults
+        to ``cfg.quant.moe == "fp8"``). Both kwargs propagate through
+        ``super().prepare`` to children.
         """
         from quark.models._waypoint_15_io import (
             compute_noise_emb_numpy,
@@ -441,7 +474,8 @@ class Waypoint15(nn.Module):
         )
 
         cfg = self.cfg
-        kwargs.setdefault("fp8", cfg.use_fp8)
+        kwargs.setdefault("fp8", cfg.quant.linear == "fp8")
+        kwargs.setdefault("moe_fp8", cfg.quant.moe == "fp8")
 
         pcf.precompute_noise_lut(
             list(cfg.scheduler_sigmas),
@@ -457,7 +491,8 @@ class Waypoint15(nn.Module):
         compute_noise_emb_numpy(self, cfg)
         prepare_cond_luts(self, cfg, cfg.d_model)
 
-        # Recurse into children (Linear.prepare handles fp8 + shuffle).
+        # Recurse into children (Linear.prepare handles fp8 + shuffle;
+        # MoE.prepare picks moe_fp8 out of kwargs).
         super().prepare(**kwargs)
 
     def set_frame_t(self, value: int, stream: int = 0) -> None:
@@ -493,38 +528,31 @@ class Waypoint15(nn.Module):
         return build_ctrl_buffer(self)
 
     @classmethod
-    def from_world_engine_hub(
+    def from_pretrained(
         cls,
-        repo_id: str,
+        model_uri: str,
         *,
         cfg: Waypoint15Config | None = None,
-        we_cfg=None,
         dtype: str = "bf16",
         filename: str = "model.safetensors",
     ) -> Waypoint15:
-        """Download a world_engine-format checkpoint, remap, and load.
+        """Load a checkpoint (local dir or HF repo id) into a fresh model.
 
-        Either ``cfg`` (a ``Waypoint15Config`` already built by the
-        caller) or ``we_cfg`` (a world_engine OmegaConf/dict to map
-        through ``Waypoint15Config.from_world_engine``) must be given.
-
-        The returned model has weights loaded but has NOT been
-        ``prepare()``'d — callers choose their own ``fp8`` / ``shuffle``
-        kwargs. Wrap in ``GenerateFrame(model)`` for graph inference.
+        ``cfg`` defaults to ``Waypoint15Config.from_yaml(model_uri)`` —
+        pass an explicit ``Waypoint15Config`` to override fields the
+        config doesn't capture (e.g. quant). Weights are loaded but
+        ``prepare()`` is NOT called — callers wrap in ``GenerateFrame``
+        or ``quark.Engine`` which call ``prepare()`` themselves.
         """
         if cfg is None:
-            if we_cfg is None:
-                raise ValueError(
-                    "from_world_engine_hub: pass either cfg=Waypoint15Config(...) "
-                    "or we_cfg=<world_engine model config>"
-                )
-            cfg = Waypoint15Config.from_world_engine(we_cfg)
+            cfg = Waypoint15Config.from_yaml(model_uri)
 
-        from quark.nn.io import load_from_hub
+        from quark.models.config import _resolve_path
+        from quark.nn.io import load_safetensors
 
-        raw_sd = load_from_hub(repo_id, filename=filename, dtype=dtype)
+        raw_sd = load_safetensors(_resolve_path(model_uri, filename=filename), dtype=dtype)
         model = cls(cfg)
-        model.load_state_dict(remap_world_engine_state_dict(raw_sd, cfg), strict=False)
+        model.load_state_dict(remap_state_dict(raw_sd, cfg), strict=False)
         return model
 
     def encode_ctrl(self, ctrl_input):
@@ -558,7 +586,7 @@ class Waypoint15(nn.Module):
 
     def forward(self, latent, sigma_idx: int, frame_t=None, ctrl_emb=None, frozen: bool = False):
         """One forward pass — denoise or commit."""
-        half_dt = "f16" if self.cfg.use_f16 else "bf16"
+        half_dt = "bf16"
         s_on, b_on = self._out_norm_luts[sigma_idx]
 
         x = self.patchify(latent)

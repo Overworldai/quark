@@ -692,7 +692,7 @@ class OwlAttn(Module):
         # regardless of Q's arrival dtype (caller must also pin the KV
         # cache to e4m3 for this to work). ``None`` inherits from Q —
         # bf16 input → bf16 MMAs. Set to None by the bf16 fallback path
-        # in Waypoint15 when ``cfg.use_fp8 = False``.
+        # in Waypoint15 when ``cfg.quant.attn_compute = "bf16"``.
         self._compute_dtype = compute_dtype
 
     def forward(self, qkv, kv_cache, frame_t=None):

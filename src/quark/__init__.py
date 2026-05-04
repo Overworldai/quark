@@ -7,6 +7,22 @@ from quark.graph import capture_graph
 from quark.ir import Builder, DType, Module
 
 
+def __getattr__(name: str):
+    """Lazy top-level attrs.
+
+    ``Engine`` / ``CtrlInput`` pull in torch + the model stack, which
+    we don't want to load on every ``import quark`` (the kernel-only
+    surface — ``quark.lang``, ``quark.functional`` — has no torch
+    dep). Importing them only when the attribute is actually accessed
+    keeps the cold-import path lean.
+    """
+    if name in ("Engine", "CtrlInput"):
+        from quark.engine import CtrlInput, Engine
+
+        return {"Engine": Engine, "CtrlInput": CtrlInput}[name]
+    raise AttributeError(f"module 'quark' has no attribute {name!r}")
+
+
 @contextmanager
 def max_autotune():
     """Force full genetic search for any autotune cache miss inside this block.
@@ -35,9 +51,11 @@ def max_autotune():
 
 __all__ = [
     "Builder",
+    "CtrlInput",
     "DType",
     "Device",
     "DeviceCaps",
+    "Engine",
     "Module",
     "capture_graph",
     "current_device",

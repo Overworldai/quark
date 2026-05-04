@@ -40,36 +40,25 @@ Weight layout matches world_engine bit-for-bit:
 ``prepare(fp8=True)`` quantizes ``expert_in`` / ``expert_out`` to e4m3
 and routes the inproj / outproj calls through the fp8 compute path
 (``compute_dtype="e4m3"``). The router stays bf16 (precision-sensitive,
-small E). The inproj output ``_buf_h`` stays in ``out_dtype`` (bf16/f16)
+small E). The inproj output ``_buf_h`` stays in ``out_dtype`` (bf16)
 because the fused-silu epilogue can't yet store fp8 (PTX has no scalar
 fp8 cvt — pending the ``packed_convert`` refactor); outproj reads it
 back and casts on smem-load via ``compute_dtype``.
 
-**Env var ``QUARK_MOE_NO_FP8``**: opt the MoE block out of fp8 even
-when the surrounding model is configured for fp8 (``cfg.use_fp8=True``
-in Waypoint15). Set this before calling ``model.prepare()`` — once the
-expert weights are quantized to e4m3 they can't be un-quantized without
-reloading the state dict. Useful when the runtime bf16→e4m3 smem cast
-on the input tile dominates the kernel time and the cuBLAS gemms are
-the only thing that actually wins from fp8.
+**``moe_fp8`` kwarg**: opt the MoE block out of fp8 independently of
+the surrounding model (``Waypoint15Config.quant.moe = "bf16"``).
+Propagated through ``Waypoint15.prepare`` → ``MoE.prepare`` so the
+caller flips it on the config and the env doesn't need touching.
+Useful when the runtime bf16→e4m3 smem cast on the input tile
+dominates and only the cuBLAS gemms actually win from fp8.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 
 from quark.nn.layers import Cast, Linear
 from quark.nn.module import Module, Parameter, _quantize_to_e4m3, _tensor, _zeros
-
-
-def _moe_fp8_disabled() -> bool:
-    """``QUARK_MOE_NO_FP8`` opt-out — read at prepare-time so callers
-    can flip it without restarting the process. Truthy = disable fp8
-    quantization for MoE blocks even when the outer model passes
-    ``fp8=True``."""
-    return os.environ.get("QUARK_MOE_NO_FP8", "").strip().lower() in ("1", "true", "yes")
-
 
 _IS_METAL = sys.platform == "darwin"
 
@@ -204,27 +193,27 @@ class MoE(Module):
 
         self._cast_out = Cast(out_dtype)
 
-    def prepare(self, *, fp8: bool = False, **kwargs) -> None:
+    def prepare(self, *, fp8: bool = False, moe_fp8: bool | None = None, **kwargs) -> None:
         """Optionally quantize expert weights to e4m3 for fp8 MMA compute.
 
         Mirrors ``Linear.prepare(fp8=True)``: idempotent, keeps the
         router in bf16 (its inner Linear has ``fp8_skip=True``), and
-        the inproj output buffer stays in its allocated half dtype
-        because the fused-silu epilogue can't store fp8 yet.
+        the inproj output buffer stays in bf16 because the fused-silu
+        epilogue can't store fp8 yet.
 
-        Honors ``QUARK_MOE_NO_FP8`` — when set, the entire MoE block
-        stays bf16 even if the parent model passes ``fp8=True``. The
-        opt-out also propagates to the recursive ``super().prepare()``
-        call so any current/future Linear children inside the block
-        skip their fp8 quantization too. The router stays bf16 either
-        way (its inner Linear has ``fp8_skip=True``).
+        ``moe_fp8`` overrides ``fp8`` for this block specifically —
+        when ``False`` the expert weights stay bf16 even if the parent
+        model passed ``fp8=True``. Defaults to ``fp8`` when unset.
+        The override also propagates to the recursive
+        ``super().prepare()`` call so Linear children inside the block
+        skip their fp8 quantization too.
         """
-        moe_fp8 = fp8 and not _moe_fp8_disabled()
-        if moe_fp8 and not getattr(self, "_fp8", False):
+        effective_fp8 = fp8 if moe_fp8 is None else moe_fp8
+        if effective_fp8 and not getattr(self, "_fp8", False):
             self.expert_in.data = _quantize_to_e4m3(self.expert_in.data)
             self.expert_out.data = _quantize_to_e4m3(self.expert_out.data)
             self._fp8 = True
-        super().prepare(fp8=moe_fp8, **kwargs)
+        super().prepare(fp8=effective_fp8, **kwargs)
 
     def forward(self, x):
         import quark.functional as pcf

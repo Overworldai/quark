@@ -4,17 +4,37 @@ A 24-layer DiT for autoregressive video generation, implemented end to
 end as a `quark.nn.Module` with every leaf lowering to a `pcf.*`
 kernel. Target weights: `Overworld/Waypoint-1.5-1B` on HF Hub.
 
+The high-level entry point is `quark.Engine` — append seed frames,
+generate new frames, ship pixels in / pixels out:
+
+```python
+import quark
+
+engine = quark.Engine("Overworld/Waypoint-1.5-1B")        # default fp8
+# engine = quark.Engine("Overworld/Waypoint-1.5-1B", quant="bf16")   # safe fallback
+# engine = quark.Engine("Overworld/Waypoint-1.5-1B",
+#                      quant=quark.models.waypoint_15.QuantConfig(moe="bf16"))
+
+engine.append_frame(seed_frame_uint8)                     # seed
+for _ in range(n_frames):
+    rgb = engine.gen_frame(ctrl=ctrl_input)               # uint8 [T,H,W,3]
+```
+
+Lower-level (skip the VAE wrapper, drive the DiT directly):
+
 ```python
 from quark.models.waypoint_15 import Waypoint15, Waypoint15Config
-from quark.nn.io import load_from_hub
 
-cfg   = Waypoint15Config()                          # 720p defaults
-model = Waypoint15(cfg)
-sd    = load_from_hub("Overworld/Waypoint-1.5-1B", dtype="bf16")
-model.load_state_dict(sd)
-model.prepare(shuffle=True, fp8=True)
+model = Waypoint15.from_pretrained("Overworld/Waypoint-1.5-1B")
+model.prepare(shuffle=True)        # fp8 defaults to cfg.quant.linear
 out = model(x, sigma_idx=0, frame_t=0)
 ```
+
+Per-component quantization is on `Waypoint15Config.quant` (a
+`QuantConfig` with `linear` / `kv_cache` / `attn_compute` / `moe`,
+each `"fp8"` or `"bf16"`). This replaces the previous
+`QUARK_NO_FP8` / `QUARK_MOE_NO_FP8` env-var knobs and the
+`use_fp8` / `use_f16` config booleans.
 
 `scripts/generate.py` is the end-to-end driver: downloads weights,
 loads through `nn.io`, optionally captures CUDA graphs, replays per
