@@ -253,6 +253,47 @@ class TestExistingKernelsCompile:
         assert ck.module.handle != 0
         assert ck.module.n_buffers == 1  # single ``T`` buffer
 
+    def test_increment_kernel_runs_end_to_end(self, spv_device):
+        """``IncrementKernel`` not just compiles — actually executes
+        on Battlemage and produces the correct output. ``T[0] += 1``
+        per the kernel; we initialise to 41, expect 42 back.
+
+        Uses ``SpvDriver.allocate_buffer`` for the storage backing,
+        passes the handle through ``CompiledKernel.launch``, reads
+        back via the host-visible mapping. This is the closing
+        framework-to-hardware loop: a kernel written for the CUDA +
+        Metal backends now runs unchanged on Intel, dispatched
+        through the same Launcher API.
+        """
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.increment.kernel import (
+            IncrementConfig,
+            IncrementKernel,
+            IncrementSpec,
+        )
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            IncrementKernel,
+            IncrementSpec(dtype=DType.S32),
+            IncrementConfig(),
+        )
+
+        # 1-element s32 scratch buffer, init to 41.
+        handle, mapped = _sd.allocate_buffer(4)
+        init = np.array([41], dtype=np.int32)
+        ctypes.memmove(mapped, init.ctypes.data, init.nbytes)
+
+        ck.launch(buffers=[handle])
+
+        out = np.empty(1, dtype=np.int32)
+        ctypes.memmove(out.ctypes.data, mapped, out.nbytes)
+        assert int(out[0]) == 42
+
     def test_euler_step_kernel_compiles(self, spv_device):
         """``EulerStepKernel`` (in-tree, the diffusion-scheduler euler
         step that runs every denoise iter) lowers cleanly. Exercises

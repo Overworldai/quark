@@ -307,6 +307,8 @@ class CompiledKernel:
 
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.METAL:
             return self._launch_metal(buffers, scalars, persistent_outs=persistent_outs)
+        if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.INTEL_GPU:
+            return self._launch_spv(buffers, scalars)
 
         return self._launch_cuda(buffers, scalars, stream)
 
@@ -469,6 +471,72 @@ class CompiledKernel:
         if not _LAZY.get():
             self.driver.sync(None)
         return results
+
+    def _launch_spv(self, buffers: list, scalars: tuple) -> None:
+        """SPIR-V / Vulkan launch path.
+
+        Per-buffer policy:
+          * ``int`` — opaque buffer handle previously returned by
+            ``SpvDriver.allocate_buffer``. Passed through as-is.
+          * ``(handle, mapped_ptr)`` tuple — same shape
+            ``allocate_buffer`` returns; the handle is the first
+            element, mapped_ptr is the host-visible mapping the
+            caller writes / reads through (already used by the
+            test harness; the launcher just consumes the handle).
+          * ``QuarkTensor`` — TODO. The pool of Vulkan-backed
+            QuarkTensor allocations isn't wired today; once it is,
+            zero-copy via ``buffer_handle`` mirrors the Metal
+            ``metal_handle`` path. For v1, callers route through
+            ``SpvDriver.allocate_buffer`` directly.
+          * ``numpy.ndarray`` — copied into a fresh Vulkan buffer
+            allocated on the fly and the handle is passed. Cheaper
+            for tests; production code should reuse pinned buffers.
+
+        Scalars are packed into push constants via
+        ``param_spec.pack_scalars``. The compiled module's
+        ``push_size`` validation in ``SpvDriver.launch`` catches
+        size mismatches.
+        """
+        import numpy as np
+        from quark.drivers import _spv_dispatch as _sd
+
+        handles: list[int] = []
+        for buf, pspec in zip(buffers, self.param_spec.buffers, strict=False):
+            del pspec  # only used by the dtype/contiguity checks; SpvDriver
+                       # validates via the shader module's binding count.
+            if isinstance(buf, int):
+                handles.append(buf)
+            elif isinstance(buf, tuple) and len(buf) == 2 and isinstance(buf[0], int):
+                handles.append(buf[0])
+            elif isinstance(buf, np.ndarray):
+                arr = np.ascontiguousarray(buf)
+                h, ptr = _sd.allocate_buffer(arr.nbytes)
+                import ctypes
+                ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
+                handles.append(h)
+            else:
+                raise TypeError(
+                    f"_launch_spv: buffer is {type(buf).__name__}; expected "
+                    "int handle / (handle, ptr) / numpy.ndarray. QuarkTensor "
+                    "support pending pool integration."
+                )
+
+        # ``pack_scalars`` returns one bytes object per scalar param.
+        # SPIR-V push-constants want a single contiguous blob — flatten.
+        scalar_blobs = self.param_spec.pack_scalars(tuple(scalars))
+        push_bytes = b"".join(scalar_blobs)
+
+        # The driver's launch signature wants the SpvCompiledModule
+        # dataclass (with the pipeline handle + n_buffers + push
+        # validation), the workgroup grid, the buffer-handle list,
+        # and the push-constant bytes.
+        self.driver.launch(
+            self.module,
+            grid=self.grid_fn(*self.grid_args),
+            buffer_handles=handles,
+            push_bytes=push_bytes,
+        )
+        return None
 
     def launch_metal_fast(
         self,
