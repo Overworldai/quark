@@ -621,6 +621,53 @@ class TestExistingKernelsCompile:
         ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
         np.testing.assert_allclose(got, expected, rtol=0, atol=0)
 
+    def test_ada_rmsnorm_runs_end_to_end_against_numpy_reference(self, spv_device):
+        """``AdaRMSNormKernel`` runs E2E on Battlemage and matches its
+        own ``ada_rmsnorm_reference_numpy``. First kernel through the
+        SPV backend that uses ``ForLoopOp`` + carries (chunk-D
+        accumulation), proving the loop visitor is correct on a real
+        kernel — not just the synthetic ``test_for_loop_*`` cases."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.ada_rmsnorm.kernel import AdaRMSNormKernel
+        from quark.kernels.ada_rmsnorm.spec import AdaRMSNormSpec
+        from quark.kernels.ada_rmsnorm.config import AdaRMSNormConfig
+        from quark.kernels.ada_rmsnorm.reference import (
+            ada_rmsnorm_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        G, M, D = 1, 32, 128
+        B = G * M
+        spec = AdaRMSNormSpec(G=G, M=M, D=D, dtype=DType.F32)
+
+        rng = np.random.default_rng(0xADA_DEC0DE & 0xFFFFFFFF)
+        X = rng.standard_normal((B, D)).astype(np.float32)
+        scale = rng.standard_normal((G, D)).astype(np.float32) * 0.1
+        bias = rng.standard_normal((G, D)).astype(np.float32) * 0.1
+        expected = ada_rmsnorm_reference_numpy(spec, X=X, scale=scale, bias=bias)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            AdaRMSNormKernel, spec, AdaRMSNormConfig(n_warps=1, chunk_D=128),
+        )
+
+        x_h, x_map = _sd.allocate_buffer(X.nbytes)
+        s_h, s_map = _sd.allocate_buffer(scale.nbytes)
+        b_h, b_map = _sd.allocate_buffer(bias.nbytes)
+        o_h, o_map = _sd.allocate_buffer(B * D * 4)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+        ctypes.memmove(s_map, scale.ctypes.data, scale.nbytes)
+        ctypes.memmove(b_map, bias.ctypes.data, bias.nbytes)
+
+        ck.launch(buffers=[x_h, s_h, b_h, o_h])
+
+        got = np.empty((B, D), dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-4)
+
     def test_value_residual_packed_kernel_compiles(self, spv_device):
         """``ValueResidualPackedKernel`` — packed-QKV variant. First
         kernel through SPV that needs PRED-typed values (boolean SSA
