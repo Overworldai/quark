@@ -577,6 +577,50 @@ class TestExistingKernelsCompile:
         )
         assert ck.module.handle != 0
 
+    def test_elementwise_runs_end_to_end_against_numpy_reference(self, spv_device):
+        """Run ``ElementwiseKernel`` (op="add") on Battlemage and verify
+        it matches ``elementwise_reference_numpy``. Cohort backbone for
+        attention's scalar epilogues — proves the SPV launcher hands the
+        binary-op + vec_load/store path through correctly."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.elementwise.kernel import ElementwiseKernel
+        from quark.kernels.elementwise.spec import ElementwiseSpec
+        from quark.kernels.elementwise.config import ElementwiseConfig
+        from quark.kernels.elementwise.reference import (
+            elementwise_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        N = 256
+        rng = np.random.default_rng(0xCAFE_FACE & 0xFFFFFFFF)
+        X = rng.standard_normal(N).astype(np.float32)
+        Y = rng.standard_normal(N).astype(np.float32)
+        spec = ElementwiseSpec(N=N, dtype=DType.F32, op="add")
+        expected = elementwise_reference_numpy(spec, X=X, Y=Y)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            ElementwiseKernel,
+            spec,
+            ElementwiseConfig(n_warps=1, elems_per_block=N),
+        )
+
+        nbytes = N * 4
+        x_h, x_map = _sd.allocate_buffer(nbytes)
+        y_h, y_map = _sd.allocate_buffer(nbytes)
+        o_h, o_map = _sd.allocate_buffer(nbytes)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+        ctypes.memmove(y_map, Y.ctypes.data, Y.nbytes)
+
+        ck.launch(buffers=[x_h, y_h, o_h])
+
+        got = np.empty(N, dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
     def test_value_residual_packed_kernel_compiles(self, spv_device):
         """``ValueResidualPackedKernel`` — packed-QKV variant. First
         kernel through SPV that needs PRED-typed values (boolean SSA
