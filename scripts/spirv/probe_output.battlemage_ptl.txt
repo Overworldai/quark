@@ -1,0 +1,46 @@
+=== Device 0: Intel(R) Graphics (PTL) ===
+  vendor=0x8086  device=0xb080  type=1  apiVersion=1.4.335
+  limits.maxComputeWorkGroupInvocations = 1024
+  limits.maxComputeSharedMemorySize     = 49152  (48 KiB)
+  limits.maxPushConstantsSize           = 256
+  limits.maxComputeWorkGroupSize        = (1024, 1024, 1024)
+  subgroup.subgroupSize       = 32
+  subgroup.supportedStages   = Compute Vertex Fragment Geometry TessCtrl TessEval
+  subgroup.supportedOperations = basic vote arithmetic ballot shuffle shuffleRel clustered quad
+  bf16.shaderBFloat16Type             = yes
+  bf16.shaderBFloat16DotProduct       = yes
+  bf16.shaderBFloat16CooperativeMatrix= yes
+  atomic.f32Add(buf)   = yes    f32Add(smem) = no
+  atomic.f16Add(buf)   = no    f16Add(smem) = no
+  atomic.f16Min(buf)   = yes    f16Min(smem) = yes
+  coopmat: 6 shapes
+      M   N   K      A     B     C     R  scope    
+      8  16  16    f16   f16   f16   f16  subgroup 
+      8  16  16    f16   f16   f32   f32  subgroup 
+      8  16  16   bf16  bf16  bf16  bf16  subgroup 
+      8  16  16   bf16  bf16   f32   f32  subgroup 
+      8  16  32     s8    s8   s32   s32  subgroup 
+      8  16  32     u8    u8   u32   u32  subgroup 
+
+=== Device 1: llvmpipe (LLVM 21.1.8, 256 bits) ===
+  vendor=0x10005  device=0x0000  type=4  apiVersion=1.4.335
+  limits.maxComputeWorkGroupInvocations = 1024
+  limits.maxComputeSharedMemorySize     = 32768  (32 KiB)
+  limits.maxPushConstantsSize           = 256
+  limits.maxComputeWorkGroupSize        = (1024, 1024, 1024)
+  subgroup.subgroupSize       = 8
+  subgroup.supportedStages   = Compute Fragment
+  subgroup.supportedOperations = basic vote arithmetic ballot shuffle shuffleRel clustered quad
+  bf16.shaderBFloat16Type             = no
+  bf16.shaderBFloat16DotProduct       = no
+  bf16.shaderBFloat16CooperativeMatrix= no
+  atomic.f32Add(buf)   = yes    f32Add(smem) = yes
+  atomic.f16Add(buf)   = no    f16Add(smem) = no
+  atomic.f16Min(buf)   = no    f16Min(smem) = no
+  coopmat: 4 shapes
+      M   N   K      A     B     C     R  scope    
+      8   8   8    f16   f16   f16   f16  subgroup 
+      8   8   8    f16   f16   f32   f32  subgroup 
+      8   8   8     u8    u8   u32   u32  subgroup 
+      8   8   8     s8    s8   s32   s32  subgroup 
+

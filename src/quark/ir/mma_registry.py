@@ -52,14 +52,20 @@ class MmaConfig:
     * ``min_cuda_cc`` + ``cuda``    — CUDA  (PTX mnemonic suffix)
     * ``min_metal_gen`` + ``metal`` — Metal (MSL tiling
       ``"<frag_dtype>:<mf>:<nf>:<kf>"`` consumed by ``_parse_msl_tiling``)
+    * ``min_intel_gpu_gen`` + ``intel_gpu`` — Intel SPIR-V (Vulkan
+      KHR_cooperative_matrix). The payload is a tag the SPIR-V
+      lowerer parses; today the only emitted form is
+      ``"khr:subgroup"`` (subgroup-scope KHR coopmat — Battlemage
+      doesn't expose workgroup scope).
 
     Gate semantics: ``min_*=None`` means the shape has no path on that
     backend at all. ``shapes_for_chip`` filters the descriptor list
     against the active device's ``ChipGeneration``: CUDA chips pass iff
     ``chip.cuda_cc() >= min_cuda_cc``; Metal chips pass iff
-    ``chip >= min_metal_gen`` in the enum's declaration order. A
-    descriptor with every gate ``None`` is rejected by any chip
-    (mis-registered).
+    ``chip >= min_metal_gen`` in the Metal-gen declaration order;
+    Intel chips pass iff ``chip >= min_intel_gpu_gen`` in the
+    Xe-gen declaration order. A descriptor with every gate ``None``
+    is rejected by any chip (mis-registered).
 
     Payload semantics: the value is a backend-opaque string that the
     lowerer parses. ``None`` (default) means no lowering — if the gate
@@ -85,6 +91,10 @@ class MmaConfig:
     # --- Metal backend ---
     min_metal_gen: Optional[ChipGeneration] = None
     metal: Optional[str] = None  # MSL tiling ``"<frag_dtype>:<mf>:<nf>:<kf>"``
+
+    # --- Intel SPIR-V backend (Vulkan KHR_cooperative_matrix) ---
+    min_intel_gpu_gen: Optional[ChipGeneration] = None
+    intel_gpu: Optional[str] = None  # tag, e.g. ``"khr:subgroup"``
 
     @property
     def shape_id(self) -> str:
@@ -481,6 +491,146 @@ _BF16_M32N32K16_NAX = MmaConfig(
 )
 
 
+# ---------------------------------------------------------------------------
+# Intel SPIR-V cooperative-matrix shapes (Battlemage / Xe2+).
+#
+# Captured from ``scripts/spirv/probe_coopmat`` on Intel Panther Lake
+# (Xe3 iGPU, vendor=0x8086 device=0xb080, Mesa 26.0.3). All entries are
+# ``subgroup`` scope — Battlemage doesn't expose workgroup-scope coopmat.
+#
+# Per-fragment shape is fixed at ``m=8, n=16, k=16`` for fp16/bf16 (Intel's
+# matrix engine native tile). Compare to PTX m16n8k16 (transposed M/N
+# convention) and Apple NAX m16n32k16 (different per-fragment dims). Tile
+# multiples on Intel: ``BM % 8 == 0``, ``BN % 16 == 0``, ``BK % 16 == 0``.
+#
+# Two acc-dtype variants are registered for both fp16 and bf16:
+#   * ``_F32`` — accumulate in f32 (the standard "compute_dtype=bf16,
+#     acc=f32" path; what the autotuned configs assume).
+#   * ``_BF16`` / ``_F16`` — accumulate in the input dtype (lossy but
+#     exposed by Intel for memory-bound kernels that don't need full f32
+#     accumulation; left registered so kernel authors can opt in via
+#     ``compute_dtype=bf16, acc=bf16`` if a future kernel benefits).
+#
+# Per-register lane offsets and reg counts are placeholders (matching
+# the PTX m16n8 layout) — the SPIR-V lowerer doesn't consume the
+# per-register coordinate map (KHR cooperative_matrix's lane↔element
+# mapping is driver-private; element access goes through
+# ``OpCooperativeMatrixLengthKHR``). Kept non-empty so the MmaConfig
+# dataclass invariants pass.
+# ---------------------------------------------------------------------------
+
+# Placeholder per-register layout for Intel SPIR-V coopmat shapes. The
+# SPIR-V lowerer never consults this — the KHR cooperative_matrix
+# mapping is driver-private; per-element access uses
+# ``OpCooperativeMatrixLengthKHR`` indexing. Filled in with the same
+# byte pattern across all Intel shapes for consistency.
+_INTEL_PLACEHOLDER_OFFSETS = ((0, 0),)
+
+_BF16_M8N16K16_INTEL_F32 = MmaConfig(
+    shape=MmaShape(
+        name="m8n16k16_intel_bf16_f32",
+        m=8,
+        n=16,
+        k=16,
+        a_dtype=DType.BF16,
+        b_dtype=DType.BF16,
+        acc_dtype=DType.F32,
+        # Reg counts are nominal — the SPIR-V lowerer derives storage
+        # from the cooperative_matrix type the driver allocates, not
+        # from these fields. Kept truthful-ish so callers that
+        # introspect (e.g. autotune budget calcs) don't divide by zero.
+        a_regs=4,  # 8m × 16k bf16 / 32 lanes = 4 elements/lane
+        b_regs=8,  # 16n × 16k bf16 / 32 lanes = 8 elements/lane
+        c_regs=4,  # 8m × 16n f32 / 32 lanes = 4 elements/lane
+    ),
+    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    lane_col_step=2,  # bf16 in b32 carrier
+    min_cuda_cc=None,
+    cuda=None,
+    min_metal_gen=None,
+    metal=None,
+    min_intel_gpu_gen=ChipGeneration.INTEL_XE2,
+    intel_gpu="khr:subgroup",
+)
+
+_BF16_M8N16K16_INTEL_BF16 = MmaConfig(
+    shape=MmaShape(
+        name="m8n16k16_intel_bf16_bf16",
+        m=8,
+        n=16,
+        k=16,
+        a_dtype=DType.BF16,
+        b_dtype=DType.BF16,
+        acc_dtype=DType.BF16,
+        a_regs=4,
+        b_regs=8,
+        c_regs=4,  # 8m × 16n bf16 / 32 lanes = 4 elements/lane
+    ),
+    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    lane_col_step=2,
+    min_cuda_cc=None,
+    cuda=None,
+    min_metal_gen=None,
+    metal=None,
+    min_intel_gpu_gen=ChipGeneration.INTEL_XE2,
+    intel_gpu="khr:subgroup",
+)
+
+_F16_M8N16K16_INTEL_F32 = MmaConfig(
+    shape=MmaShape(
+        name="m8n16k16_intel_f16_f32",
+        m=8,
+        n=16,
+        k=16,
+        a_dtype=DType.F16,
+        b_dtype=DType.F16,
+        acc_dtype=DType.F32,
+        a_regs=4,
+        b_regs=8,
+        c_regs=4,
+    ),
+    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    lane_col_step=2,
+    min_cuda_cc=None,
+    cuda=None,
+    min_metal_gen=None,
+    metal=None,
+    min_intel_gpu_gen=ChipGeneration.INTEL_XE2,
+    intel_gpu="khr:subgroup",
+)
+
+_F16_M8N16K16_INTEL_F16 = MmaConfig(
+    shape=MmaShape(
+        name="m8n16k16_intel_f16_f16",
+        m=8,
+        n=16,
+        k=16,
+        a_dtype=DType.F16,
+        b_dtype=DType.F16,
+        acc_dtype=DType.F16,
+        a_regs=4,
+        b_regs=8,
+        c_regs=4,
+    ),
+    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    lane_col_step=2,
+    min_cuda_cc=None,
+    cuda=None,
+    min_metal_gen=None,
+    metal=None,
+    min_intel_gpu_gen=ChipGeneration.INTEL_XE2,
+    intel_gpu="khr:subgroup",
+)
+
+
 ALL_SHAPES: tuple[MmaConfig, ...] = (
     _BF16_M8N8K8,  # Metal-native 8x8x8
     _BF16_M16N8K8,  # PTX m16n8k8 (Ampere+)
@@ -493,6 +643,11 @@ ALL_SHAPES: tuple[MmaConfig, ...] = (
     _E4M3_K32,
     _E5M2_K32,
     _BF16xE4M3_K16,
+    # Intel SPIR-V — KHR cooperative_matrix (subgroup scope) on Xe2+.
+    _BF16_M8N16K16_INTEL_F32,
+    _BF16_M8N16K16_INTEL_BF16,
+    _F16_M8N16K16_INTEL_F32,
+    _F16_M8N16K16_INTEL_F16,
 )
 
 # Reverse index for O(1) shape_id → config lookups. Built once at
@@ -519,7 +674,11 @@ _BY_SHAPE_ID: dict[str, MmaConfig] = {cfg.shape_id: cfg for cfg in ALL_SHAPES}
 # dataclass instances.
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_FAMILIES: tuple[DeviceFamily, ...] = (DeviceFamily.CUDA, DeviceFamily.METAL)
+_SUPPORTED_FAMILIES: tuple[DeviceFamily, ...] = (
+    DeviceFamily.CUDA,
+    DeviceFamily.METAL,
+    DeviceFamily.INTEL_GPU,
+)
 
 _MMA_CONFIG_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in dataclasses.fields(MmaConfig))
 for _fam in _SUPPORTED_FAMILIES:
@@ -595,9 +754,19 @@ _TABLE_COLLISIONS: set[tuple[str, str, int]] = set()
 # NAX shapes (M5+) are only reachable via shapes_for_chip + main_shape;
 # exclude from the legacy (a, b, k) table to avoid collisions with the
 # same-dtype same-k simdgroup_matrix shapes that the fallback path uses.
+# Intel SPIR-V shapes are similarly only reachable via shapes_for_chip
+# (no PTX path, no MSL path) — exclude from the legacy table by
+# checking ``min_intel_gpu_gen`` is set.
 _LEGACY_EXCLUDE_GENS = {ChipGeneration.METAL_M5}
 for _cfg in ALL_SHAPES:
     if _cfg.min_metal_gen in _LEGACY_EXCLUDE_GENS and _cfg.min_cuda_cc is None:
+        continue
+    if (
+        _cfg.min_intel_gpu_gen is not None
+        and _cfg.min_cuda_cc is None
+        and _cfg.min_metal_gen is None
+    ):
+        # Intel-only shape — never reach the legacy (a, b, k) table.
         continue
     _a = _dtype_key(_cfg.shape.a_dtype)
     _b = _dtype_key(_cfg.shape.b_dtype)
@@ -649,6 +818,18 @@ def _metal_gen_index(gen: ChipGeneration) -> int:
     return _METAL_GEN_ORDER.index(gen)
 
 
+# Intel Xe gens, ordered ascending. Used for ``min_intel_gpu_gen`` filter.
+_INTEL_GPU_GEN_ORDER: tuple[ChipGeneration, ...] = (
+    ChipGeneration.INTEL_XE_LPG,  # Meteor Lake
+    ChipGeneration.INTEL_XE2,  # Lunar Lake / Battlemage discrete
+    ChipGeneration.INTEL_XE3,  # Panther Lake / Battlemage+
+)
+
+
+def _intel_gpu_gen_index(gen: ChipGeneration) -> int:
+    return _INTEL_GPU_GEN_ORDER.index(gen)
+
+
 def _supports(cfg: MmaConfig, gen: ChipGeneration) -> bool:
     if gen.is_cuda:
         if cfg.min_cuda_cc is None:
@@ -661,6 +842,13 @@ def _supports(cfg: MmaConfig, gen: ChipGeneration) -> bool:
             return False
         try:
             return _metal_gen_index(gen) >= _metal_gen_index(cfg.min_metal_gen)
+        except ValueError:
+            return False
+    if gen.is_intel_gpu:
+        if cfg.min_intel_gpu_gen is None:
+            return False
+        try:
+            return _intel_gpu_gen_index(gen) >= _intel_gpu_gen_index(cfg.min_intel_gpu_gen)
         except ValueError:
             return False
     return False  # UNKNOWN or other families — no shapes

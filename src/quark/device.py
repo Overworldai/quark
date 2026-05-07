@@ -85,6 +85,11 @@ class ChipGeneration(Enum):
     METAL_M1 = "metal_m1"  # A14 / M1 / M2 — simdgroup_matrix baseline
     METAL_M3 = "metal_m3"  # M3 / M3 Pro / M3 Max / M3 Ultra — bf16 MMA native
     METAL_M5 = "metal_m5"  # M5+ — direct tensor-core primitive (reserved)
+    # Intel GPU (SPIR-V via Vulkan + VK_KHR_cooperative_matrix). Ordered
+    # by Xe microarchitecture generation.
+    INTEL_XE_LPG = "intel_xe_lpg"  # Meteor Lake iGPU
+    INTEL_XE2 = "intel_xe2"  # Lunar Lake iGPU + discrete Arc B-series (Battlemage)
+    INTEL_XE3 = "intel_xe3"  # Panther Lake iGPU + future discrete (Battlemage+)
     # Fallback.
     UNKNOWN = "unknown"
 
@@ -95,6 +100,10 @@ class ChipGeneration(Enum):
     @property
     def is_metal(self) -> bool:
         return self.name.startswith("METAL_")
+
+    @property
+    def is_intel_gpu(self) -> bool:
+        return self.name.startswith("INTEL_")
 
     def cuda_cc(self) -> tuple[int, int] | None:
         """CUDA compute capability (major, minor) for CUDA chips; None else."""
@@ -128,6 +137,52 @@ def chip_gen_from_cuda_cc(major: int, minor: int) -> ChipGeneration:
         if cc <= (major, minor):
             return gen
     return ChipGeneration.UNKNOWN
+
+
+def chip_gen_from_intel_info(info: dict) -> ChipGeneration:
+    """Map Intel Vulkan device info to ``ChipGeneration``.
+
+    ``info`` is a dict with ``device_name`` (e.g. ``"Intel(R) Graphics
+    (PTL)"``), ``device_id`` (the Vulkan ``deviceID`` int — Intel
+    encodes the Xe arch generation in the upper nibble), and optionally
+    ``driver_info`` (Mesa version string, useful for forcing a known
+    chip when ``deviceID`` is opaque on early hardware).
+
+    Falls back to ``INTEL_XE2`` (the safe baseline that supports
+    ``VK_KHR_cooperative_matrix``) when the device name doesn't match a
+    known generation; UNKNOWN is reserved for non-Intel devices.
+
+    Generation map (per Mesa's ``intel_device_info`` + Vulkan
+    ``deviceID`` upper-nibble convention):
+      * 0x9...  → Xe-LPG (Meteor Lake)
+      * 0xa...  → Xe2 (Lunar Lake, Battlemage discrete)
+      * 0xb...  → Xe3 (Panther Lake, Battlemage+)
+    """
+    name = str(info.get("device_name", "")).lower()
+    device_id = info.get("device_id", 0)
+    if isinstance(device_id, int):
+        nibble = (device_id >> 12) & 0xF
+    else:
+        nibble = 0
+    # Direct device-id nibble mapping — first source of truth.
+    if nibble == 0xB:
+        return ChipGeneration.INTEL_XE3
+    if nibble == 0xA:
+        return ChipGeneration.INTEL_XE2
+    if nibble == 0x9:
+        return ChipGeneration.INTEL_XE_LPG
+    # Name-based fallback for hardware where the deviceID nibble
+    # convention doesn't apply yet (e.g. early dev-kit firmware).
+    if "(ptl)" in name or "panther lake" in name:
+        return ChipGeneration.INTEL_XE3
+    if "lunar lake" in name or "(lnl)" in name or "arc b" in name:
+        return ChipGeneration.INTEL_XE2
+    if "meteor lake" in name or "(mtl)" in name:
+        return ChipGeneration.INTEL_XE_LPG
+    # Unknown Intel chip — assume Xe2 (the lowest gen with KHR
+    # cooperative_matrix exposed). Picking newer would silently skip
+    # shape filters that older hardware might not support.
+    return ChipGeneration.INTEL_XE2
 
 
 def chip_gen_from_metal_info(info: dict) -> ChipGeneration:

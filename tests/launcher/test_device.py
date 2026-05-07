@@ -10,9 +10,10 @@ from quark.device import (
     _detect_family,
     _forced_family,
     chip_gen_from_cuda_cc,
+    chip_gen_from_intel_info,
     make_test_device,
 )
-from quark.ir.mma_registry import shapes_for_chip
+from quark.ir.mma_registry import payload_for, shapes_for_chip
 
 
 class TestDeviceFamily:
@@ -77,6 +78,55 @@ class TestDeviceCaps:
 
     def test_matmul_shapes_for_unknown_chip_is_empty(self):
         assert shapes_for_chip(ChipGeneration.UNKNOWN) == frozenset()
+
+    def test_intel_xe3_has_battlemage_coopmat_shapes(self):
+        # Captured from `scripts/spirv/probe_coopmat` on Intel Panther
+        # Lake (Xe3 iGPU). bf16/f16 input × bf16/f16/f32 acc — int8
+        # variants are TODO (not yet registered).
+        s = shapes_for_chip(ChipGeneration.INTEL_XE3)
+        assert "m8n16k16_intel_bf16_f32" in s
+        assert "m8n16k16_intel_bf16_bf16" in s
+        assert "m8n16k16_intel_f16_f32" in s
+        assert "m8n16k16_intel_f16_f16" in s
+        # No CUDA / Metal shapes leak in.
+        assert "m16n8k16_bf16" not in s  # PTX
+        assert "m16n32k16_nax_bf16" not in s  # NAX
+
+    def test_intel_xe2_matches_xe3_baseline(self):
+        # Battlemage discrete + Lunar Lake iGPU expose the same coopmat
+        # shapes as Panther Lake's Xe3 iGPU. ``min_intel_gpu_gen`` for
+        # the registered shapes is INTEL_XE2, so both gens match.
+        assert shapes_for_chip(ChipGeneration.INTEL_XE2) == shapes_for_chip(
+            ChipGeneration.INTEL_XE3
+        )
+
+    def test_intel_xe_lpg_has_no_coopmat_shapes(self):
+        # Meteor Lake (Xe-LPG) precedes the cooperative_matrix-shipping
+        # generations. Empty until we re-probe on actual Xe-LPG hardware
+        # and lower the ``min_intel_gpu_gen`` gate accordingly.
+        assert shapes_for_chip(ChipGeneration.INTEL_XE_LPG) == frozenset()
+
+    def test_intel_payload_resolves_only_on_intel_gpu_family(self):
+        assert (
+            payload_for("m8n16k16_intel_bf16_f32", DeviceFamily.INTEL_GPU)
+            == "khr:subgroup"
+        )
+        assert payload_for("m8n16k16_intel_bf16_f32", DeviceFamily.CUDA) is None
+        assert payload_for("m8n16k16_intel_bf16_f32", DeviceFamily.METAL) is None
+
+    def test_chip_gen_from_intel_info_panther_lake(self):
+        # Probe captured: vendor=0x8086, device=0xb080, name="Intel(R) Graphics (PTL)"
+        gen = chip_gen_from_intel_info(
+            {"device_name": "Intel(R) Graphics (PTL)", "device_id": 0xB080}
+        )
+        assert gen is ChipGeneration.INTEL_XE3
+
+    def test_chip_gen_from_intel_info_unknown_falls_back_to_xe2(self):
+        # Unknown future Intel chip — never silently skips shape filters.
+        gen = chip_gen_from_intel_info(
+            {"device_name": "Intel(R) Graphics (Future)", "device_id": 0x0}
+        )
+        assert gen is ChipGeneration.INTEL_XE2
 
     def test_chip_gen_from_cuda_cc_maps_newer_to_older_on_unknown(self):
         # sm_99 doesn't exist; falls back to nearest-older we know.
