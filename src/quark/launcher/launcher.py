@@ -758,6 +758,7 @@ class Launcher:
 
         CUDA: IR Module -> PtxLowerer -> LoweredKernel
         Metal: IR Module -> MslLowerer -> LoweredMslKernel
+        SPIR-V: IR Module -> SpirVLowerer -> LoweredSpirVKernel
         """
         if isinstance(ir_or_program, Module):
             from quark.lower import get_lowerer
@@ -768,6 +769,16 @@ class Launcher:
             # registered (phase-2.1 default). Rewrites land in phase 2.2.
             legalize(ir_or_program, self.device.caps)
             lowerer = get_lowerer(self.device.family, self.device.caps)
+            # SPIR-V's ``LocalSize`` execution mode is baked into the
+            # binary at lower-time, so the lowerer needs the kernel's
+            # block dim or the dispatched workgroup geometry will not
+            # match what the kernel was authored against. CUDA / Metal
+            # don't have this issue — the dispatch system passes the
+            # block dim per-launch.
+            if self.device.family is DeviceFamily.INTEL_GPU:
+                block = kernel.block()
+                if hasattr(lowerer, "_local_size"):
+                    lowerer._local_size = block
             return lowerer.lower_module(ir_or_program)
         raise NotImplementedError(
             "Launcher._lower: legacy Program-based emit() not yet "

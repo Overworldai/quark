@@ -668,6 +668,71 @@ class TestExistingKernelsCompile:
         ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
         np.testing.assert_allclose(got, expected, rtol=0, atol=1e-4)
 
+    def test_value_residual_packed_runs_end_to_end_against_numpy_reference(
+        self, spv_device,
+    ):
+        """``ValueResidualPackedKernel`` runs E2E and matches its
+        reference. First kernel through SPV that uses
+        - PRED-typed values + ``OpLogicalAnd`` (the v-col bounds gate),
+        - 4 chunks (D_full // chunk_D = 4), so ``run_pipeline`` engages
+          the double-buffer path with two consume calls in the loop
+          body — both the iter_a (stage 0) and iter_b (stage 1) writes
+          must hit Out, which depends on the kernel's expected
+          workgroup size matching ``LocalSize`` (was wrong before — see
+          launcher's INTEL_GPU branch in ``_lower``)."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.value_residual_packed.kernel import (
+            ValueResidualPackedKernel,
+        )
+        from quark.kernels.value_residual_packed.spec import (
+            ValueResidualPackedSpec,
+        )
+        from quark.kernels.value_residual_packed.config import (
+            ValueResidualPackedConfig,
+        )
+        from quark.kernels.value_residual_packed.reference import (
+            value_residual_packed_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        M, D_full = 4, 512
+        v_col_offset, v_width = 256, 256
+        spec = ValueResidualPackedSpec(
+            M=M, D_full=D_full, v_col_offset=v_col_offset, v_width=v_width,
+            dtype=DType.F32,
+        )
+
+        rng = np.random.default_rng(0xC0DE_FEED)
+        QKV_curr = rng.standard_normal((M, D_full)).astype(np.float32)
+        QKV_first = rng.standard_normal((M, D_full)).astype(np.float32)
+        lamb = np.array([0.42], dtype=np.float32)
+        expected = value_residual_packed_reference_numpy(
+            spec, QKV_curr=QKV_curr, QKV_first=QKV_first, lamb=lamb,
+        )
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            ValueResidualPackedKernel, spec,
+            ValueResidualPackedConfig(n_warps=1, chunk_D=128),
+        )
+
+        c_h, c_map = _sd.allocate_buffer(QKV_curr.nbytes)
+        f_h, f_map = _sd.allocate_buffer(QKV_first.nbytes)
+        l_h, l_map = _sd.allocate_buffer(lamb.nbytes)
+        o_h, o_map = _sd.allocate_buffer(M * D_full * 4)
+        ctypes.memmove(c_map, QKV_curr.ctypes.data, QKV_curr.nbytes)
+        ctypes.memmove(f_map, QKV_first.ctypes.data, QKV_first.nbytes)
+        ctypes.memmove(l_map, lamb.ctypes.data, lamb.nbytes)
+
+        ck.launch(buffers=[c_h, f_h, l_h, o_h])
+
+        got = np.empty((M, D_full), dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-5)
+
     def test_value_residual_packed_kernel_compiles(self, spv_device):
         """``ValueResidualPackedKernel`` — packed-QKV variant. First
         kernel through SPV that needs PRED-typed values (boolean SSA
