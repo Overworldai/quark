@@ -43,6 +43,47 @@ import torch
 from quark.models.waypoint_15 import CtrlInput, QuantConfig
 
 _IS_METAL = sys.platform == "darwin"
+_IS_LINUX = sys.platform == "linux"
+
+
+def _detect_engine_family():
+    """Pick the right ``Engine`` subclass for this host.
+
+    Resolution order:
+      1. ``QUARK_FORCE_ENGINE`` env var (one of ``cuda`` / ``metal`` /
+         ``intel``) — wins for testing / dev.
+      2. macOS  → ``metal``.
+      3. Linux  → ``intel`` if a Vulkan ICD is reachable, else ``cuda``.
+         CUDA stays the default on Linux because the production
+         deployment is NVIDIA today; Intel becomes the default in a
+         later commit once the lowerer + driver are real.
+      4. Anything else → ``cuda``.
+
+    Returns one of the strings above. The actual subclass import +
+    dispatch happens in ``Engine.__new__``.
+    """
+    import os  # noqa: PLC0415
+
+    forced = os.environ.get("QUARK_FORCE_ENGINE", "").strip().lower()
+    if forced in ("cuda", "metal", "intel"):
+        return forced
+    if _IS_METAL:
+        return "metal"
+    if _IS_LINUX:
+        # Probe Vulkan only when explicitly requested via env. Default
+        # behaviour stays "CUDA on Linux" so existing CI / production
+        # workflows aren't disrupted by a Vulkan-detected redirect to
+        # the (still-stub) Intel engine. Flip the default once §3.7
+        # lands a usable EngineIntel.
+        if os.environ.get("QUARK_PROBE_INTEL_FIRST") == "1":
+            try:
+                from quark.drivers import spv  # noqa: PLC0415
+                if spv.is_available():
+                    return "intel"
+            except ImportError:
+                pass
+        return "cuda"
+    return "cuda"
 
 
 def _qt_from_torch(t: torch.Tensor, dtype: str = "bf16"):
@@ -154,13 +195,15 @@ class Engine:
 
     def __new__(cls, *_args, **_kwargs):
         if cls is Engine:
-            if _IS_METAL:
+            family = _detect_engine_family()
+            if family == "metal":
                 from quark.engine.metal import EngineMetal
-
                 cls = EngineMetal
+            elif family == "intel":
+                from quark.engine.intel import EngineIntel
+                cls = EngineIntel
             else:
                 from quark.engine.cuda import EngineCUDA
-
                 cls = EngineCUDA
         return object.__new__(cls)
 

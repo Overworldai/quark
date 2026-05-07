@@ -4,7 +4,9 @@ The engine is a package: this ``__init__.py`` is just the public-
 import shim. ``Engine(model_uri, ...)`` constructs a platform-
 appropriate concrete subclass via the ``__new__`` factory in
 :mod:`quark.engine.base` — :class:`EngineCUDA` on Linux / Windows /
-CUDA Macs, :class:`EngineMetal` on Apple Silicon.
+CUDA Macs, :class:`EngineMetal` on Apple Silicon, :class:`EngineIntel`
+on Linux + Vulkan when ``QUARK_FORCE_ENGINE=intel`` (or Vulkan probing
+is opted into).
 
 Backend modules:
 
@@ -18,6 +20,11 @@ Backend modules:
     eagerly under ``quark.lazy()`` (Metal has no graph capture), VAE
     runs on the Apple Neural Engine via ``quark.taehv``, latent
     boundary is plain numpy.
+  * :mod:`quark.engine.intel` — :class:`EngineIntel`. Stub today —
+    construction + caps are wired against ``drivers.spv.SpvDriver``,
+    inference methods raise ``NotImplementedError`` until the
+    PORTABILITY_PLAN §3.2 SpirVLowerer + §3.4 OpenVINO-TAEHV path
+    land.
 
 Adding a new backend is one new ``EngineX(Engine)`` subclass plus a
 branch in :meth:`Engine.__new__`; nothing in :class:`Engine` itself
@@ -28,7 +35,8 @@ from __future__ import annotations
 
 from quark.engine.base import Engine
 from quark.engine.cuda import EngineCUDA
+from quark.engine.intel import EngineIntel
 from quark.engine.metal import EngineMetal
 from quark.models.waypoint_15 import CtrlInput
 
-__all__ = ["CtrlInput", "Engine", "EngineCUDA", "EngineMetal"]
+__all__ = ["CtrlInput", "Engine", "EngineCUDA", "EngineIntel", "EngineMetal"]
