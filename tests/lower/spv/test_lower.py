@@ -523,3 +523,172 @@ def test_vec_add_with_bounds_end_to_end(driver):
     got = np.empty(n, dtype=np.float32)
     ctypes.memmove(got.ctypes.data, c_map, got.nbytes)
     np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
+def _build_for_loop_accum_ir(n: int, n_iters: int):
+    """Per-thread accumulator: ``Out[t] = sum_{k=0}^{n_iters-1} X[t]``.
+
+    Exercises ``ForLoopOp`` + carries: the loop carries an F32
+    accumulator, the body adds ``X[t]`` to it once per iteration. After
+    ``n_iters`` iterations the carry equals ``X[t] * n_iters``, which we
+    write to ``Out[t]``. Catches OpPhi at the loop header, OpCopyObject
+    for the yielded carry, and the merge-block exit value.
+    """
+    import quark.lang as qk
+
+    b = Builder("for_loop_module")
+    fn = b.begin_function("for_loop_accum")
+    b.param("X", BufferType(DType.F32))
+    b.param("Out", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_o = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Out", param=fn.params[1])
+
+    tid = b.thread_idx("x")
+    x_t = b.load(g_x, tid)
+    zero_f = b.const(DType.F32, 0.0)
+    lo = b.const(DType.U32, 0)
+    hi = b.const(DType.U32, n_iters)
+    step = b.const(DType.U32, 1)
+    with b.for_loop(lo, hi, step, iv_name="k", carried=(zero_f,)) as (
+        _k, (acc_in,),
+    ):
+        new_acc = b.add(acc_in, x_t)
+        b.yield_(new_acc)
+    final_acc = b.last_results[0]
+    b.store(g_o, final_acc, tid)
+    b.end_function()
+    return b.module
+
+
+class TestForLoopTextEmit:
+    """Tier 1 — for_loop visitor must emit the structured-loop skeleton
+    (preheader + header with phi + cond + loop merge + body + continue
+    with iv increment + merge), independent of any Vulkan device."""
+
+    def test_emits_loop_skeleton(self):
+        result = SpirVLowerer(local_size=(8, 1, 1)).lower_module(
+            _build_for_loop_accum_ir(8, n_iters=4)
+        )
+        src = result.source
+        # Structured loop primitives.
+        assert "OpLoopMerge" in src
+        assert "OpPhi" in src
+        # iv increment via OpIAdd in the continue block.
+        assert "OpIAdd" in src
+        # Carry materialisation at YieldOp.
+        assert "OpCopyObject" in src
+        # Loop predicate uses ULessThan on u32 induction.
+        assert "OpULessThan" in src
+
+
+@pytestmark_e2e
+def test_for_loop_accum_end_to_end(driver):
+    """End-to-end: build a for_loop kernel with an F32 carry, lower it,
+    dispatch it on the Vulkan device, and verify
+    ``Out[t] == X[t] * n_iters``. This is the first kernel through the
+    SPIR-V backend that uses ``ForLoopOp`` + carries."""
+    from quark.lower.spv import text_to_binary
+
+    n = 64
+    n_iters = 5
+    rng = np.random.default_rng(0xF00DCAFE)
+    X = rng.standard_normal(n).astype(np.float32)
+    expected = X * n_iters
+
+    result = SpirVLowerer(local_size=(n, 1, 1)).lower_module(
+        _build_for_loop_accum_ir(n, n_iters=n_iters)
+    )
+    binary = text_to_binary(result.source)
+
+    nbytes = n * 4
+    x_h, x_map = driver.allocate_buffer(nbytes)
+    o_h, o_map = driver.allocate_buffer(nbytes)
+    ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+    compiled = driver.compile(
+        source=binary,
+        entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [x_h, o_h], push_bytes=b"")
+
+    got = np.empty(n, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+
+
+def _build_for_loop_window_sum_ir(n: int, win: int):
+    """Per-thread sliding-window sum: ``Out[t] = sum_{k=0}^{win-1} X[t+k]``.
+
+    Loop body uses the induction variable to compute a varying load
+    address, so this kernel exercises the iv path through OpPhi (not
+    just the carry path of ``test_for_loop_accum_end_to_end``). X is
+    sized ``n + win`` so the trailing window is in-bounds for every
+    thread ``t in [0, n)``.
+    """
+    import quark.lang as qk
+
+    b = Builder("for_loop_window")
+    fn = b.begin_function("for_loop_window")
+    b.param("X", BufferType(DType.F32))
+    b.param("Out", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n + win,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_o = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Out", param=fn.params[1])
+
+    tid = b.thread_idx("x")
+    zero_f = b.const(DType.F32, 0.0)
+    lo = b.const(DType.U32, 0)
+    hi = b.const(DType.U32, win)
+    step = b.const(DType.U32, 1)
+    with b.for_loop(lo, hi, step, iv_name="k", carried=(zero_f,)) as (
+        k, (acc_in,),
+    ):
+        addr = b.add(tid, k)
+        x_v = b.load(g_x, addr)
+        new_acc = b.add(acc_in, x_v)
+        b.yield_(new_acc)
+    final_acc = b.last_results[0]
+    b.store(g_o, final_acc, tid)
+    b.end_function()
+    return b.module
+
+
+@pytestmark_e2e
+def test_for_loop_window_sum_end_to_end(driver):
+    """Sliding-window sum exercising both iv-derived loads AND a carry.
+    Catches the case where the OpPhi-emitted iv is mis-routed (e.g.
+    confused with the next-iteration value) in the body — a windowed
+    load makes that bug visible whereas an iv-free body doesn't."""
+    from quark.lower.spv import text_to_binary
+
+    n = 64
+    win = 4
+    rng = np.random.default_rng(0xC0FFEE_5A5A & 0xFFFFFFFF)
+    X = rng.standard_normal(n + win).astype(np.float32)
+    expected = np.array([X[t : t + win].sum() for t in range(n)], dtype=np.float32)
+
+    result = SpirVLowerer(local_size=(n, 1, 1)).lower_module(
+        _build_for_loop_window_sum_ir(n, win=win)
+    )
+    binary = text_to_binary(result.source)
+
+    x_h, x_map = driver.allocate_buffer((n + win) * 4)
+    o_h, o_map = driver.allocate_buffer(n * 4)
+    ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+    compiled = driver.compile(
+        source=binary,
+        entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [x_h, o_h], push_bytes=b"")
+
+    got = np.empty(n, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)

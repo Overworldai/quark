@@ -47,6 +47,7 @@ from quark.ir.op import (
     CmpOp,
     ConstOp,
     ConvertOp,
+    ForLoopOp,
     GroupIdOp,
     IfRegionOp,
     LaneIdOp,
@@ -143,6 +144,13 @@ class _SpvCtx:
     # SharedRegion.alloc.id (which equals the SmemAllocOp's
     # backing Value id).
     smem_allocs: dict[int, tuple[str, str, str, int]] = field(default_factory=dict)
+    # Stack of pending loop-yield targets. Each entry is the list of
+    # ``(target_id, type_id)`` slots a ``YieldOp`` inside the loop body
+    # should ``OpCopyObject`` into so the surrounding ``ForLoopOp``'s
+    # ``OpPhi`` at the header can reference a known SSA id (allocated
+    # by ``_visit_for_loop`` upfront, defined via OpCopyObject when the
+    # body's YieldOp fires). Stack-shaped to allow nested for-loops.
+    loop_yield_stack: list[list[tuple[str, str]]] = field(default_factory=list)
 
 
 # Map quark DType values → (SPIR-V type emitter method name, byte width).
@@ -677,19 +685,178 @@ def _visit_if_region(op: IfRegionOp, ctx: _SpvCtx) -> None:
 
 
 def _visit_yield(op: YieldOp, ctx: _SpvCtx) -> None:
-    """``YieldOp`` inside if/for body. With no carries (the path
-    we support today) it's a no-op: the region's terminator gets
-    handled by the surrounding visitor's ``OpBranch`` emit.
+    """``YieldOp`` inside if/for body.
 
-    When carries land (PORTABILITY_PLAN §3.2 follow-up), this
-    visitor will record the per-arm yielded values for the surrounding
-    op's OpPhi emit at merge.
+    Without carries (the if-without-carries path), this is a pure
+    no-op: the region's terminator is consumed by the surrounding
+    visitor's ``OpBranch``.
+
+    Inside a ``ForLoopOp`` body with carries, ``_visit_for_loop``
+    pushes a list of ``(target_id, type_id)`` slots onto
+    ``ctx.loop_yield_stack``. We materialise each yielded value into
+    its pre-allocated target id with ``OpCopyObject`` so the loop
+    header's ``OpPhi`` (already emitted, referencing those ids as a
+    forward declaration) resolves cleanly through ``spirv-as``.
     """
-    if op.operands:
+    if not op.operands:
+        return
+    if not ctx.loop_yield_stack:
         raise NotImplementedError(
-            "_visit_yield: yielding values from a region requires "
-            "OpPhi support (carry path). See PORTABILITY_PLAN §3.2."
+            "_visit_yield: yielding values from a region without a "
+            "surrounding for/while loop (likely if/else with carries) "
+            "needs OpPhi merge — not yet wired. See PORTABILITY_PLAN §3.2."
         )
+    targets = ctx.loop_yield_stack[-1]
+    if len(targets) != len(op.operands):
+        raise RuntimeError(
+            f"_visit_yield: yielded {len(op.operands)} values vs "
+            f"{len(targets)} carries"
+        )
+    for (target_id, type_id), val in zip(targets, op.operands, strict=False):
+        src_id = ctx.val_to_id[val.id]
+        ctx.text.emit_function(
+            f"{target_id} = OpCopyObject {type_id} {src_id}"
+        )
+
+
+def _visit_for_loop(op: ForLoopOp, ctx: _SpvCtx) -> None:
+    """Counted for-loop with optional loop-carried values.
+
+    SPIR-V structured loop pattern (Vulkan compute):
+
+        ;; <current block>
+        OpBranch %preheader
+        %preheader = OpLabel
+        OpBranch %header
+
+        %header = OpLabel
+        %iv     = OpPhi <iv_t> %lo %preheader %iv_next %continue
+        %ck     = OpPhi <ck_t> %ck_init %preheader %ck_next %continue   ; per carry
+        %cond   = OpULessThan/OpSLessThan %iv %hi
+        OpLoopMerge %merge %continue None
+        OpBranchConditional %cond %body %merge
+
+        %body = OpLabel
+        ;; body emits ops. The terminating YieldOp materialises each
+        ;; ck_next via OpCopyObject into the header's pre-declared id.
+        OpBranch %continue
+
+        %continue = OpLabel
+        %iv_next  = OpIAdd <iv_t> %iv %step
+        OpBranch %header
+
+        %merge = OpLabel
+        ;; for_op.results[i] is mapped to the header's OpPhi result —
+        ;; on exit the OpPhi is the value-on-cond-false, which is the
+        ;; final yielded carry value (or %ck_init if zero iterations).
+
+    The OpPhi at the header references ``%iv_next`` and ``%ck_next``
+    as forward references; spirv-as resolves them on its second pass.
+    The preheader exists purely to give OpPhi a concrete predecessor
+    label without having to track the surrounding visitor's "current
+    block" label.
+    """
+    iv_dtype = op.attrs["iv_dtype"]
+    iv_kind = _dtype_kind(iv_dtype)
+    if iv_kind not in ("uint", "sint"):
+        raise NotImplementedError(
+            f"_visit_for_loop: only integer induction supported, got {iv_dtype!r}"
+        )
+    iv_type = _emit_dtype(ctx.text, iv_dtype, ctx)
+
+    lo_id = ctx.val_to_id[op.lo.id]
+    hi_id = ctx.val_to_id[op.hi.id]
+    step_id = ctx.val_to_id[op.step.id]
+    carried_init_ids = [ctx.val_to_id[c.id] for c in op.carried_in]
+
+    # Allocate labels.
+    preheader = ctx.text.alloc_id("loop_pre")
+    header = ctx.text.alloc_id("loop_hdr")
+    body_label = ctx.text.alloc_id("loop_body")
+    cont_label = ctx.text.alloc_id("loop_cont")
+    merge_label = ctx.text.alloc_id("loop_mrg")
+
+    # Pre-allocate ids for forward refs in the header's OpPhi.
+    iv_next_id = ctx.text.alloc_id("iv_next")
+
+    # Per-carry: phi result id (== body-visible carry-in == loop result),
+    # next id (yielded value, materialised by YieldOp visitor), and the
+    # element type id.
+    carry_phi_ids: list[str] = []
+    carry_next_ids: list[str] = []
+    carry_type_ids: list[str] = []
+    for i, body_var in enumerate(op.carried_body_vars):
+        c_type = _emit_dtype(ctx.text, body_var.dtype, ctx)
+        phi_id = ctx.text.alloc_id(f"carry{i}")
+        next_id = ctx.text.alloc_id(f"carry{i}_next")
+        carry_phi_ids.append(phi_id)
+        carry_next_ids.append(next_id)
+        carry_type_ids.append(c_type)
+        # Body-visible carry-in == header phi result.
+        ctx.val_to_id[body_var.id] = phi_id
+        # Loop result (visible after merge) == header phi result.
+        ctx.val_to_id[op.results[i].id] = phi_id
+
+    # Map the induction variable to its phi id.
+    ctx.val_to_id[op.induction_var.id] = ctx.text.alloc_id("iv")
+    iv_phi_id = ctx.val_to_id[op.induction_var.id]
+
+    # ── Branch from current block into preheader, then header ────────
+    ctx.text.emit_function(f"OpBranch {preheader}")
+    ctx.text.emit_function(f"{preheader} = OpLabel")
+    ctx.text.emit_function(f"OpBranch {header}")
+
+    # ── Header: phi nodes + loop merge + cond branch ────────────────
+    ctx.text.emit_function(f"{header} = OpLabel")
+    ctx.text.emit_function(
+        f"{iv_phi_id} = OpPhi {iv_type} {lo_id} {preheader} "
+        f"{iv_next_id} {cont_label}"
+    )
+    for phi_id, type_id, init_id, next_id in zip(
+        carry_phi_ids, carry_type_ids, carried_init_ids, carry_next_ids,
+        strict=False,
+    ):
+        ctx.text.emit_function(
+            f"{phi_id} = OpPhi {type_id} {init_id} {preheader} "
+            f"{next_id} {cont_label}"
+        )
+
+    bool_t = ctx.text.type_bool()
+    cond_id = ctx.text.alloc_id("loop_cond")
+    cmp_op = "OpULessThan" if iv_kind == "uint" else "OpSLessThan"
+    ctx.text.emit_function(
+        f"{cond_id} = {cmp_op} {bool_t} {iv_phi_id} {hi_id}"
+    )
+    ctx.text.emit_function(
+        f"OpLoopMerge {merge_label} {cont_label} None"
+    )
+    ctx.text.emit_function(
+        f"OpBranchConditional {cond_id} {body_label} {merge_label}"
+    )
+
+    # ── Body block ──────────────────────────────────────────────────
+    ctx.text.emit_function(f"{body_label} = OpLabel")
+    # Push the carry yield target stack frame so the body's YieldOp
+    # materialises into the pre-allocated ids.
+    ctx.loop_yield_stack.append(
+        list(zip(carry_next_ids, carry_type_ids, strict=False))
+    )
+    try:
+        for body_op in op.body.ops:
+            _walk_op(body_op, ctx)
+    finally:
+        ctx.loop_yield_stack.pop()
+    ctx.text.emit_function(f"OpBranch {cont_label}")
+
+    # ── Continue block: increment iv ────────────────────────────────
+    ctx.text.emit_function(f"{cont_label} = OpLabel")
+    ctx.text.emit_function(
+        f"{iv_next_id} = OpIAdd {iv_type} {iv_phi_id} {step_id}"
+    )
+    ctx.text.emit_function(f"OpBranch {header}")
+
+    # ── Merge block ─────────────────────────────────────────────────
+    ctx.text.emit_function(f"{merge_label} = OpLabel")
 
 
 def _ensure_buffer_var(tensor: GlobalTensor, binding_index: int,
@@ -1367,6 +1534,7 @@ _DISPATCH: dict[type, Any] = {
     VecBuildOp: _visit_vec_build,
     VecExtractOp: _visit_vec_extract,
     IfRegionOp: _visit_if_region,
+    ForLoopOp: _visit_for_loop,
     YieldOp: _visit_yield,
     SmemAllocOp: _visit_smem_alloc,
     BarrierOp: _visit_barrier,
