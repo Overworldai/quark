@@ -516,8 +516,8 @@ the lowerer compiles SPIR-V into the void — there is no caller.
 | § | Work | Status | Blocker |
 |---|---|---|---|
 | 3.0 | Scaffolding (registry slot, stub lowerer, skeleton tests) | ✅ landed `e12b08e` | — |
-| 3.1 | Runtime choice + ``drivers/_spv_dispatch`` C ext + ``drivers/spv.py`` Python wrapper + ``DeviceCaps`` probe + compile + launch | ✅ landed `a585e1e` (probe + EngineIntel) + this commit (compile/launch) | command-buffer accumulation perf optim deferred |
-| 3.2 | ``SpirVLowerer`` body — ~45 visitors + ``LoweredSpirVKernel`` artifact | ⏳ | nothing — 3.1 dispatch path is live |
+| 3.1 | Runtime choice + ``drivers/_spv_dispatch`` C ext + ``drivers/spv.py`` Python wrapper + ``DeviceCaps`` probe + compile + launch | ✅ landed `a585e1e` (probe + EngineIntel) + `54449a1` (compile/launch) | command-buffer accumulation perf optim deferred |
+| 3.2 | ``SpirVLowerer`` body — ~45 visitors + ``LoweredSpirVKernel`` artifact | 🟡 first cut landed (this commit) — ``vec_add``-class kernels round-trip end-to-end through Vulkan; remaining ~40 visitors expand incrementally | each new visitor is one entry in ``_DISPATCH`` |
 | 3.3 | ``FragApplyOp`` lowering (coord-free body via ``OpCooperativeMatrixLengthKHR``) | ⏳ | 3.2 |
 | 3.4 | ``EngineIntel`` subclass — host tensor format, VAE choice, lazy-dispatch idiom | 🟡 stub landed `a585e1e` (constructs + caps); inference paths blocked on 3.2 + OpenVINO TAEHV | 3.2 + VAE backend |
 | 3.5 | Subgroup width policy (``reqd_sub_group_size`` pin vs driver-chosen + per-width variants) | ⏳ | 3.1 (probe data — captured) |
