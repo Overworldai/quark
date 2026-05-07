@@ -276,6 +276,31 @@ def _visit_arith(op: ArithOp, ctx: _SpvCtx) -> None:
             f"{res_id} = OpExtInst {type_id} {glsl_id} Fma {operands[0]} {operands[1]} {operands[2]}"
         )
         return
+    if kind == "mul_hi":
+        # SPIR-V has no single ``OpUMulHi``. The standard idiom is
+        # ``OpUMulExtended`` which returns a struct ``{low, high}``;
+        # extract the high half. Used by hash-based RNG kernels
+        # (xoshiro / philox) for state advance.
+        if _dtype_kind(out.dtype) != "uint":
+            raise NotImplementedError(
+                f"_visit_arith(mul_hi): only unsigned int wired, got {out.dtype!r}"
+            )
+        u32 = ctx.text.type_int(32, signed=False)
+        # Declare an ``OpTypeStruct {u32, u32}`` for the extended result.
+        struct_type = ctx.text._cached_type(
+            f"struct_u32u32",
+            f"OpTypeStruct {u32} {u32}",
+        )
+        ext_id = ctx.text.alloc_id("mul_ext")
+        ctx.text.emit_function(
+            f"{ext_id} = OpUMulExtended {struct_type} {operands[0]} {operands[1]}"
+        )
+        res_id = ctx.text.alloc_id("mul_hi")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = OpCompositeExtract {u32} {ext_id} 1"
+        )
+        return
     if kind in ("min", "max"):
         glsl_id = ctx.text.import_ext_inst("GLSL.std.450")
         if _dtype_kind(out.dtype) == "float":

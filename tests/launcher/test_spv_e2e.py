@@ -299,6 +299,42 @@ class TestExistingKernelsCompile:
         ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
         np.testing.assert_allclose(got, expected, rtol=0, atol=1e-5)
 
+    def test_rmsnorm_runs_end_to_end_against_numpy_reference(self, spv_device):
+        """``RMSNormKernel`` runs end-to-end on Battlemage —
+        ``y = x * rsqrt(mean(x², axis=-1) + eps)``. Exercises the
+        full reduction surface: smem + barrier + cross-lane shuffle
+        ``OpGroupNonUniformShuffleXor`` for the partial-sum tree."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.rmsnorm.kernel import RMSNormKernel
+        from quark.kernels.rmsnorm.spec import RMSNormSpec
+        from quark.kernels.rmsnorm.config import RMSNormConfig
+        from quark.kernels.rmsnorm.reference import rmsnorm_reference_numpy
+        from quark.launcher import Launcher
+
+        B, D = 4, 64
+        rng = np.random.default_rng(0xCAFEBABE)
+        X = rng.standard_normal((B, D)).astype(np.float32)
+        spec = RMSNormSpec(B=B, D=D, dtype=DType.F32)
+        expected = rmsnorm_reference_numpy(spec, X=X)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(RMSNormKernel, spec, RMSNormConfig(n_warps=1))
+
+        nbytes = B * D * 4
+        x_h, x_map = _sd.allocate_buffer(nbytes)
+        o_h, o_map = _sd.allocate_buffer(nbytes)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+        ck.launch(buffers=[x_h, o_h])
+
+        got = np.empty((B, D), dtype=np.float32).reshape(-1)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        got = got.reshape(B, D)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-4)
+
     def test_silu_runs_end_to_end_against_numpy_reference(self, spv_device):
         """``SiLUKernel`` runs end-to-end on Battlemage and produces
         output matching the kernel's own ``silu_reference_numpy``.
@@ -450,6 +486,41 @@ class TestExistingKernelsCompile:
             RMSNormKernel,
             RMSNormSpec(B=4, D=64, dtype=DType.F32),
             RMSNormConfig(n_warps=1),
+        )
+        assert ck.module.handle != 0
+
+    def test_head_rmsnorm_kernel_compiles(self, spv_device):
+        """``HeadRMSNormKernel`` (per-head RMSNorm in attention) lowers
+        cleanly — multi-head fused norm over the QKV-packed buffer."""
+        from quark.kernels.head_rmsnorm.kernel import HeadRMSNormKernel
+        from quark.kernels.head_rmsnorm.spec import HeadRMSNormSpec
+        from quark.kernels.head_rmsnorm.config import HeadRMSNormConfig
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        # D_full = (n_q + 2*n_kv) * Dh = (4 + 4) * 64 = 512
+        ck = launcher.compile(
+            HeadRMSNormKernel,
+            HeadRMSNormSpec(M=4, D_full=512, n_q_heads=4, n_kv_heads=2,
+                            Dh=64, dtype=DType.F32),
+            HeadRMSNormConfig(n_warps=1),
+        )
+        assert ck.module.handle != 0
+
+    def test_value_residual_kernel_compiles(self, spv_device):
+        """``ValueResidualKernel`` (the residual-stream value path in
+        attention) lowers cleanly. 4 storage buffers, exercises the
+        per-frame state-update load/store pattern."""
+        from quark.kernels.value_residual.kernel import ValueResidualKernel
+        from quark.kernels.value_residual.spec import ValueResidualSpec
+        from quark.kernels.value_residual.config import ValueResidualConfig
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            ValueResidualKernel,
+            ValueResidualSpec(N=128, dtype=DType.F32),
+            ValueResidualConfig(n_warps=1, elems_per_block=128),
         )
         assert ck.module.handle != 0
 
