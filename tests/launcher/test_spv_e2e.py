@@ -293,6 +293,27 @@ class TestExistingKernelsCompile:
         )
         assert ck.module.handle != 0
 
+    def test_rmsnorm_kernel_compiles(self, spv_device):
+        """``RMSNormKernel`` (in-tree, the activations rmsnorm in
+        the transformer block) lowers cleanly. Exercises the
+        smem + barrier + cross-lane shuffle reduction path that
+        the §3.2 v4 / v7 visitor bundles unlocked, plus the
+        Vulkan-1.4 "all globals in entry-point interface" rule
+        for Workgroup-class smem variables.
+        """
+        from quark.kernels.rmsnorm.kernel import RMSNormKernel
+        from quark.kernels.rmsnorm.spec import RMSNormSpec
+        from quark.kernels.rmsnorm.config import RMSNormConfig
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            RMSNormKernel,
+            RMSNormSpec(B=4, D=64, dtype=DType.F32),
+            RMSNormConfig(n_warps=1),
+        )
+        assert ck.module.handle != 0
+
     def test_silu_kernel_compiles(self, spv_device):
         """``SiLUKernel`` (in-tree, the elementwise activation that
         sits in the MLP fc1 epilogue) lowers cleanly through the

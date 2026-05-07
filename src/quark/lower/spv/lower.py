@@ -1437,16 +1437,31 @@ class SpirVLowerer:
         # has to play by the stricter rule.
         local_size = ctx.local_size
         interface = []
-        if ctx.local_inv_id_var:
-            interface.append(ctx.local_inv_id_var)
-        if ctx.workgroup_id_var:
-            interface.append(ctx.workgroup_id_var)
+        # Compute-shader builtin inputs the body uses. Vulkan 1.4
+        # SPIR-V requires every statically-referenced global variable
+        # in the entry-point interface — Input class for builtins,
+        # StorageBuffer for buffers, Workgroup for smem.
+        for var_attr in (
+            "local_inv_id_var",
+            "workgroup_id_var",
+            "lane_id_var",
+            "subgroup_id_var",
+        ):
+            v = getattr(ctx, var_attr, "")
+            if v:
+                interface.append(v)
         # Storage buffers in declaration order — matches binding
         # index, makes the disassembly readable.
         for t in global_tensors:
             var_id = ctx.tensor_to_var.get(id(t))
             if var_id is not None:
                 interface.append(var_id)
+        # Workgroup-class smem variables. Vulkan 1.4 SPIR-V requires
+        # these in the interface alongside Input / Output / StorageBuffer
+        # — earlier specs only required Input/Output, the broader rule
+        # applies on the ``vulkan1.3`` profile we target.
+        for _alloc_value_id, (var_id, *_rest) in ctx.smem_allocs.items():
+            interface.append(var_id)
         text.add_entry_point(fn_id, "main", "GLCompute", interface)
         text.add_execution_mode(
             f"OpExecutionMode {fn_id} LocalSize {local_size[0]} {local_size[1]} {local_size[2]}"
