@@ -41,6 +41,7 @@ from quark.ir import DType
 from quark.ir.module import Function, Module
 from quark.ir.op import (
     ArithOp,
+    BarrierOp,
     BlockDimOp,
     BlockIdxOp,
     CmpOp,
@@ -50,11 +51,13 @@ from quark.ir.op import (
     LoadOp,
     MathOp,
     SelectOp,
+    SmemAllocOp,
     StoreOp,
+    SubgroupReduceOp,
     ThreadIdxOp,
     YieldOp,
 )
-from quark.ir.tensor import GlobalTensor
+from quark.ir.tensor import GlobalTensor, SharedRegion
 
 from quark.lower.spv.text import SpvText
 
@@ -116,6 +119,12 @@ class _SpvCtx:
     # to avoid re-emitting the capability line.
     has_f16_cap: bool = False
     has_bf16_cap: bool = False
+    # Smem allocations: SmemAllocOp result Value.id → (var_id,
+    # element_type_id, elem_pointer_id, total_elements). Visitors
+    # that load/store on a SharedRegion look up by the
+    # SharedRegion.alloc.id (which equals the SmemAllocOp's
+    # backing Value id).
+    smem_allocs: dict[int, tuple[str, str, str, int]] = field(default_factory=dict)
 
 
 # Map quark DType values → (SPIR-V type emitter method name, byte width).
@@ -496,61 +505,126 @@ def _ensure_buffer_var(tensor: GlobalTensor, binding_index: int,
     return var_id, elem_ptr
 
 
+def _flatten_index(indices: tuple, shape: tuple, ctx: _SpvCtx) -> str:
+    """Compute a row-major flat index from N-D indices + shape.
+
+    Returns the SSA id of the flat-index ``OpIAdd``. For 1-D this
+    is just the single index; for N-D, emits the ``i*S2 + j*S3 +
+    k`` chain. ``shape`` is the IR's declared shape (post-pad).
+    """
+    if len(indices) == 1:
+        return ctx.val_to_id[indices[0].id]
+    u32 = ctx.text.type_int(32, signed=False)
+    # Compute strides right-to-left.
+    flat: str | None = None
+    stride = 1
+    rev_strides = []
+    for s in reversed(shape):
+        rev_strides.append(stride)
+        stride *= s
+    rev_strides.reverse()
+    for idx_v, s in zip(indices, rev_strides, strict=False):
+        idx_id = ctx.val_to_id[idx_v.id]
+        if s == 1:
+            term = idx_id
+        else:
+            stride_const = ctx.text.const_uint(s)
+            term = ctx.text.alloc_id("flat_mul")
+            ctx.text.emit_function(
+                f"{term} = OpIMul {u32} {idx_id} {stride_const}"
+            )
+        if flat is None:
+            flat = term
+        else:
+            new_flat = ctx.text.alloc_id("flat_add")
+            ctx.text.emit_function(
+                f"{new_flat} = OpIAdd {u32} {flat} {term}"
+            )
+            flat = new_flat
+    assert flat is not None
+    return flat
+
+
 def _visit_load(op: LoadOp, ctx: _SpvCtx) -> None:
     (out,) = op.results
     tensor = op.attrs["tensor"]
-    if not isinstance(tensor, GlobalTensor):
-        raise NotImplementedError(
-            "_visit_load: only GlobalTensor sources are wired today. "
-            "SharedRegion loads land with the threadgroup-memory "
-            "visitor bundle in PORTABILITY_PLAN §3.2."
+    if isinstance(tensor, GlobalTensor):
+        binding = ctx.tensor_to_binding[id(tensor)]
+        var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
+        elem_type = ctx.tensor_to_elem_type[id(tensor)]
+        zero = ctx.text.const_uint(0)
+        idx_id = _flatten_index(tuple(op.operands), tensor.shape, ctx)
+        chain_id = ctx.text.alloc_id("chain")
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
         )
-    if len(op.operands) != 1:
-        raise NotImplementedError(
-            f"_visit_load: only 1D loads wired (got {len(op.operands)} "
-            "indices). N-D loads need stride math; defer until a kernel "
-            "demands them."
+        res_id = ctx.text.alloc_id("ld")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(f"{res_id} = OpLoad {elem_type} {chain_id}")
+        return
+
+    if isinstance(tensor, SharedRegion):
+        rec = ctx.smem_allocs.get(tensor.alloc.id)
+        if rec is None:
+            raise RuntimeError(
+                f"_visit_load: SharedRegion {tensor.name!r} accessed "
+                "before its SmemAllocOp was visited"
+            )
+        var_id, elem_type, elem_ptr, _n = rec
+        idx_id = _flatten_index(tuple(op.operands), tensor.shape, ctx)
+        chain_id = ctx.text.alloc_id("smem_chain")
+        # Workgroup-class arrays are ``OpVariable Workgroup
+        # OpTypeArray T n`` — no enclosing struct — so the access
+        # chain takes one fewer index than the StorageBuffer path
+        # (no ``%uint_0`` for the struct-member dimension).
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
         )
+        res_id = ctx.text.alloc_id("smem_ld")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(f"{res_id} = OpLoad {elem_type} {chain_id}")
+        return
 
-    # Resolve the binding index from the function's param ordering —
-    # set by the lowerer below before walking the body.
-    binding = ctx.tensor_to_binding[id(tensor)]
-    var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
-    elem_type = ctx.tensor_to_elem_type[id(tensor)]
-
-    idx_id = ctx.val_to_id[op.operands[0].id]
-    zero = ctx.text.const_uint(0)
-
-    chain_id = ctx.text.alloc_id("chain")
-    ctx.text.emit_function(
-        f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
+    raise NotImplementedError(
+        f"_visit_load: tensor type {type(tensor).__name__} not wired"
     )
-    res_id = ctx.text.alloc_id("ld")
-    ctx.val_to_id[out.id] = res_id
-    ctx.text.emit_function(f"{res_id} = OpLoad {elem_type} {chain_id}")
 
 
 def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
     tensor = op.attrs["tensor"]
-    if not isinstance(tensor, GlobalTensor):
-        raise NotImplementedError(
-            "_visit_store: only GlobalTensor sinks are wired today."
+    if isinstance(tensor, GlobalTensor):
+        binding = ctx.tensor_to_binding[id(tensor)]
+        var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
+        value_id = ctx.val_to_id[op.operands[0].id]
+        zero = ctx.text.const_uint(0)
+        idx_id = _flatten_index(tuple(op.operands[1:]), tensor.shape, ctx)
+        chain_id = ctx.text.alloc_id("chain")
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
         )
-    if len(op.operands) != 2:
-        raise NotImplementedError(
-            f"_visit_store: only 1D stores wired (got "
-            f"{len(op.operands) - 1} indices)."
+        ctx.text.emit_function(f"OpStore {chain_id} {value_id}")
+        return
+
+    if isinstance(tensor, SharedRegion):
+        rec = ctx.smem_allocs.get(tensor.alloc.id)
+        if rec is None:
+            raise RuntimeError(
+                f"_visit_store: SharedRegion {tensor.name!r} accessed "
+                "before its SmemAllocOp was visited"
+            )
+        var_id, _elem_type, elem_ptr, _n = rec
+        value_id = ctx.val_to_id[op.operands[0].id]
+        idx_id = _flatten_index(tuple(op.operands[1:]), tensor.shape, ctx)
+        chain_id = ctx.text.alloc_id("smem_chain")
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
         )
-    binding = ctx.tensor_to_binding[id(tensor)]
-    var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
-    value_id = ctx.val_to_id[op.operands[0].id]
-    idx_id = ctx.val_to_id[op.operands[1].id]
-    zero = ctx.text.const_uint(0)
-    chain_id = ctx.text.alloc_id("chain")
-    ctx.text.emit_function(
-        f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
+        ctx.text.emit_function(f"OpStore {chain_id} {value_id}")
+        return
+
+    raise NotImplementedError(
+        f"_visit_store: tensor type {type(tensor).__name__} not wired"
     )
-    ctx.text.emit_function(f"OpStore {chain_id} {value_id}")
 
 
 # ─── Convert / Math / Select ──────────────────────────────────────
@@ -709,6 +783,137 @@ def _visit_select(op: SelectOp, ctx: _SpvCtx) -> None:
     ctx.text.emit_function(f"{res_id} = OpSelect {dst_t} {pred_id} {t_id} {f_id}")
 
 
+# ─── Threadgroup memory + sync ────────────────────────────────────
+
+
+def _visit_smem_alloc(op: SmemAllocOp, ctx: _SpvCtx) -> None:
+    """Allocate an ``OpVariable Workgroup`` for the smem region.
+
+    SPIR-V's ``Workgroup`` storage class is the analogue of CUDA's
+    ``__shared__`` / MSL's ``threadgroup``. The variable must be
+    declared at module scope (not inside the function body) — the
+    type-line emit path lands the variable in the type section
+    automatically.
+
+    Layout: a flat ``OpTypeArray`` sized to the total element count.
+    N-D shapes flatten to 1D for SPIR-V; the
+    ``_visit_load`` / ``_visit_store`` paths compute the row-major
+    flat index from N-D indices. Pad bytes from the ``pad`` attr
+    are folded into the per-row stride at index time.
+
+    Smem aliasing (the framework's ``smem_layout`` pass picks
+    overlapping offsets for disjoint-lifetime regions to fit a
+    bigger working set into the same byte budget) is deferred — for
+    v1 each ``SmemAllocOp`` gets its own variable. The waste is
+    real but small at the kernel sizes Battlemage targets.
+    """
+    (backing,) = op.results
+    elem_type = _emit_dtype(ctx.text, op.dtype, ctx)
+    n_elems = 1
+    for s in op.shape:
+        n_elems *= s
+    n_const = ctx.text.const_uint(n_elems)
+    arr_id = ctx.text.alloc_id(f"smem_{op.name}_arr")
+    ctx.text.add_type_line(f"{arr_id} = OpTypeArray {elem_type} {n_const}")
+    ptr_arr = ctx.text.type_pointer("Workgroup", arr_id)
+    var_id = ctx.text.alloc_id(f"smem_{op.name}")
+    ctx.text.add_type_line(f"{var_id} = OpVariable {ptr_arr} Workgroup")
+    elem_ptr = ctx.text.type_pointer("Workgroup", elem_type)
+    ctx.smem_allocs[backing.id] = (var_id, elem_type, elem_ptr, n_elems)
+
+
+def _visit_barrier(op: BarrierOp, ctx: _SpvCtx) -> None:
+    """``OpControlBarrier execution memory semantics``.
+
+    Maps the IR scope to the corresponding SPIR-V scope id:
+      * ``"block"`` → Workgroup (2) — full threadgroup barrier
+      * ``"subgroup"`` → Subgroup (3)
+      * ``"system"`` → Device (1)
+
+    Memory semantics: ``AcquireRelease | WorkgroupMemory`` for block
+    scope (matches CUDA's ``__syncthreads`` / Metal's
+    ``threadgroup_barrier(mem_threadgroup)`` semantics — release prior
+    smem writes, acquire subsequent smem reads). Add
+    ``SubgroupMemory`` for subgroup scope.
+    """
+    scope = op.attrs.get("scope", "block")
+    # SPIR-V scope constants. Use OpConstant uint values that
+    # spirv-as recognises as named scopes.
+    scope_const = {"block": 2, "subgroup": 3, "system": 1}.get(scope)
+    if scope_const is None:
+        raise NotImplementedError(f"_visit_barrier: scope={scope!r}")
+    # Memory semantics: 0x8 = AcquireRelease (Vulkan-required), plus
+    # 0x100 = WorkgroupMemory or 0x80 = SubgroupMemory depending on
+    # which smem the barrier protects.
+    if scope == "block":
+        mem_sem = 0x8 | 0x100  # AcquireRelease | WorkgroupMemory
+    elif scope == "subgroup":
+        mem_sem = 0x8 | 0x80   # AcquireRelease | SubgroupMemory
+    else:
+        mem_sem = 0x8
+
+    exec_id = ctx.text.const_uint(scope_const)
+    mem_id = ctx.text.const_uint(scope_const)
+    sem_id = ctx.text.const_uint(mem_sem)
+    ctx.text.emit_function(f"OpControlBarrier {exec_id} {mem_id} {sem_id}")
+
+
+# ─── Subgroup ops ─────────────────────────────────────────────────
+
+
+# (op kind, dtype kind) → SPIR-V opcode name. ``Reduce`` operation
+# is the one we want for kernel reductions (every-lane gets the
+# scalar result of the full-subgroup reduction).
+_SUBGROUP_REDUCE_TO_SPV: dict[tuple[str, str], str] = {
+    ("sum", "float"): "OpGroupNonUniformFAdd",
+    ("sum", "uint"): "OpGroupNonUniformIAdd",
+    ("sum", "sint"): "OpGroupNonUniformIAdd",
+    ("max", "float"): "OpGroupNonUniformFMax",
+    ("max", "uint"): "OpGroupNonUniformUMax",
+    ("max", "sint"): "OpGroupNonUniformSMax",
+    ("min", "float"): "OpGroupNonUniformFMin",
+    ("min", "uint"): "OpGroupNonUniformUMin",
+    ("min", "sint"): "OpGroupNonUniformSMin",
+    ("and", "uint"): "OpGroupNonUniformBitwiseAnd",
+    ("and", "sint"): "OpGroupNonUniformBitwiseAnd",
+    ("or", "uint"): "OpGroupNonUniformBitwiseOr",
+    ("or", "sint"): "OpGroupNonUniformBitwiseOr",
+}
+
+
+def _visit_subgroup_reduce(op: SubgroupReduceOp, ctx: _SpvCtx) -> None:
+    """Cross-lane reduction within a subgroup.
+
+    Maps the ``op`` attr to the right ``OpGroupNonUniform*`` opcode
+    based on the operand dtype (float/uint/sint). Always uses the
+    ``Reduce`` variant — every lane in the subgroup receives the
+    same scalar result.
+
+    Capability needed: ``GroupNonUniformArithmetic`` (Vulkan 1.1+
+    core; Battlemage advertises it per the §3.1 probe).
+    """
+    (out,) = op.results
+    src_v = op.operands[0]
+    kind = op.attrs["op"]
+    dt_kind = _dtype_kind(src_v.dtype)
+    spv_op = _SUBGROUP_REDUCE_TO_SPV.get((kind, dt_kind))
+    if spv_op is None:
+        raise NotImplementedError(
+            f"_visit_subgroup_reduce: op={kind!r} dtype_kind={dt_kind!r}"
+        )
+    ctx.text.add_capability("GroupNonUniformArithmetic")
+    src_id = ctx.val_to_id[src_v.id]
+    dst_t = _emit_dtype(ctx.text, out.dtype, ctx)
+    # Subgroup scope (3) for the execution scope of the reduction.
+    sg_scope = ctx.text.const_uint(3)
+    res_id = ctx.text.alloc_id(f"sgreduce_{kind}")
+    ctx.val_to_id[out.id] = res_id
+    # ``Reduce`` operation — same result on every lane.
+    ctx.text.emit_function(
+        f"{res_id} = {spv_op} {dst_t} {sg_scope} Reduce {src_id}"
+    )
+
+
 _DISPATCH: dict[type, Any] = {
     ConstOp: _visit_const,
     ArithOp: _visit_arith,
@@ -723,6 +928,9 @@ _DISPATCH: dict[type, Any] = {
     StoreOp: _visit_store,
     IfRegionOp: _visit_if_region,
     YieldOp: _visit_yield,
+    SmemAllocOp: _visit_smem_alloc,
+    BarrierOp: _visit_barrier,
+    SubgroupReduceOp: _visit_subgroup_reduce,
 }
 
 

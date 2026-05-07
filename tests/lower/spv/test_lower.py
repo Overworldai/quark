@@ -330,6 +330,115 @@ class TestMathConvertSelect:
         assert "OpSelect" in src
 
 
+def _build_subgroup_reduce_ir(n: int):
+    """Per-thread loads X[i], subgroup-reduce-sum across the
+    workgroup, lane 0 writes the total to Y[0].
+
+    Exercises ``SubgroupReduceOp`` (sum, f32) + ``ThreadIdxOp`` +
+    ``IfRegionOp`` (lane-0 gate). N must be ≤ subgroup_size for
+    a single-subgroup workgroup; on Battlemage that's 32.
+    """
+    import quark.lang as qk
+
+    b = Builder("subgroup_reduce")
+    fn = b.begin_function("subgroup_reduce")
+    b.param("X", BufferType(DType.F32))
+    b.param("Y", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_y = GlobalTensor(dtype=DType.F32, shape=(1,), stride=(1,),
+                       name="Y", param=fn.params[1])
+
+    tid = b.thread_idx("x")
+    x_i = b.load(g_x, tid)
+    sum_v = b.subgroup_reduce("sum", x_i)  # cross-lane sum
+    zero = b.const(DType.U32, 0)
+    is_lane_zero = b.cmp("eq", tid, zero)
+    with qk.if_(is_lane_zero) as (then_in, else_in, arms):
+        with arms.then_():
+            b.store(g_y, sum_v, zero)
+            qk.yield_()
+        with arms.else_():
+            qk.yield_()
+    b.end_function()
+    return b.module
+
+
+class TestSmemBarrierSubgroup:
+    """Tier 1 goldens for §3.2 v4 visitors: smem + barrier +
+    subgroup reductions."""
+
+    def test_subgroup_reduce_emits_op_group_nonuniform(self):
+        result = SpirVLowerer(local_size=(32, 1, 1)).lower_module(
+            _build_subgroup_reduce_ir(32)
+        )
+        src = result.source
+        assert "OpCapability GroupNonUniformArithmetic" in src
+        assert "OpGroupNonUniformFAdd" in src
+        # Subgroup scope (3) used for the reduction execution scope.
+        assert " Reduce " in src
+
+    def test_smem_alloc_emits_workgroup_variable(self):
+        b = Builder("smem")
+        b.begin_function("f")
+        smem = b.smem_alloc("scratch", DType.F32, (32,))
+        # Write index 0 = a constant, then read it back. Just exercises
+        # the smem allocation + load/store paths.
+        v = b.const(DType.F32, 1.5)
+        zero = b.const(DType.U32, 0)
+        b.store(smem, v, zero)
+        b.load(smem, zero)
+        b.end_function()
+        src = SpirVLowerer().lower_module(b.module).source
+        assert "OpVariable" in src and "Workgroup" in src
+        # The flat array sized to 32.
+        assert "OpTypeArray" in src
+
+    def test_barrier_emits_op_control_barrier(self):
+        b = Builder("barrier")
+        b.begin_function("f")
+        import quark.lang as qk
+        qk.barrier()
+        b.end_function()
+        src = SpirVLowerer().lower_module(b.module).source
+        assert "OpControlBarrier" in src
+
+
+@pytestmark_e2e
+def test_subgroup_reduce_end_to_end(driver):
+    """Full subgroup-reduce kernel runs on Battlemage. N=32 matches
+    the device's subgroup width (per the §3.1 probe), so a single
+    subgroup covers all the work."""
+    from quark.lower.spv import text_to_binary
+
+    n = 32
+    rng = np.random.default_rng(0xDEADBEEF)
+    X = rng.standard_normal(n).astype(np.float32)
+    expected = X.sum()
+
+    result = SpirVLowerer(local_size=(n, 1, 1)).lower_module(
+        _build_subgroup_reduce_ir(n)
+    )
+    binary = text_to_binary(result.source)
+
+    a_h, a_map = driver.allocate_buffer(n * 4)
+    y_h, y_map = driver.allocate_buffer(4)
+    ctypes.memmove(a_map, X.ctypes.data, X.nbytes)
+
+    compiled = driver.compile(
+        source=binary, entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [a_h, y_h], push_bytes=b"")
+
+    got = np.empty(1, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, y_map, got.nbytes)
+    # Subgroup reduction order is implementation-defined; allow some
+    # ULP slack on the float-add tree.
+    np.testing.assert_allclose(got[0], expected, rtol=1e-5, atol=1e-5)
+
+
 @pytestmark_e2e
 def test_math_kernel_end_to_end(driver):
     """End-to-end: lower a kernel using ``MathOp`` (sin / sqrt) +
