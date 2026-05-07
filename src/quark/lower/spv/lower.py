@@ -43,10 +43,13 @@ from quark.ir.op import (
     ArithOp,
     BlockDimOp,
     BlockIdxOp,
+    CmpOp,
     ConstOp,
+    IfRegionOp,
     LoadOp,
     StoreOp,
     ThreadIdxOp,
+    YieldOp,
 )
 from quark.ir.tensor import GlobalTensor
 
@@ -87,13 +90,24 @@ class _SpvCtx:
     tensor_to_elem_ptr: dict[int, str] = field(default_factory=dict)
     # GlobalTensor id() → element type id (OpTypeFloat32, etc.)
     tensor_to_elem_type: dict[int, str] = field(default_factory=dict)
-    # Cached SSA id for LocalInvocationId — the builtin variable + a
-    # convenience accessor that loads its .x component.
+    # Cached SSA ids for compute-shader builtins. Lazily declared on
+    # first reference — kernel that never reads ``LocalInvocationId``
+    # doesn't get a useless ``%LocalInvocationId`` variable.
     local_inv_id_var: str = ""
     local_inv_id_x_loaded: str = ""
+    workgroup_id_var: str = ""
+    workgroup_id_x_loaded: str = ""
+    # Local size constants from ``OpExecutionMode LocalSize`` —
+    # populated by the lowerer entry point so ``BlockDimOp``
+    # visitors emit the right ``OpConstant uint``.
+    local_size: tuple[int, int, int] = (1, 1, 1)
     # Cached push-constant block id, if any.
     push_block_var: str = ""
     push_block_size: int = 0
+    # Tracks GlobalTensors actually used (load/store visited). Drives
+    # the entry-point interface list — Vulkan 1.3 SPIR-V demands every
+    # statically-used global variable be enumerated there.
+    tensor_to_binding: dict[int, int] = field(default_factory=dict)
 
 
 # Map quark DType values → (SPIR-V type emitter method name, byte width).
@@ -233,19 +247,185 @@ def _visit_thread_idx(op: ThreadIdxOp, ctx: _SpvCtx) -> None:
     ctx.val_to_id[out.id] = x_id
 
 
+def _ensure_workgroup_id(ctx: _SpvCtx) -> str:
+    """Return the SSA id of WorkgroupId.x. Mirror of
+    ``_ensure_local_invocation_id`` but for the multi-workgroup
+    dispatch axis."""
+    if ctx.workgroup_id_x_loaded:
+        return ctx.workgroup_id_x_loaded
+    if not ctx.workgroup_id_var:
+        u32 = ctx.text.type_int(32, signed=False)
+        v3u = ctx.text.type_vec(u32, 3)
+        ptr = ctx.text.type_pointer("Input", v3u)
+        var_id = ctx.text.alloc_id("WorkgroupId")
+        ctx.text.add_type_line(f"{var_id} = OpVariable {ptr} Input")
+        ctx.text.add_decoration(f"OpDecorate {var_id} BuiltIn WorkgroupId")
+        ctx.workgroup_id_var = var_id
+    u32 = ctx.text.type_int(32, signed=False)
+    v3u = ctx.text.type_vec(u32, 3)
+    loaded = ctx.text.alloc_id("wgid_vec")
+    ctx.text.emit_function(f"{loaded} = OpLoad {v3u} {ctx.workgroup_id_var}")
+    x_id = ctx.text.alloc_id("wgid_x")
+    ctx.text.emit_function(f"{x_id} = OpCompositeExtract {u32} {loaded} 0")
+    ctx.workgroup_id_x_loaded = x_id
+    return x_id
+
+
 def _visit_block_idx(op: BlockIdxOp, ctx: _SpvCtx) -> None:
-    raise NotImplementedError(
-        "_visit_block_idx: WorkgroupId emit deferred to next visitor "
-        "bundle. v1 vec_add uses LocalInvocationId only (single-"
-        "workgroup dispatch). See PORTABILITY_PLAN §3.2."
-    )
+    """``block_idx("x")`` → WorkgroupId.x.
+
+    SPIR-V's ``WorkgroupId`` is a vec3 of u32; the kernel's per-axis
+    block index is its component access. Like ``ThreadIdxOp``, only
+    ``"x"`` is wired in this first cut — y/z extend trivially when
+    a kernel demands them.
+    """
+    (out,) = op.results
+    dim = op.attrs.get("dim", "x")
+    if dim != "x":
+        raise NotImplementedError(
+            f"_visit_block_idx: dim={dim!r} not yet wired (only 'x'). "
+            "See PORTABILITY_PLAN §3.2."
+        )
+    x_id = _ensure_workgroup_id(ctx)
+    ctx.val_to_id[out.id] = x_id
 
 
 def _visit_block_dim(op: BlockDimOp, ctx: _SpvCtx) -> None:
-    raise NotImplementedError(
-        "_visit_block_dim: emit a constant from LocalSize. Deferred to "
-        "the next visitor bundle. See PORTABILITY_PLAN §3.2."
+    """``block_dim("x")`` → constant from the kernel's ``LocalSize``.
+
+    SPIR-V doesn't expose WorkgroupSize as a runtime read like CUDA's
+    ``blockDim.x``; the value is fixed at compile time via
+    ``OpExecutionMode LocalSize``. The lowerer emits an
+    ``OpConstant uint`` with the value the entry point already
+    declared. This is correct so long as no kernel changes its
+    LocalSize after compile (none does — it's part of the kernel
+    spec).
+    """
+    (out,) = op.results
+    dim = op.attrs.get("dim", "x")
+    axis = {"x": 0, "y": 1, "z": 2}.get(dim)
+    if axis is None:
+        raise ValueError(f"_visit_block_dim: bad dim={dim!r}")
+    cid = ctx.text.const_uint(int(ctx.local_size[axis]))
+    ctx.val_to_id[out.id] = cid
+
+
+# ─── Comparison + structured if/else ──────────────────────────────
+
+
+# (kind, dtype) → SPIR-V opcode. ``ord`` (ordered) variants for fp
+# match GLSL semantics; integer cmps split signed / unsigned via the
+# dtype.
+_CMP_KIND_TO_SPV: dict[tuple[str, DType], str] = {
+    # f32
+    ("eq", DType.F32): "OpFOrdEqual",
+    ("ne", DType.F32): "OpFOrdNotEqual",
+    ("lt", DType.F32): "OpFOrdLessThan",
+    ("le", DType.F32): "OpFOrdLessThanEqual",
+    ("gt", DType.F32): "OpFOrdGreaterThan",
+    ("ge", DType.F32): "OpFOrdGreaterThanEqual",
+    # u32
+    ("eq", DType.U32): "OpIEqual",
+    ("ne", DType.U32): "OpINotEqual",
+    ("lt", DType.U32): "OpULessThan",
+    ("le", DType.U32): "OpULessThanEqual",
+    ("gt", DType.U32): "OpUGreaterThan",
+    ("ge", DType.U32): "OpUGreaterThanEqual",
+    # s32
+    ("eq", DType.S32): "OpIEqual",
+    ("ne", DType.S32): "OpINotEqual",
+    ("lt", DType.S32): "OpSLessThan",
+    ("le", DType.S32): "OpSLessThanEqual",
+    ("gt", DType.S32): "OpSGreaterThan",
+    ("ge", DType.S32): "OpSGreaterThanEqual",
+}
+
+
+def _visit_cmp(op: CmpOp, ctx: _SpvCtx) -> None:
+    (out,) = op.results
+    kind = op.attrs["kind"]
+    a, b = op.operands
+    spv_op = _CMP_KIND_TO_SPV.get((kind, a.dtype))
+    if spv_op is None:
+        raise NotImplementedError(
+            f"_visit_cmp: kind={kind!r} dtype={a.dtype!r} not yet wired"
+        )
+    bool_t = ctx.text.type_bool()
+    res_id = ctx.text.alloc_id(f"cmp_{kind}")
+    ctx.val_to_id[out.id] = res_id
+    a_id = ctx.val_to_id[a.id]
+    b_id = ctx.val_to_id[b.id]
+    ctx.text.emit_function(f"{res_id} = {spv_op} {bool_t} {a_id} {b_id}")
+
+
+def _visit_if_region(op: IfRegionOp, ctx: _SpvCtx) -> None:
+    """Structured if/else with no carries (the bounds-check pattern).
+
+    SPIR-V structured control flow:
+      OpSelectionMerge merge None
+      OpBranchConditional pred then_label else_label
+      then_label = OpLabel
+        ...then body ops...
+        OpBranch merge
+      else_label = OpLabel
+        ...else body ops...   (empty if no else)
+        OpBranch merge
+      merge = OpLabel
+
+    Carries (operands beyond the predicate, results from the op) need
+    OpPhi at the merge block to thread per-arm-yielded values
+    forward. Deferred — every in-tree kernel I've checked uses
+    if-without-carries today; the carry path lands when a kernel
+    needs it. ``YieldOp`` body terminators are simply walked inside
+    each region; they emit their operand into the val map, no phi.
+    """
+    if op.results:
+        raise NotImplementedError(
+            "_visit_if_region: result-yielding (carried) if/else "
+            "needs OpPhi merge — not yet wired. See PORTABILITY_PLAN "
+            "§3.2."
+        )
+    pred_id = ctx.val_to_id[op.pred.id]
+
+    merge_label = ctx.text.alloc_id("if_merge")
+    then_label = ctx.text.alloc_id("if_then")
+    else_label = ctx.text.alloc_id("if_else")
+
+    ctx.text.emit_function(f"OpSelectionMerge {merge_label} None")
+    ctx.text.emit_function(
+        f"OpBranchConditional {pred_id} {then_label} {else_label}"
     )
+
+    # Then arm
+    ctx.text.emit_function(f"{then_label} = OpLabel")
+    for body_op in op.then_region.ops:
+        _walk_op(body_op, ctx)
+    ctx.text.emit_function(f"OpBranch {merge_label}")
+
+    # Else arm — may be empty.
+    ctx.text.emit_function(f"{else_label} = OpLabel")
+    for body_op in op.else_region.ops:
+        _walk_op(body_op, ctx)
+    ctx.text.emit_function(f"OpBranch {merge_label}")
+
+    # Merge block. Subsequent ops in the parent region land here.
+    ctx.text.emit_function(f"{merge_label} = OpLabel")
+
+
+def _visit_yield(op: YieldOp, ctx: _SpvCtx) -> None:
+    """``YieldOp`` inside if/for body. With no carries (the path
+    we support today) it's a no-op: the region's terminator gets
+    handled by the surrounding visitor's ``OpBranch`` emit.
+
+    When carries land (PORTABILITY_PLAN §3.2 follow-up), this
+    visitor will record the per-arm yielded values for the surrounding
+    op's OpPhi emit at merge.
+    """
+    if op.operands:
+        raise NotImplementedError(
+            "_visit_yield: yielding values from a region requires "
+            "OpPhi support (carry path). See PORTABILITY_PLAN §3.2."
+        )
 
 
 def _ensure_buffer_var(tensor: GlobalTensor, binding_index: int,
@@ -342,12 +522,28 @@ def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
 _DISPATCH: dict[type, Any] = {
     ConstOp: _visit_const,
     ArithOp: _visit_arith,
+    CmpOp: _visit_cmp,
     ThreadIdxOp: _visit_thread_idx,
     BlockIdxOp: _visit_block_idx,
     BlockDimOp: _visit_block_dim,
     LoadOp: _visit_load,
     StoreOp: _visit_store,
+    IfRegionOp: _visit_if_region,
+    YieldOp: _visit_yield,
 }
+
+
+def _walk_op(op: Any, ctx: _SpvCtx) -> None:
+    """Single-op dispatch — used by both the top-level body walker
+    and recursive structured-control-flow visitors (``IfRegionOp``,
+    eventually ``ForLoopOp`` / ``WhileLoopOp``)."""
+    visitor = _DISPATCH.get(type(op))
+    if visitor is None:
+        raise NotImplementedError(
+            f"SpirVLowerer: no visitor for {type(op).__name__}. "
+            "See PORTABILITY_PLAN §3.2 — visitor coverage table."
+        )
+    visitor(op, ctx)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -397,18 +593,17 @@ class SpirVLowerer:
         entry_label = text.alloc_id("entry")
         text.emit_function(f"{entry_label} = OpLabel")
 
-        # Walk the IR. We drive _ensure_buffer_var lazily off
-        # _visit_load / _visit_store so an unused param doesn't get
-        # declared (a binding declared but not used is a SPIR-V
-        # validation error in some configurations).
+        # Stash the kernel's resolved local size so BlockDimOp visitors
+        # can synthesise it as a constant.
+        ctx.local_size = self._resolve_local_size(fn)
+
+        # Walk the IR via the recursive ``_walk_op`` helper so the
+        # if/while-region visitors can recurse into body ops without
+        # duplicating the dispatch table. ``_ensure_buffer_var``
+        # fires lazily off load/store so an unused param doesn't
+        # produce a SPIR-V validation error.
         for op in fn.body.ops:
-            visitor = _DISPATCH.get(type(op))
-            if visitor is None:
-                raise NotImplementedError(
-                    f"SpirVLowerer: no visitor for {type(op).__name__}. "
-                    "See PORTABILITY_PLAN §3.2 — visitor coverage table."
-                )
-            visitor(op, ctx)
+            _walk_op(op, ctx)
 
         text.emit_function("OpReturn")
         text.emit_function("OpFunctionEnd")
@@ -423,13 +618,15 @@ class SpirVLowerer:
         # GLSL→SPIR-V test fixture was built against; the framework
         # lowerer here goes through ``spirv-as`` at vulkan1.3 and
         # has to play by the stricter rule.
-        local_size = self._resolve_local_size(fn)
+        local_size = ctx.local_size
         interface = []
         if ctx.local_inv_id_var:
             interface.append(ctx.local_inv_id_var)
+        if ctx.workgroup_id_var:
+            interface.append(ctx.workgroup_id_var)
         # Storage buffers in declaration order — matches binding
         # index, makes the disassembly readable.
-        for binding_index, t in enumerate(global_tensors):
+        for t in global_tensors:
             var_id = ctx.tensor_to_var.get(id(t))
             if var_id is not None:
                 interface.append(var_id)
@@ -449,7 +646,14 @@ class SpirVLowerer:
 
     def _collect_global_tensors(self, fn: Function, ctx: _SpvCtx) -> list[GlobalTensor]:
         """Walk the IR's load/store ops and collect the GlobalTensor
-        objects in the order they're first referenced."""
+        objects in the order they're first referenced.
+
+        Recurses into op-owned regions (``IfRegionOp.then_region`` /
+        ``.else_region``, ``ForLoopOp.body_region``, etc.) — kernels
+        that touch a tensor only inside a structured-control-flow
+        body otherwise drop off the binding-collection pass and the
+        load/store visitor explodes with a KeyError.
+        """
         seen: dict[int, GlobalTensor] = {}
         order: list[GlobalTensor] = []
 
@@ -459,11 +663,17 @@ class SpirVLowerer:
             seen[id(t)] = t
             order.append(t)
 
-        for op in fn.body.ops:
-            if isinstance(op, (LoadOp, StoreOp)):
-                t = op.attrs.get("tensor")
-                if isinstance(t, GlobalTensor):
-                    consider(t)
+        def walk(ops):
+            for op in ops:
+                if isinstance(op, (LoadOp, StoreOp)):
+                    t = op.attrs.get("tensor")
+                    if isinstance(t, GlobalTensor):
+                        consider(t)
+                # Generic recursion through any op-owned regions.
+                for region in getattr(op, "regions", ()):
+                    walk(region.ops)
+
+        walk(fn.body.ops)
         return order
 
     def _resolve_local_size(self, fn: Function) -> tuple[int, int, int]:

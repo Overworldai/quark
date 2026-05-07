@@ -131,6 +131,78 @@ def driver():
     return spv.SpvDriver()
 
 
+def _build_vec_add_with_bounds_ir(n: int):
+    """Bounds-check pattern: dispatch a multiple-of-local-size grid,
+    use ``if (i < n)`` to skip out-of-range elements. Mirrors the
+    GLSL fixture from §3.1's compile/launch test, but built from
+    quark IR so the ``CmpOp`` + ``IfRegionOp`` + ``BlockIdxOp`` +
+    ``BlockDimOp`` visitors get exercised.
+
+    Global thread id is the standard ``block_idx*block_dim +
+    thread_idx`` composition — the same shape every multi-workgroup
+    kernel emits.
+    """
+    import quark.lang as qk
+
+    b = Builder("vec_add_bounds_module")
+    fn = b.begin_function("vec_add_bounds")
+    b.param("X", BufferType(DType.F32))
+    b.param("Y", BufferType(DType.F32))
+    b.param("Z", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_y = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Y", param=fn.params[1])
+    g_z = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Z", param=fn.params[2])
+
+    gid = b.add(b.mul(b.block_idx("x"), b.block_dim("x")), b.thread_idx("x"))
+    n_const = b.const(DType.U32, n)
+    pred = b.cmp("lt", gid, n_const)
+    with qk.if_(pred) as (then_in, else_in, arms):
+        with arms.then_():
+            b.store(g_z, b.add(b.load(g_x, gid), b.load(g_y, gid)), gid)
+            qk.yield_()
+        with arms.else_():
+            qk.yield_()
+    b.end_function()
+    return b.module
+
+
+class TestBoundsCheckedKernel:
+    """Tier 1 goldens for the bounds-check / multi-workgroup path —
+    the visitor set the §3.2 second-cut adds."""
+
+    def test_emits_workgroup_id_for_block_idx(self):
+        result = SpirVLowerer(local_size=(64, 1, 1)).lower_module(
+            _build_vec_add_with_bounds_ir(100)
+        )
+        # Both LocalInvocationId AND WorkgroupId in interface, since
+        # the kernel composes a global id from both.
+        assert "BuiltIn LocalInvocationId" in result.source
+        assert "BuiltIn WorkgroupId" in result.source
+
+    def test_emits_constant_for_block_dim(self):
+        result = SpirVLowerer(local_size=(64, 1, 1)).lower_module(
+            _build_vec_add_with_bounds_ir(100)
+        )
+        # block_dim("x") is a compile-time constant (LocalSize.x).
+        assert "OpConstant " in result.source
+        assert "64" in result.source
+
+    def test_emits_structured_if(self):
+        result = SpirVLowerer(local_size=(64, 1, 1)).lower_module(
+            _build_vec_add_with_bounds_ir(100)
+        )
+        src = result.source
+        assert "OpSelectionMerge" in src
+        assert "OpBranchConditional" in src
+        # Two OpBranch (one per arm), one OpReturn at function exit.
+        assert src.count("OpBranch ") >= 2
+        # The bounds check uses ULessThan on u32.
+        assert "OpULessThan" in src
+
+
 @pytestmark_e2e
 def test_vec_add_end_to_end_through_lowerer(driver):
     """The full pipeline: build IR → lower → assemble → compile →
@@ -167,6 +239,50 @@ def test_vec_add_end_to_end_through_lowerer(driver):
     # Single-workgroup dispatch: grid is (1, 1, 1), workgroup size
     # is local_size = (n, 1, 1), so n threads cover the n elements.
     driver.launch(compiled, (1, 1, 1), [a_h, b_h, c_h], push_bytes=b"")
+
+    got = np.empty(n, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, c_map, got.nbytes)
+    np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
+@pytestmark_e2e
+def test_vec_add_with_bounds_end_to_end(driver):
+    """Multi-workgroup dispatch + bounds check. The kernel computes
+    a global thread id from ``block_idx*block_dim + thread_idx``,
+    early-exits when ``gid >= n``. Dispatch grid is
+    ``ceil(n / local_size)`` workgroups; the trailing partial
+    workgroup hits the bounds check and skips work without writing
+    out of range.
+    """
+    from quark.lower.spv import text_to_binary
+
+    n = 100  # not a multiple of 64 — partial trailing workgroup
+    local_size_x = 64
+    n_workgroups = (n + local_size_x - 1) // local_size_x
+    rng = np.random.default_rng(0xABCDEF)
+    X = rng.standard_normal(n).astype(np.float32)
+    Y = rng.standard_normal(n).astype(np.float32)
+    expected = X + Y
+
+    result = SpirVLowerer(local_size=(local_size_x, 1, 1)).lower_module(
+        _build_vec_add_with_bounds_ir(n)
+    )
+    binary = text_to_binary(result.source)
+
+    nbytes = n * 4
+    a_h, a_map = driver.allocate_buffer(nbytes)
+    b_h, b_map = driver.allocate_buffer(nbytes)
+    c_h, c_map = driver.allocate_buffer(nbytes)
+    ctypes.memmove(a_map, X.ctypes.data, X.nbytes)
+    ctypes.memmove(b_map, Y.ctypes.data, Y.nbytes)
+
+    compiled = driver.compile(
+        source=binary,
+        entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (n_workgroups, 1, 1), [a_h, b_h, c_h], push_bytes=b"")
 
     got = np.empty(n, dtype=np.float32)
     ctypes.memmove(got.ctypes.data, c_map, got.nbytes)
