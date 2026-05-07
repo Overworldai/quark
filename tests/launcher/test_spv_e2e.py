@@ -253,6 +253,52 @@ class TestExistingKernelsCompile:
         assert ck.module.handle != 0
         assert ck.module.n_buffers == 1  # single ``T`` buffer
 
+    def test_euler_step_runs_end_to_end_against_numpy_reference(self, spv_device):
+        """``EulerStepKernel`` runs end-to-end on Battlemage —
+        ``Out = X + Dsig[0] * V`` per element. Multi-buffer (4 storage
+        buffers) + multi-axis dispatch (the kernel uses ``block_idx
+        ('y')``) + scalar f32 dsig parameter.
+        """
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.euler_step.kernel import (
+            EulerStepConfig,
+            EulerStepKernel,
+            EulerStepSpec,
+            _reference,
+        )
+        from quark.launcher import Launcher
+
+        N = 128
+        rng = np.random.default_rng(0xFEEDBEEF)
+        X = rng.standard_normal(N).astype(np.float32)
+        V = rng.standard_normal(N).astype(np.float32)
+        Dsig = np.array([0.1], dtype=np.float32)
+        spec = EulerStepSpec(N=N, dtype=DType.F32)
+        expected = _reference(spec, X=X, V=V, Dsig=Dsig)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            EulerStepKernel, spec, EulerStepConfig(n_warps=2, elems_per_block=128),
+        )
+
+        nbytes = N * 4
+        x_h, x_map = _sd.allocate_buffer(nbytes)
+        v_h, v_map = _sd.allocate_buffer(nbytes)
+        d_h, d_map = _sd.allocate_buffer(4)
+        o_h, o_map = _sd.allocate_buffer(nbytes)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+        ctypes.memmove(v_map, V.ctypes.data, V.nbytes)
+        ctypes.memmove(d_map, Dsig.ctypes.data, Dsig.nbytes)
+
+        ck.launch(buffers=[x_h, v_h, d_h, o_h])
+
+        got = np.empty(N, dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-5)
+
     def test_silu_runs_end_to_end_against_numpy_reference(self, spv_device):
         """``SiLUKernel`` runs end-to-end on Battlemage and produces
         output matching the kernel's own ``silu_reference_numpy``.

@@ -1477,40 +1477,50 @@ class SpirVLowerer:
         )
 
     def _collect_global_tensors(self, fn: Function, ctx: _SpvCtx) -> list[GlobalTensor]:
-        """Walk the IR's load/store ops and collect the GlobalTensor
-        objects in the order they're first referenced.
+        """Collect GlobalTensors in **kernel-parameter order**.
 
-        Recurses into op-owned regions (``IfRegionOp.then_region`` /
-        ``.else_region``, ``ForLoopOp.body_region``, etc.) — kernels
-        that touch a tensor only inside a structured-control-flow
-        body otherwise drop off the binding-collection pass and the
-        load/store visitor explodes with a KeyError.
+        Binding indices feed into ``CompiledKernel.launch``'s per-
+        buffer dispatch; the launcher passes buffers in
+        ``ParamSpec.buffers`` order, which itself comes from the
+        kernel function's parameter declaration order. Earlier this
+        walked ops in encounter order (``LoadOp``s in the body), but
+        kernels often reference parameters in a different order than
+        they're declared (e.g. ``EulerStepKernel`` loads ``Dsig``
+        first, then ``X``, ``V``, ``Out``). Encounter-order binding
+        produced shader bindings out of phase with the framework's
+        per-buffer launch list — kernel reads the wrong buffer.
+
+        Walks IR ops to discover *which* params are actually used,
+        then orders by ``fn.params`` index. Unused params don't get
+        a binding (Vulkan rejects unreferenced descriptor-set
+        bindings on some configurations); they take a slot in the
+        launcher's buffer list anyway, but the lowerer skips them.
         """
-        seen: dict[int, GlobalTensor] = {}
-        order: list[GlobalTensor] = []
+        used_param_ids: set[int] = set()
+        param_to_tensor: dict[int, GlobalTensor] = {}
 
         def consider(t: GlobalTensor) -> None:
-            if id(t) in seen:
-                return
-            seen[id(t)] = t
-            order.append(t)
+            param_to_tensor.setdefault(id(t.param), t)
+            used_param_ids.add(id(t.param))
 
         def walk(ops):
             for op in ops:
-                # Every op kind that touches a tensor through its
-                # ``tensor`` attr — keep this list in sync with the
-                # visitor table. AsyncCopyOp uses dst_tensor /
-                # src_tensor (different keys); add when wired.
                 if isinstance(op, (LoadOp, StoreOp, VecLoadOp, VecStoreOp)):
                     t = op.attrs.get("tensor")
                     if isinstance(t, GlobalTensor):
                         consider(t)
-                # Generic recursion through any op-owned regions.
                 for region in getattr(op, "regions", ()):
                     walk(region.ops)
 
         walk(fn.body.ops)
-        return order
+
+        # Order by the param's index in ``fn.params``, so bindings 0
+        # ..n-1 line up with the launcher's per-buffer launch list.
+        ordered: list[GlobalTensor] = []
+        for p in fn.params:
+            if id(p) in used_param_ids and id(p) in param_to_tensor:
+                ordered.append(param_to_tensor[id(p)])
+        return ordered
 
     def _resolve_local_size(self, fn: Function) -> tuple[int, int, int]:
         if self._local_size is not None:
