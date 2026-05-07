@@ -5,24 +5,48 @@
  * VkInstance / VkPhysicalDevice / VkDevice / VkQueue calls for the
  * Quark SPIR-V backend. PORTABILITY_PLAN §3.1 deliverable.
  *
- * Surface (kept tiny in this first cut — only ``probe`` is wired):
+ * Surface:
  *
- *     probe(device_index: int = 0) -> dict
- *         Init a VkInstance, enumerate VkPhysicalDevice, return a
- *         capability dict for the device at ``device_index``. Mirrors
- *         the standalone ``scripts/spirv/probe_coopmat.c`` probe but
- *         delivers the data into Python so ``drivers/spv.py`` can
- *         populate ``DeviceCaps`` without shelling out.
+ *     enumerate_devices() / probe(device_index)
+ *         Identity-only summary + full capability dict per device.
  *
- *     enumerate_devices() -> list[dict]
- *         Identity-only summary for every Vulkan physical device.
- *         Used by ``Engine.__new__`` family detection + by tests.
+ *     bind_device(device_index) -> None
+ *         Choose the active VkPhysicalDevice + create the VkDevice +
+ *         compute queue + command pool. Idempotent; second call with
+ *         a different index re-creates the device-side state.
  *
- * The compile/launch surface (``compile``, ``launch``, ``sync``,
- * buffer-pool helpers, fence-graph wiring) lands in subsequent
- * commits per PORTABILITY_PLAN §3.1's sub-phase map. Until then
- * ``SpvDriver`` raises NotImplementedError on any call past
- * device-probe — same shape ``SpirVLowerer`` had at §3.0.
+ *     allocate_buffer(nbytes) -> (handle, mapped_ptr)
+ *         Host-visible coherent storage buffer. ``handle`` is a u64
+ *         opaque token Python uses with ``launch``. ``mapped_ptr``
+ *         is an address Python's ``ctypes.memmove`` can write into
+ *         directly for upload / read from for download.
+ *
+ *     compile(spirv_bytes, entry, n_buffers, push_constants_size)
+ *         -> compile_handle
+ *         Build a VkShaderModule + VkDescriptorSetLayout +
+ *         VkPipelineLayout + VkPipeline. ``n_buffers`` is the number
+ *         of storage-buffer bindings the kernel reads/writes (slot
+ *         layout is sequential 0..n_buffers-1). ``push_constants_size``
+ *         is how many bytes of scalar args the kernel expects via
+ *         ``layout(push_constant)``.
+ *
+ *     launch(compile_handle, grid_xyz, buffer_handles, push_bytes)
+ *         -> None
+ *         Record a vkCmdDispatch into the persistent command buffer.
+ *         Synchronous-style today: the buffer is committed + waited
+ *         on inside ``launch`` itself (no accumulation yet — that's
+ *         a follow-up perf optim once a real workload exists).
+ *
+ *     sync() -> None
+ *         Wait for any pending GPU work. No-op in today's eager-
+ *         submit shape; lands functionality once accumulation does.
+ *
+ * The accumulation idiom that mirrors ``_metal_dispatch.cpp``'s
+ * MTLCommandBuffer batching (commit on ops threshold / output read /
+ * explicit sync) is a perf optim, not a correctness need — an eager
+ * submit-per-launch shape is correct, just slower at high dispatch
+ * rates. Land alongside the §3.7 v1 perf number that proves the
+ * accumulation pays off.
  *
  * Linker: needs ``-lvulkan``. Vulkan headers come from
  * ``libvulkan-dev`` (apt) / equivalent. No SDK install required —
@@ -59,15 +83,78 @@ namespace nb = nanobind;
 
 namespace {
 
+// Per-allocation buffer record. The mapped pointer is held for the
+// lifetime of the allocation — Vulkan's host-visible coherent memory
+// guarantees writes are visible to the GPU without an explicit flush.
+struct BufferAlloc {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    size_t nbytes = 0;
+};
+
+// Per-compiled-pipeline record. Kept as a single value rather than
+// chasing pointers so the launch path's hot loop stays branch-free.
+struct CompiledPipeline {
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t n_buffers = 0;
+    uint32_t push_size = 0;
+};
+
 struct Globals {
+    // Instance-level (created lazily on first probe / device call).
     VkInstance instance = VK_NULL_HANDLE;
     bool init_attempted = false;
     std::string init_error;
+
+    // Device-level (created on bind_device(device_index); recreated
+    // on a subsequent bind to a different index).
+    VkPhysicalDevice phys = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t queue_family = ~0u;
+    int bound_index = -1;
+
+    VkCommandPool cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+
+    // Descriptor pool — one set per dispatch today, refilled per
+    // sync(). Sized generously enough to absorb a typical Waypoint
+    // frame without re-allocating; resize on demand if a real
+    // workload exceeds.
+    VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+
+    // Cached memory-type indices for "host-visible coherent storage"
+    // (used by every alloc today) and "device-local storage" (the
+    // path the steady-state kernel will switch to once we have a
+    // staging-buffer loop).
+    uint32_t mem_host_visible = ~0u;
+    uint32_t mem_device_local = ~0u;
+
+    // u64 → record tables. We hand Python opaque integers so it
+    // doesn't have to learn nanobind capsules; the C side resolves
+    // back to the record on every call. Indices are dense + start
+    // from 1 (0 is reserved for "no handle").
+    std::vector<BufferAlloc> buffers;
+    std::vector<CompiledPipeline> pipelines;
 };
 
 Globals& globals() {
     static Globals g;
     return g;
+}
+
+void check(VkResult r, const char* where) {
+    if (r != VK_SUCCESS) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "%s failed (VkResult=%d)", where, static_cast<int>(r));
+        throw std::runtime_error(buf);
+    }
 }
 
 void ensure_instance() {
@@ -277,6 +364,443 @@ nb::dict probe_device(VkInstance instance, VkPhysicalDevice phys) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Device binding — pick a VkPhysicalDevice and stand up its VkDevice +
+// compute queue + command pool + descriptor pool + per-launch fence.
+// Re-enterable: a second call with a different index tears the prior
+// state down first.
+// ---------------------------------------------------------------------------
+
+uint32_t pick_compute_queue_family(VkPhysicalDevice phys) {
+    uint32_t n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &n, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(n);
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &n, qf.data());
+    // Prefer compute-only family (often higher-priority on the GPU's
+    // scheduler than the universal graphics+compute one). Fall back
+    // to any family that advertises COMPUTE.
+    for (uint32_t i = 0; i < n; ++i) {
+        if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            return i;
+        }
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) return i;
+    }
+    throw std::runtime_error("no Vulkan queue family with COMPUTE");
+}
+
+void cache_memory_type_indices(Globals& g) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g.phys, &mp);
+    g.mem_host_visible = ~0u;
+    g.mem_device_local = ~0u;
+    // Walk types in order; prefer COHERENT (no manual flush needed)
+    // for the host-visible slot.
+    constexpr VkMemoryPropertyFlags HV =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        VkMemoryPropertyFlags pf = mp.memoryTypes[i].propertyFlags;
+        if (g.mem_host_visible == ~0u && (pf & HV) == HV) {
+            g.mem_host_visible = i;
+        }
+        if (g.mem_device_local == ~0u &&
+            (pf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            g.mem_device_local = i;
+        }
+    }
+    if (g.mem_host_visible == ~0u) {
+        throw std::runtime_error(
+            "no HOST_VISIBLE | HOST_COHERENT memory type — required for "
+            "spv_dispatch's first-cut buffer allocator");
+    }
+}
+
+void teardown_device_state(Globals& g) {
+    if (g.device == VK_NULL_HANDLE) return;
+    vkDeviceWaitIdle(g.device);
+    for (auto& p : g.pipelines) {
+        if (p.pipeline) vkDestroyPipeline(g.device, p.pipeline, nullptr);
+        if (p.layout) vkDestroyPipelineLayout(g.device, p.layout, nullptr);
+        if (p.dsl) vkDestroyDescriptorSetLayout(g.device, p.dsl, nullptr);
+        if (p.module) vkDestroyShaderModule(g.device, p.module, nullptr);
+    }
+    g.pipelines.clear();
+    for (auto& b : g.buffers) {
+        if (b.mapped) vkUnmapMemory(g.device, b.memory);
+        if (b.buffer) vkDestroyBuffer(g.device, b.buffer, nullptr);
+        if (b.memory) vkFreeMemory(g.device, b.memory, nullptr);
+    }
+    g.buffers.clear();
+    if (g.desc_pool) vkDestroyDescriptorPool(g.device, g.desc_pool, nullptr);
+    if (g.fence) vkDestroyFence(g.device, g.fence, nullptr);
+    if (g.cmd_buf) vkFreeCommandBuffers(g.device, g.cmd_pool, 1, &g.cmd_buf);
+    if (g.cmd_pool) vkDestroyCommandPool(g.device, g.cmd_pool, nullptr);
+    vkDestroyDevice(g.device, nullptr);
+    g.device = VK_NULL_HANDLE;
+    g.queue = VK_NULL_HANDLE;
+    g.cmd_pool = VK_NULL_HANDLE;
+    g.cmd_buf = VK_NULL_HANDLE;
+    g.fence = VK_NULL_HANDLE;
+    g.desc_pool = VK_NULL_HANDLE;
+    g.bound_index = -1;
+}
+
+void bind_device_internal(uint32_t index) {
+    Globals& g = globals();
+    if (g.bound_index == static_cast<int>(index)) return;  // already there
+    teardown_device_state(g);
+
+    auto devices = physical_devices();
+    if (index >= devices.size()) {
+        throw std::out_of_range(
+            "bind_device: device_index out of range");
+    }
+    g.phys = devices[index];
+    g.queue_family = pick_compute_queue_family(g.phys);
+    cache_memory_type_indices(g);
+
+    // Build VkDevice with the bf16 feature chain enabled so the
+    // SPIR-V we'll emit can declare `BFloat16` capability and
+    // `OpCooperativeMatrixMulAddKHR` ops at bf16. Pass any feature
+    // we can — the driver will silently drop ones it doesn't
+    // advertise (no failure mode there) — but only the ones we
+    // actually plan to use today.
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16{};
+    bf16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+    bf16.shaderBFloat16Type = VK_TRUE;
+    bf16.shaderBFloat16CooperativeMatrix = VK_TRUE;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopmat{};
+    coopmat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    coopmat.cooperativeMatrix = VK_TRUE;
+    coopmat.pNext = &bf16;
+    VkPhysicalDeviceVulkan12Features v12{};
+    v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    v12.shaderBufferInt64Atomics = VK_FALSE;
+    v12.pNext = &coopmat;
+
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.queueFamilyIndex = g.queue_family;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+
+    // Enable the extensions the SPIR-V backend will need. Surface
+    // them via `vkEnumerateDeviceExtensionProperties` first so
+    // we don't request anything the driver doesn't expose
+    // (otherwise vkCreateDevice fails). Mesa Battlemage does
+    // ship all these.
+    std::vector<const char*> ext_names = {
+        "VK_KHR_cooperative_matrix",
+        "VK_KHR_shader_bfloat16",
+    };
+    uint32_t n_ext = 0;
+    vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &n_ext, nullptr);
+    std::vector<VkExtensionProperties> avail(n_ext);
+    vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &n_ext, avail.data());
+    auto has_ext = [&](const char* name) {
+        for (const auto& e : avail) {
+            if (std::strcmp(e.extensionName, name) == 0) return true;
+        }
+        return false;
+    };
+    std::vector<const char*> enabled_ext;
+    for (auto* e : ext_names) {
+        if (has_ext(e)) enabled_ext.push_back(e);
+    }
+
+    VkDeviceCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = static_cast<uint32_t>(enabled_ext.size());
+    dci.ppEnabledExtensionNames = enabled_ext.data();
+    dci.pNext = &v12;
+    check(vkCreateDevice(g.phys, &dci, nullptr, &g.device), "vkCreateDevice");
+
+    vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
+
+    VkCommandPoolCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpci.queueFamilyIndex = g.queue_family;
+    check(vkCreateCommandPool(g.device, &cpci, nullptr, &g.cmd_pool),
+          "vkCreateCommandPool");
+
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = g.cmd_pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    check(vkAllocateCommandBuffers(g.device, &cbai, &g.cmd_buf),
+          "vkAllocateCommandBuffers");
+
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    check(vkCreateFence(g.device, &fci, nullptr, &g.fence), "vkCreateFence");
+
+    // Descriptor pool — sized for ~64 unique pipeline launches
+    // before reset; 8 storage-buffer slots per launch is plenty
+    // for the kernels in tree (qkv_proj at 5 buffers is the upper
+    // bound today). Resize on demand later.
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps.descriptorCount = 64 * 8;
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpci.maxSets = 64;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    check(vkCreateDescriptorPool(g.device, &dpci, nullptr, &g.desc_pool),
+          "vkCreateDescriptorPool");
+
+    g.bound_index = static_cast<int>(index);
+}
+
+void ensure_device() {
+    Globals& g = globals();
+    if (g.device != VK_NULL_HANDLE) return;
+    auto devices = physical_devices();
+    if (devices.empty()) {
+        throw std::runtime_error("no Vulkan physical devices");
+    }
+    bind_device_internal(0);
+}
+
+// ---------------------------------------------------------------------------
+// Buffer allocation. Host-visible coherent storage today — fine for
+// iGPU dev (Battlemage's unified memory means HV is also DEVICE_LOCAL
+// in practice). Add a staging-buffer loop + pure DEVICE_LOCAL pool
+// once the §3.7 v2 sweep on discrete Arc demands it.
+// ---------------------------------------------------------------------------
+
+uint64_t allocate_buffer_internal(uint64_t nbytes) {
+    ensure_device();
+    Globals& g = globals();
+
+    BufferAlloc rec{};
+    rec.nbytes = static_cast<size_t>(nbytes);
+
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = nbytes;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    check(vkCreateBuffer(g.device, &bci, nullptr, &rec.buffer),
+          "vkCreateBuffer");
+
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g.device, rec.buffer, &mr);
+
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = g.mem_host_visible;
+    check(vkAllocateMemory(g.device, &mai, nullptr, &rec.memory),
+          "vkAllocateMemory");
+    check(vkBindBufferMemory(g.device, rec.buffer, rec.memory, 0),
+          "vkBindBufferMemory");
+
+    check(vkMapMemory(g.device, rec.memory, 0, mr.size, 0, &rec.mapped),
+          "vkMapMemory");
+    std::memset(rec.mapped, 0, rec.nbytes);
+
+    g.buffers.push_back(rec);
+    // Hand back a 1-based index so 0 stays reserved for "no handle".
+    return static_cast<uint64_t>(g.buffers.size());
+}
+
+BufferAlloc& resolve_buffer(uint64_t handle) {
+    Globals& g = globals();
+    if (handle == 0 || handle > g.buffers.size()) {
+        throw std::out_of_range("buffer handle out of range");
+    }
+    return g.buffers[static_cast<size_t>(handle) - 1];
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline compilation.
+//
+// Layout convention (locked for v1):
+//   * All buffers are storage buffers, bound at sequential
+//     descriptor-set #0 bindings 0..n_buffers-1.
+//   * Push constants occupy a single VK_SHADER_STAGE_COMPUTE range
+//     of size ``push_constants_size`` bytes (zero → no PC range).
+//   * SPIR-V binary's entry point name is ``entry`` (typically "main").
+//   * No specialisation constants today — the SubgroupSize pin per
+//     §3.5 lands as a spec const here in a follow-up.
+// ---------------------------------------------------------------------------
+
+uint64_t compile_internal(
+    const void* spirv_blob, size_t blob_nbytes,
+    const std::string& entry, uint32_t n_buffers,
+    uint32_t push_constants_size
+) {
+    ensure_device();
+    Globals& g = globals();
+
+    if (blob_nbytes % 4 != 0) {
+        throw std::runtime_error(
+            "compile: SPIR-V blob length must be a multiple of 4 bytes");
+    }
+
+    CompiledPipeline rec{};
+    rec.n_buffers = n_buffers;
+    rec.push_size = push_constants_size;
+
+    // 1. Shader module from the SPIR-V binary.
+    VkShaderModuleCreateInfo smci{};
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = blob_nbytes;
+    smci.pCode = static_cast<const uint32_t*>(spirv_blob);
+    check(vkCreateShaderModule(g.device, &smci, nullptr, &rec.module),
+          "vkCreateShaderModule");
+
+    // 2. Descriptor set layout — one storage-buffer binding per slot.
+    std::vector<VkDescriptorSetLayoutBinding> bindings(n_buffers);
+    for (uint32_t i = 0; i < n_buffers; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslci{};
+    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = n_buffers;
+    dslci.pBindings = bindings.data();
+    check(vkCreateDescriptorSetLayout(g.device, &dslci, nullptr, &rec.dsl),
+          "vkCreateDescriptorSetLayout");
+
+    // 3. Pipeline layout — one descriptor set + maybe push constants.
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = push_constants_size;
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &rec.dsl;
+    plci.pushConstantRangeCount = (push_constants_size > 0) ? 1 : 0;
+    plci.pPushConstantRanges = (push_constants_size > 0) ? &pcr : nullptr;
+    check(vkCreatePipelineLayout(g.device, &plci, nullptr, &rec.layout),
+          "vkCreatePipelineLayout");
+
+    // 4. Compute pipeline.
+    VkPipelineShaderStageCreateInfo ssci{};
+    ssci.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ssci.module = rec.module;
+    ssci.pName = entry.c_str();
+
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage = ssci;
+    cpci.layout = rec.layout;
+    check(vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &cpci,
+                                   nullptr, &rec.pipeline),
+          "vkCreateComputePipelines");
+
+    g.pipelines.push_back(rec);
+    return static_cast<uint64_t>(g.pipelines.size());  // 1-based handle
+}
+
+CompiledPipeline& resolve_pipeline(uint64_t handle) {
+    Globals& g = globals();
+    if (handle == 0 || handle > g.pipelines.size()) {
+        throw std::out_of_range("pipeline handle out of range");
+    }
+    return g.pipelines[static_cast<size_t>(handle) - 1];
+}
+
+// ---------------------------------------------------------------------------
+// Launch — record + submit + wait. Eager today (§3.1 MVP); accumulate
+// in a follow-up commit when a perf number demands it.
+// ---------------------------------------------------------------------------
+
+void launch_internal(
+    uint64_t pipeline_handle,
+    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+    const std::vector<uint64_t>& buffer_handles,
+    const void* push_bytes, uint32_t push_nbytes
+) {
+    Globals& g = globals();
+    CompiledPipeline& p = resolve_pipeline(pipeline_handle);
+
+    if (buffer_handles.size() != p.n_buffers) {
+        throw std::runtime_error(
+            "launch: buffer_handles count != n_buffers from compile()");
+    }
+    if (push_nbytes != p.push_size) {
+        throw std::runtime_error(
+            "launch: push_bytes size != push_constants_size from compile()");
+    }
+
+    // Allocate a fresh descriptor set for this dispatch. The pool is
+    // created with FREE_DESCRIPTOR_SET_BIT so we can immediately
+    // free it after sync(). In v2 we'll switch to per-pipeline
+    // long-lived sets keyed on (pipeline, buffer-tuple).
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = g.desc_pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &p.dsl;
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+    check(vkAllocateDescriptorSets(g.device, &dsai, &ds),
+          "vkAllocateDescriptorSets");
+
+    // Wire each buffer handle to its descriptor binding.
+    std::vector<VkDescriptorBufferInfo> buf_infos(p.n_buffers);
+    std::vector<VkWriteDescriptorSet> writes(p.n_buffers);
+    for (uint32_t i = 0; i < p.n_buffers; ++i) {
+        BufferAlloc& b = resolve_buffer(buffer_handles[i]);
+        buf_infos[i].buffer = b.buffer;
+        buf_infos[i].offset = 0;
+        buf_infos[i].range = VK_WHOLE_SIZE;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = ds;
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buf_infos[i];
+    }
+    vkUpdateDescriptorSets(g.device, p.n_buffers, writes.data(), 0, nullptr);
+
+    // Record + submit + wait. Eager.
+    VkCommandBufferBeginInfo cbbi{};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkResetCommandBuffer(g.cmd_buf, 0), "vkResetCommandBuffer");
+    check(vkBeginCommandBuffer(g.cmd_buf, &cbbi), "vkBeginCommandBuffer");
+    vkCmdBindPipeline(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    vkCmdBindDescriptorSets(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            p.layout, 0, 1, &ds, 0, nullptr);
+    if (push_nbytes > 0) {
+        vkCmdPushConstants(g.cmd_buf, p.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, push_nbytes, push_bytes);
+    }
+    vkCmdDispatch(g.cmd_buf, grid_x, grid_y, grid_z);
+    check(vkEndCommandBuffer(g.cmd_buf), "vkEndCommandBuffer");
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.cmd_buf;
+    check(vkResetFences(g.device, 1, &g.fence), "vkResetFences");
+    check(vkQueueSubmit(g.queue, 1, &si, g.fence), "vkQueueSubmit");
+    check(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX),
+          "vkWaitForFences");
+
+    // Free this dispatch's descriptor set so the pool stays low.
+    vkFreeDescriptorSets(g.device, g.desc_pool, 1, &ds);
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -326,4 +850,74 @@ NB_MODULE(_spv_dispatch, m) {
     "``device_index``. Same data the standalone ``scripts/spirv/"
     "probe_coopmat.c`` dumps to stdout, but parsed into Python types "
     "so ``drivers/spv.py`` can populate ``DeviceCaps`` directly.");
+
+    m.def("bind_device", [](uint32_t device_index) {
+        bind_device_internal(device_index);
+    },
+    nb::arg("device_index") = 0,
+    "Stand up VkDevice + compute queue + command pool for the device "
+    "at ``device_index``. Idempotent; re-binding to a different index "
+    "tears the prior state down first.");
+
+    m.def("allocate_buffer", [](uint64_t nbytes) {
+        uint64_t handle = allocate_buffer_internal(nbytes);
+        BufferAlloc& b = resolve_buffer(handle);
+        return nb::make_tuple(handle, reinterpret_cast<uintptr_t>(b.mapped));
+    },
+    nb::arg("nbytes"),
+    "Allocate a host-visible coherent storage buffer of ``nbytes`` "
+    "bytes. Returns ``(handle, mapped_ptr)`` — handle is opaque, "
+    "mapped_ptr is an integer address callers (typically Python's "
+    "``ctypes.memmove``) write into / read from for upload / "
+    "download.");
+
+    m.def("compile", [](nb::bytes spirv,
+                        const std::string& entry,
+                        uint32_t n_buffers,
+                        uint32_t push_constants_size) {
+        return compile_internal(spirv.c_str(), spirv.size(),
+                                entry, n_buffers, push_constants_size);
+    },
+    nb::arg("spirv"),
+    nb::arg("entry") = "main",
+    nb::arg("n_buffers"),
+    nb::arg("push_constants_size") = 0,
+    "Compile a SPIR-V binary blob to a dispatchable Vulkan compute "
+    "pipeline. ``n_buffers`` storage-buffer bindings at descriptor "
+    "set 0 (sequential bindings 0..n_buffers-1). "
+    "``push_constants_size`` bytes of push constants if non-zero. "
+    "Returns an opaque pipeline handle for ``launch``.");
+
+    m.def("launch", [](uint64_t pipeline,
+                       nb::tuple grid,
+                       std::vector<uint64_t> buffers,
+                       nb::bytes push_bytes) {
+        if (grid.size() != 3) {
+            throw std::runtime_error("launch: grid must be (x, y, z)");
+        }
+        uint32_t gx = nb::cast<uint32_t>(grid[0]);
+        uint32_t gy = nb::cast<uint32_t>(grid[1]);
+        uint32_t gz = nb::cast<uint32_t>(grid[2]);
+        launch_internal(pipeline, gx, gy, gz, buffers,
+                        push_bytes.c_str(),
+                        static_cast<uint32_t>(push_bytes.size()));
+    },
+    nb::arg("pipeline"),
+    nb::arg("grid"),
+    nb::arg("buffers"),
+    nb::arg("push_bytes") = nb::bytes(""),
+    "Record + submit + wait on one vkCmdDispatch. ``grid`` is "
+    "``(x, y, z)`` workgroup count. ``buffers`` is a list of buffer "
+    "handles in binding-slot order. ``push_bytes`` is the raw push-"
+    "constant payload (empty if push_constants_size was 0).");
+
+    m.def("sync", []() {
+        Globals& g = globals();
+        if (g.device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(g.device);
+        }
+    },
+    "Wait for all pending GPU work to complete. No-op in the eager-"
+    "submit shape today (every launch already waits inline); turns "
+    "into a real wait once command-buffer accumulation lands.");
 }

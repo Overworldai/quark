@@ -1,0 +1,22 @@
+#version 450
+// Minimal "C[i] = A[i] + B[i]" compute shader. Used as the
+// PORTABILITY_PLAN §3.1 end-to-end smoke for the SPIR-V backend's
+// compile + launch path. Compile to a SPIR-V binary blob via:
+//
+//     glslangValidator -V vector_add.comp -o vector_add.spv
+//
+// Loaded by ``test_spv_compile_launch.py``.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer A_buf { float A[]; };
+layout(set = 0, binding = 1) readonly  buffer B_buf { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer C_buf { float C[]; };
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    C[i] = A[i] + B[i];
+}

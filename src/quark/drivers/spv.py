@@ -286,25 +286,23 @@ def _dtypes_from_probe(probe_dict: dict[str, Any]) -> frozenset[str]:
 
 @dataclass
 class SpvCompiledModule:
-    """Opaque SPIR-V compiled handle.
+    """Opaque handle for a SPIR-V binary that's been built into a
+    Vulkan compute pipeline.
 
-    Mirrors ``CudaCompiledModule`` / Metal's compiled-pipeline
-    dataclass. Filled in by ``SpvDriver.compile`` once that lands;
-    today the dataclass exists so the type-only side of the launcher
-    can reference it.
+    ``handle`` is the C-side pipeline-table index returned by
+    ``_spv_dispatch.compile``. ``n_buffers`` and ``push_size`` are
+    cached here so ``SpvDriver.launch`` can validate caller-side
+    before touching the C surface.
 
-    ``pipeline`` is the ``VkPipeline`` handle (uint64 from C).
-    ``layout`` is the ``VkPipelineLayout``.
-    ``descriptor_set_layout`` is the ``VkDescriptorSetLayout``.
-    ``smem_bytes`` is the kernel's static threadgroup-memory ask;
-    Vulkan's ``maxComputeSharedMemorySize`` cap is enforced by
-    ``compile``.
+    ``smem_bytes`` is the kernel's static threadgroup-memory ask
+    (Vulkan's ``maxComputeSharedMemorySize`` cap is enforced by
+    the C ext at compile time).
     """
 
-    pipeline: int
-    layout: int
-    descriptor_set_layout: int
-    smem_bytes: int
+    handle: int
+    n_buffers: int
+    push_size: int
+    smem_bytes: int = 0
 
 
 class SpvDriver:
@@ -315,7 +313,8 @@ class SpvDriver:
     """
 
     def __init__(self, device_index: int | None = None):
-        if not is_available():
+        mod = _try_import_dispatch()
+        if mod is None or not is_available():
             raise RuntimeError(
                 "SpvDriver: Vulkan unavailable. Install libvulkan + an "
                 "ICD, then rebuild quark via ``pip install -e .`` on "
@@ -329,7 +328,12 @@ class SpvDriver:
                     "Devices: " + repr(enumerate_devices())
                 )
         self.device_index: int = device_index
+        self._dispatch = mod
         self._probe: dict[str, Any] | None = None
+        # Stand up the device-side state (VkDevice + queue + command
+        # pool + descriptor pool) up-front so ``compile`` / ``launch``
+        # don't pay first-call latency on the hot path.
+        mod.bind_device(device_index)
 
     @property
     def caps(self) -> DeviceCaps:
@@ -347,28 +351,97 @@ class SpvDriver:
         """
         return Device(family=DeviceFamily.INTEL_GPU, index=self.device_index, caps=self.caps)
 
-    def compile(self, source: bytes, entry: str, smem_bytes: int) -> SpvCompiledModule:
-        """Compile a SPIR-V binary blob to a dispatchable pipeline.
+    def compile(
+        self,
+        source: bytes,
+        entry: str = "main",
+        *,
+        n_buffers: int,
+        push_constants_size: int = 0,
+        smem_bytes: int = 0,
+    ) -> SpvCompiledModule:
+        """Compile a SPIR-V binary blob to a Vulkan compute pipeline.
 
-        Lands in PORTABILITY_PLAN §3.1's compile/launch follow-up
-        commit. Today raises with a pointer at the plan so callers
-        get a clear progress signal.
+        ``source`` is the raw SPIR-V binary (multiple of 4 bytes).
+        ``entry`` is the entry-point symbol name (defaults to
+        ``"main"`` — the shipped GLSL convention).
+        ``n_buffers`` is the count of storage-buffer bindings the
+        kernel reads/writes; bindings are sequential 0..n-1 at
+        descriptor set 0.
+        ``push_constants_size`` is the byte width of the push-constant
+        block (0 for kernels without scalars).
+        ``smem_bytes`` is the static threadgroup memory ask — checked
+        against ``DeviceCaps.max_smem_per_block`` here (cheap caller-
+        side check) before the driver call.
+
+        Returns an ``SpvCompiledModule`` carrying the C-side handle
+        and the validation parameters. The same handle dispatches
+        through ``launch``.
         """
-        del source, entry, smem_bytes
-        raise NotImplementedError(
-            "SpvDriver.compile: lands in the next §3.1 commit. See "
-            "PORTABILITY_PLAN §3.1 — runtime-choice section is done; "
-            "vkCreateShaderModule + vkCreateComputePipelines wiring "
-            "is the next step."
+        if smem_bytes > self.caps.max_smem_per_block:
+            raise ValueError(
+                f"SpvDriver.compile: kernel needs {smem_bytes} smem bytes "
+                f"but device caps only allow {self.caps.max_smem_per_block}"
+            )
+        handle = self._dispatch.compile(
+            spirv=source,
+            entry=entry,
+            n_buffers=n_buffers,
+            push_constants_size=push_constants_size,
+        )
+        return SpvCompiledModule(
+            handle=handle,
+            n_buffers=n_buffers,
+            push_size=push_constants_size,
+            smem_bytes=smem_bytes,
         )
 
-    def launch(self, *args, **kwargs) -> None:
-        """Record a dispatch into the active command buffer.
+    def launch(
+        self,
+        compiled: SpvCompiledModule,
+        grid: tuple[int, int, int],
+        buffer_handles: list[int],
+        push_bytes: bytes = b"",
+    ) -> None:
+        """Record + submit + wait on one ``vkCmdDispatch`` of
+        ``compiled`` over ``buffer_handles`` at workgroup grid
+        ``grid``.
 
-        Lands alongside ``compile`` in §3.1's compile/launch commit.
+        Eager-submit shape today (every launch waits inline). The
+        accumulating-command-buffer optim — matching
+        ``_metal_dispatch``'s MTLCommandBuffer batching — lands once
+        a perf number from §3.7 v1 demands it.
         """
-        del args, kwargs
-        raise NotImplementedError(
-            "SpvDriver.launch: lands in the next §3.1 commit alongside "
-            "``compile``. See PORTABILITY_PLAN §3.1."
+        if len(buffer_handles) != compiled.n_buffers:
+            raise ValueError(
+                f"launch: got {len(buffer_handles)} buffers but the "
+                f"compiled pipeline expects {compiled.n_buffers}"
+            )
+        if len(push_bytes) != compiled.push_size:
+            raise ValueError(
+                f"launch: push_bytes is {len(push_bytes)} bytes but the "
+                f"compiled pipeline expects {compiled.push_size}"
+            )
+        self._dispatch.launch(
+            compiled.handle,
+            grid,
+            list(buffer_handles),
+            push_bytes=push_bytes,
         )
+
+    def allocate_buffer(self, nbytes: int) -> tuple[int, int]:
+        """Allocate a host-visible storage buffer of ``nbytes`` bytes.
+        Returns ``(handle, mapped_ptr)`` — handle is opaque (consumed
+        by ``launch``), mapped_ptr is the address Python's
+        ``ctypes.memmove`` writes into / reads from for upload /
+        download.
+        """
+        return tuple(self._dispatch.allocate_buffer(nbytes))
+
+    def sync(self) -> None:
+        """Wait for any pending GPU work to complete.
+
+        No-op in today's eager shape (every launch waits inline);
+        gains effect once command-buffer accumulation lands.
+        """
+        self._dispatch.sync()

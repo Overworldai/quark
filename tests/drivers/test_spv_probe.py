@@ -181,13 +181,38 @@ def test_spv_driver_construct_when_vulkan_available(spv_module, vulkan_available
     assert caps is not None
 
 
-def test_spv_driver_compile_raises_with_plan_pointer(spv_module, vulkan_available):
-    """Until the §3.1 compile/launch commit lands, ``compile`` must
-    raise NotImplementedError pointing at the plan."""
+def test_spv_driver_compile_validates_smem_budget(spv_module, vulkan_available):
+    """``compile`` rejects kernels asking for more threadgroup memory
+    than the device exposes. Caller-side validation; cheaper than
+    letting Vulkan reject the pipeline."""
     if not vulkan_available:
         pytest.skip("requires Vulkan to construct SpvDriver")
     drv = spv_module.SpvDriver()
-    with pytest.raises(NotImplementedError, match="PORTABILITY_PLAN"):
-        drv.compile(b"", "main", 0)
-    with pytest.raises(NotImplementedError, match="PORTABILITY_PLAN"):
-        drv.launch()
+    huge = drv.caps.max_smem_per_block * 2 + 1
+    with pytest.raises(ValueError, match="smem"):
+        drv.compile(
+            source=b"\x03\x02\x23\x07",  # SPIR-V magic, never reached
+            entry="main",
+            n_buffers=1,
+            smem_bytes=huge,
+        )
+
+
+def test_spv_driver_launch_validates_buffer_count(spv_module, vulkan_available):
+    """Buffer-count + push-bytes mismatches surface as ValueError
+    from the Python facade — saves a trip into the C ext for the
+    obvious caller-side errors."""
+    if not vulkan_available:
+        pytest.skip("requires Vulkan")
+    drv = spv_module.SpvDriver()
+    # Build a fake compiled module — we never actually launch, the
+    # validation happens before the C call. Same shape for the test
+    # in test_spv_compile_launch.py that validates from inside the C
+    # ext; this one validates the Python facade's pre-check.
+    compiled = spv_module.SpvCompiledModule(
+        handle=0, n_buffers=3, push_size=4, smem_bytes=0,
+    )
+    with pytest.raises(ValueError, match="buffers"):
+        drv.launch(compiled, (1, 1, 1), [1, 2], push_bytes=b"\x00" * 4)
+    with pytest.raises(ValueError, match="push_bytes"):
+        drv.launch(compiled, (1, 1, 1), [1, 2, 3], push_bytes=b"\x00" * 8)
