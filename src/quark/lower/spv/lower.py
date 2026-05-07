@@ -80,6 +80,15 @@ class LoweredSpirVKernel:
     smem_bytes: int = 0
     local_size: tuple[int, int, int] = (1, 1, 1)
 
+    @property
+    def kernel_name(self) -> str:
+        """Compatibility alias matching ``LoweredKernel.kernel_name``
+        (CUDA) and ``LoweredMslKernel.kernel_name`` (Metal). The
+        launcher reads this property when constructing
+        ``CompiledKernel.entry`` — the SPIR-V backend uses the
+        explicit ``entry_name`` field (defaults to ``"main"``)."""
+        return self.entry_name
+
 
 @dataclass
 class _SpvCtx:

@@ -513,6 +513,24 @@ def _driver_for(family: DeviceFamily):
         from quark.drivers.metal import MetalDriver
 
         return MetalDriver
+    if family is DeviceFamily.INTEL_GPU:
+        from quark.drivers.spv import SpvDriver
+
+        # SpvDriver doesn't take a ``device=`` kwarg the way Cuda /
+        # MetalDriver do — it picks the default Vulkan device via
+        # ``pick_default_device`` unless ``device_index`` is passed.
+        # Adapt with a small wrapper class that swallows the
+        # ``device=`` kwarg the launcher passes through.
+        class _SpvDriverAdapter(SpvDriver):
+            def __init__(self, *, device=None):
+                # ``device`` is the quark Device; we don't need it for
+                # SpvDriver (it picks the Vulkan device from the
+                # available ICDs). Stash for parity.
+                super().__init__()
+                self._quark_device = device
+                self.family = DeviceFamily.INTEL_GPU
+
+        return _SpvDriverAdapter
     raise NotImplementedError(f"_driver_for: backend {family.value!r} not yet implemented")
 
 
@@ -598,6 +616,22 @@ class Launcher:
             compiled_mod = self.driver.compile(
                 lowered=lowered,
                 entry_name=lowered.kernel_name or kernel.entry_name(),
+                smem_bytes=lowered.smem_bytes,
+            )
+        elif self.device.family is DeviceFamily.INTEL_GPU:
+            # SPIR-V / Vulkan path. The lowerer emits SPIR-V text;
+            # ``text_to_binary`` shells out to ``spirv-as`` to get
+            # the binary blob the driver consumes. ``n_buffers`` /
+            # ``push_constants_size`` come from the lowered kernel
+            # metadata so SpvDriver.compile can validate at descriptor-
+            # set creation. See PORTABILITY_PLAN §3.1 / §3.2.
+            from quark.lower.spv import text_to_binary
+            spirv_binary = text_to_binary(lowered.source)
+            compiled_mod = self.driver.compile(
+                source=spirv_binary,
+                entry=lowered.entry_name,
+                n_buffers=lowered.n_buffers,
+                push_constants_size=lowered.push_constants_size,
                 smem_bytes=lowered.smem_bytes,
             )
         else:
