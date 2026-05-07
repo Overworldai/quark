@@ -234,6 +234,58 @@ def _visit_arith(op: ArithOp, ctx: _SpvCtx) -> None:
     kind = op.attrs.get("kind", "")
     operands = [ctx.val_to_id[v.id] for v in op.operands]
     type_id = _emit_dtype(ctx.text, out.dtype, ctx)
+
+    # Unary kinds need their own emit: SPIR-V doesn't have a single
+    # binary "neg" opcode the way binary kinds do. ``OpFNegate`` /
+    # ``OpSNegate`` for negation; ``GLSL.std.450 FAbs`` /
+    # ``SAbs`` for abs.
+    if kind == "neg":
+        if _dtype_kind(out.dtype) == "float":
+            spv_op = "OpFNegate"
+        elif _dtype_kind(out.dtype) == "sint":
+            spv_op = "OpSNegate"
+        else:
+            raise NotImplementedError(
+                f"_visit_arith(neg): unsigned negation isn't expressible — "
+                f"kernel emitted neg on {out.dtype!r}"
+            )
+        res_id = ctx.text.alloc_id("neg")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(f"{res_id} = {spv_op} {type_id} {operands[0]}")
+        return
+    if kind == "abs":
+        glsl_id = ctx.text.import_ext_inst("GLSL.std.450")
+        glsl_name = "FAbs" if _dtype_kind(out.dtype) == "float" else "SAbs"
+        res_id = ctx.text.alloc_id("abs")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = OpExtInst {type_id} {glsl_id} {glsl_name} {operands[0]}"
+        )
+        return
+    if kind == "fma":
+        # ``GLSL.std.450 Fma`` = a * b + c. Mirrors PTX ``fma.rn``.
+        glsl_id = ctx.text.import_ext_inst("GLSL.std.450")
+        res_id = ctx.text.alloc_id("fma")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = OpExtInst {type_id} {glsl_id} Fma {operands[0]} {operands[1]} {operands[2]}"
+        )
+        return
+    if kind in ("min", "max"):
+        glsl_id = ctx.text.import_ext_inst("GLSL.std.450")
+        if _dtype_kind(out.dtype) == "float":
+            glsl_name = "FMin" if kind == "min" else "FMax"
+        elif _dtype_kind(out.dtype) == "sint":
+            glsl_name = "SMin" if kind == "min" else "SMax"
+        else:
+            glsl_name = "UMin" if kind == "min" else "UMax"
+        res_id = ctx.text.alloc_id(kind)
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = OpExtInst {type_id} {glsl_id} {glsl_name} {operands[0]} {operands[1]}"
+        )
+        return
+
     spv_op = _ARITH_KIND_TO_SPV.get((kind, out.dtype))
     if spv_op is None:
         raise NotImplementedError(
@@ -250,6 +302,10 @@ def _visit_arith(op: ArithOp, ctx: _SpvCtx) -> None:
 # Add entries as new ops show up in the visitor coverage. Type-aware
 # because ``add`` lowers to ``OpFAdd`` for f32 but ``OpIAdd`` for
 # u32/s32 — same kind, different opcode.
+#
+# Bitwise / shift ops on int types use their integer SPIR-V opcodes
+# directly; SPIR-V doesn't distinguish signed/unsigned for And/Or/
+# Xor (the bit pattern is what matters).
 _ARITH_KIND_TO_SPV: dict[tuple[str, DType], str] = {
     ("add", DType.F32): "OpFAdd",
     ("sub", DType.F32): "OpFSub",
@@ -258,9 +314,23 @@ _ARITH_KIND_TO_SPV: dict[tuple[str, DType], str] = {
     ("add", DType.U32): "OpIAdd",
     ("sub", DType.U32): "OpISub",
     ("mul", DType.U32): "OpIMul",
+    ("div", DType.U32): "OpUDiv",
+    ("rem", DType.U32): "OpUMod",
     ("add", DType.S32): "OpIAdd",
     ("sub", DType.S32): "OpISub",
     ("mul", DType.S32): "OpIMul",
+    ("div", DType.S32): "OpSDiv",
+    ("rem", DType.S32): "OpSMod",
+    ("shl", DType.U32): "OpShiftLeftLogical",
+    ("shr", DType.U32): "OpShiftRightLogical",
+    ("shl", DType.S32): "OpShiftLeftLogical",
+    ("shr", DType.S32): "OpShiftRightArithmetic",
+    ("and", DType.U32): "OpBitwiseAnd",
+    ("or", DType.U32): "OpBitwiseOr",
+    ("xor", DType.U32): "OpBitwiseXor",
+    ("and", DType.S32): "OpBitwiseAnd",
+    ("or", DType.S32): "OpBitwiseOr",
+    ("xor", DType.S32): "OpBitwiseXor",
 }
 
 
@@ -1244,7 +1314,11 @@ class SpirVLowerer:
 
         def walk(ops):
             for op in ops:
-                if isinstance(op, (LoadOp, StoreOp)):
+                # Every op kind that touches a tensor through its
+                # ``tensor`` attr — keep this list in sync with the
+                # visitor table. AsyncCopyOp uses dst_tensor /
+                # src_tensor (different keys); add when wired.
+                if isinstance(op, (LoadOp, StoreOp, VecLoadOp, VecStoreOp)):
                     t = op.attrs.get("tensor")
                     if isinstance(t, GlobalTensor):
                         consider(t)

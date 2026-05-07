@@ -252,3 +252,27 @@ class TestExistingKernelsCompile:
         )
         assert ck.module.handle != 0
         assert ck.module.n_buffers == 1  # single ``T`` buffer
+
+    def test_silu_kernel_compiles(self, spv_device):
+        """``SiLUKernel`` (in-tree, the elementwise activation that
+        sits in the MLP fc1 epilogue) lowers cleanly through the
+        SPIR-V launcher with zero kernel-side edits. Exercises the
+        vec ops + math (``rcp_approx`` / ``ex2_approx``) +
+        ``ConvertOp`` + ``ArithOp.neg`` visitor surface — about 60%
+        of the elementwise kernel cohort's coverage.
+        """
+        from quark.kernels.silu.kernel import (
+            SiLUConfig,
+            SiLUKernel,
+            SiLUSpec,
+        )
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            SiLUKernel,
+            SiLUSpec(N=128, dtype=DType.F32),
+            SiLUConfig(n_warps=2, elems_per_block=128),
+        )
+        assert ck.module.handle != 0
+        assert ck.module.n_buffers == 2  # X (in) + Out
