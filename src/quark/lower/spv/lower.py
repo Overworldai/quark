@@ -55,6 +55,10 @@ from quark.ir.op import (
     StoreOp,
     SubgroupReduceOp,
     ThreadIdxOp,
+    VecBuildOp,
+    VecExtractOp,
+    VecLoadOp,
+    VecStoreOp,
     YieldOp,
 )
 from quark.ir.tensor import GlobalTensor, SharedRegion
@@ -923,6 +927,167 @@ def _visit_subgroup_reduce(op: SubgroupReduceOp, ctx: _SpvCtx) -> None:
     )
 
 
+# ─── Vec ops ───────────────────────────────────────────────────────
+
+
+def _visit_vec_load(op: VecLoadOp, ctx: _SpvCtx) -> None:
+    """Vector load — emits N scalar loads + ``OpCompositeConstruct``.
+
+    SPIR-V's ``OpLoad`` from a single AccessChain returns a scalar
+    matching the pointee type. To produce a vector result we
+    AccessChain to the base of the contiguous ``width`` elements and
+    load each one, then assemble with ``OpCompositeConstruct``. The
+    assembler / driver pattern-matches this back to a vector load on
+    targets that support vector pointers; on targets that don't, it
+    becomes the ``width`` scalar loads we emit.
+
+    Aligned vector loads via ``OpLoad`` on a typed vector pointer
+    (``%v4float`` etc.) is the steady-state perf path. Lands once
+    a kernel demands it; today's silu / elementwise kernels are
+    bandwidth-bound long before the load pattern matters.
+    """
+    (out,) = op.results
+    tensor = op.attrs["tensor"]
+    width = int(op.attrs["width"])
+    indices = list(op.operands)
+    if op.attrs.get("pred") is not None:
+        indices = indices[:-1]
+
+    if isinstance(tensor, GlobalTensor):
+        binding = ctx.tensor_to_binding[id(tensor)]
+        var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
+        elem_type = ctx.tensor_to_elem_type[id(tensor)]
+        zero = ctx.text.const_uint(0)
+        chain_prefix = (var_id, zero)
+    elif isinstance(tensor, SharedRegion):
+        rec = ctx.smem_allocs.get(tensor.alloc.id)
+        if rec is None:
+            raise RuntimeError(
+                f"_visit_vec_load: SharedRegion {tensor.name!r} accessed "
+                "before its SmemAllocOp"
+            )
+        var_id, elem_type, elem_ptr, _n = rec
+        chain_prefix = (var_id,)
+    else:
+        raise NotImplementedError(
+            f"_visit_vec_load: tensor type {type(tensor).__name__}"
+        )
+
+    # Compute the base flat index, then each lane's index = base + i.
+    base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
+    u32 = ctx.text.type_int(32, signed=False)
+
+    loaded: list[str] = []
+    for i in range(width):
+        if i == 0:
+            idx_id = base_id
+        else:
+            inc = ctx.text.const_uint(i)
+            idx_id = ctx.text.alloc_id(f"vec_idx_{i}")
+            ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_id} {inc}")
+        chain_id = ctx.text.alloc_id(f"vec_chain_{i}")
+        chain_args = " ".join(chain_prefix)
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {chain_args} {idx_id}"
+        )
+        ld_id = ctx.text.alloc_id(f"vec_ld_{i}")
+        ctx.text.emit_function(f"{ld_id} = OpLoad {elem_type} {chain_id}")
+        loaded.append(ld_id)
+
+    # Assemble the vector. The result's vec type needs declaring.
+    vec_type = ctx.text.type_vec(elem_type, width)
+    res_id = ctx.text.alloc_id(f"vec_w{width}")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCompositeConstruct {vec_type} {' '.join(loaded)}"
+    )
+
+
+def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
+    """Vector store — ``OpCompositeExtract`` + N scalar stores.
+
+    Mirror of ``_visit_vec_load``: extract each element of the input
+    vector, AccessChain + OpStore at base+i. The driver-side
+    coalescing turns this back into a vector store on platforms
+    that support it.
+    """
+    tensor = op.attrs["tensor"]
+    vec_v = op.operands[0]
+    width = int(vec_v.width)
+    indices = list(op.operands[1:])
+    if op.attrs.get("pred") is not None:
+        indices = indices[:-1]
+
+    if isinstance(tensor, GlobalTensor):
+        binding = ctx.tensor_to_binding[id(tensor)]
+        var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
+        elem_type = ctx.tensor_to_elem_type[id(tensor)]
+        zero = ctx.text.const_uint(0)
+        chain_prefix = (var_id, zero)
+    elif isinstance(tensor, SharedRegion):
+        rec = ctx.smem_allocs.get(tensor.alloc.id)
+        if rec is None:
+            raise RuntimeError(
+                f"_visit_vec_store: SharedRegion {tensor.name!r} accessed "
+                "before its SmemAllocOp"
+            )
+        var_id, elem_type, elem_ptr, _n = rec
+        chain_prefix = (var_id,)
+    else:
+        raise NotImplementedError(
+            f"_visit_vec_store: tensor type {type(tensor).__name__}"
+        )
+
+    base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
+    vec_id = ctx.val_to_id[vec_v.id]
+    u32 = ctx.text.type_int(32, signed=False)
+
+    for i in range(width):
+        # Extract element i from the vector.
+        elem_id = ctx.text.alloc_id(f"vec_elem_{i}")
+        ctx.text.emit_function(
+            f"{elem_id} = OpCompositeExtract {elem_type} {vec_id} {i}"
+        )
+        if i == 0:
+            idx_id = base_id
+        else:
+            inc = ctx.text.const_uint(i)
+            idx_id = ctx.text.alloc_id(f"vec_sidx_{i}")
+            ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_id} {inc}")
+        chain_id = ctx.text.alloc_id(f"vec_schain_{i}")
+        chain_args = " ".join(chain_prefix)
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {chain_args} {idx_id}"
+        )
+        ctx.text.emit_function(f"OpStore {chain_id} {elem_id}")
+
+
+def _visit_vec_build(op: VecBuildOp, ctx: _SpvCtx) -> None:
+    """``OpCompositeConstruct`` from N scalar operands."""
+    (out,) = op.results
+    elem_type = _emit_dtype(ctx.text, op.operands[0].dtype, ctx)
+    vec_type = ctx.text.type_vec(elem_type, len(op.operands))
+    res_id = ctx.text.alloc_id("vec_build")
+    ctx.val_to_id[out.id] = res_id
+    operand_ids = [ctx.val_to_id[v.id] for v in op.operands]
+    ctx.text.emit_function(
+        f"{res_id} = OpCompositeConstruct {vec_type} {' '.join(operand_ids)}"
+    )
+
+
+def _visit_vec_extract(op: VecExtractOp, ctx: _SpvCtx) -> None:
+    """``OpCompositeExtract`` — pick one component from a vector."""
+    (out,) = op.results
+    idx = int(op.attrs["index"])
+    elem_type = _emit_dtype(ctx.text, out.dtype, ctx)
+    src_id = ctx.val_to_id[op.operands[0].id]
+    res_id = ctx.text.alloc_id(f"vec_x{idx}")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCompositeExtract {elem_type} {src_id} {idx}"
+    )
+
+
 _DISPATCH: dict[type, Any] = {
     ConstOp: _visit_const,
     ArithOp: _visit_arith,
@@ -935,6 +1100,10 @@ _DISPATCH: dict[type, Any] = {
     BlockDimOp: _visit_block_dim,
     LoadOp: _visit_load,
     StoreOp: _visit_store,
+    VecLoadOp: _visit_vec_load,
+    VecStoreOp: _visit_vec_store,
+    VecBuildOp: _visit_vec_build,
+    VecExtractOp: _visit_vec_extract,
     IfRegionOp: _visit_if_region,
     YieldOp: _visit_yield,
     SmemAllocOp: _visit_smem_alloc,

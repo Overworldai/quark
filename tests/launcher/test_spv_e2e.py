@@ -219,3 +219,36 @@ class TestSpirVLauncherCompile:
             _VecAddConfig(block=64),
         )
         assert ck1 is ck2
+
+
+class TestExistingKernelsCompile:
+    """Surveys: which in-tree kernel suites lower through SPIR-V?
+
+    These tests pin "existing kernels work without edits" — the
+    central platform-agnostic claim. New visitor coverage in the
+    SPIR-V lowerer will cause more existing kernels to start
+    passing here over time.
+    """
+
+    def test_increment_kernel_compiles(self, spv_device):
+        """``IncrementKernel`` (in-tree, used elsewhere by the
+        framework's auto-incrementing frame counter / loop-step
+        machinery) lowers cleanly through the SPIR-V launcher with
+        zero kernel-side edits. Smoke that the framework's
+        load/store/arith path on an existing kernel works on Intel.
+        """
+        from quark.kernels.increment.kernel import (
+            IncrementConfig,
+            IncrementKernel,
+            IncrementSpec,
+        )
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            IncrementKernel,
+            IncrementSpec(dtype=DType.S32),
+            IncrementConfig(),
+        )
+        assert ck.module.handle != 0
+        assert ck.module.n_buffers == 1  # single ``T`` buffer
