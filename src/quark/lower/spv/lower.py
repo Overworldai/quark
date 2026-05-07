@@ -196,6 +196,13 @@ def _emit_dtype(text: SpvText, dt: DType, ctx: "_SpvCtx | None" = None) -> str:
         # framework standardises on Vulkan 1.4 (see PORTABILITY_PLAN
         # §3.2 sub-table for the version bump).
         return text.type_float(16)
+    if dt is DType.PRED:
+        # PRED → OpTypeBool. Vulkan compute doesn't allow OpTypeBool
+        # in storage buffers — it lives only as an SSA value (cmp
+        # results, conditional branches, OpSelect). Using PRED in a
+        # buffer would need an explicit u8/u32 storage encoding at
+        # the kernel boundary.
+        return text.type_bool()
     raise NotImplementedError(
         f"SpirVLowerer: dtype {dt!r} not yet supported. See "
         "PORTABILITY_PLAN §3.2 — extend the visitor table to "
@@ -369,6 +376,11 @@ _ARITH_KIND_TO_SPV: dict[tuple[str, DType], str] = {
     ("and", DType.S32): "OpBitwiseAnd",
     ("or", DType.S32): "OpBitwiseOr",
     ("xor", DType.S32): "OpBitwiseXor",
+    # Boolean (PRED) logic ops use the dedicated ``OpLogical*`` opcodes
+    # — bitwise opcodes don't accept ``OpTypeBool`` operands in SPIR-V.
+    ("and", DType.PRED): "OpLogicalAnd",
+    ("or", DType.PRED): "OpLogicalOr",
+    ("xor", DType.PRED): "OpLogicalNotEqual",
 }
 
 

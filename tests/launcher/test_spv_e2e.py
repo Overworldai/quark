@@ -524,6 +524,83 @@ class TestExistingKernelsCompile:
         )
         assert ck.module.handle != 0
 
+    def test_ada_rmsnorm_kernel_compiles(self, spv_device):
+        """``AdaRMSNormKernel`` — adaptive RMSNorm with per-group affine.
+        Uses ForLoopOp over chunks, smem reduction, broadcast scale —
+        the first kernel through the SPV backend that needs the for-loop
+        + carries visitor wiring."""
+        from quark.kernels.ada_rmsnorm.kernel import AdaRMSNormKernel
+        from quark.kernels.ada_rmsnorm.spec import AdaRMSNormSpec
+        from quark.kernels.ada_rmsnorm.config import AdaRMSNormConfig
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            AdaRMSNormKernel,
+            AdaRMSNormSpec(G=1, M=64, D=128, dtype=DType.F32),
+            AdaRMSNormConfig(n_warps=1, chunk_D=128),
+        )
+        assert ck.module.handle != 0
+
+    def test_ada_gate_residual_kernel_compiles(self, spv_device):
+        """``AdaGateResidualKernel`` — chunk-loop gated residual stream.
+        Exercises both ``direct=True`` and ``direct=False`` config paths
+        (the `False` path adds an extra indirection lookup)."""
+        from quark.kernels.ada_gate_residual.kernel import AdaGateResidualKernel
+        from quark.kernels.ada_gate_residual.spec import AdaGateResidualSpec
+        from quark.kernels.ada_gate_residual.config import AdaGateResidualConfig
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        for direct in (True, False):
+            ck = launcher.compile(
+                AdaGateResidualKernel,
+                AdaGateResidualSpec(G=1, M=64, D=128, dtype=DType.F32),
+                AdaGateResidualConfig(n_warps=1, chunk_D=128, direct=direct),
+            )
+            assert ck.module.handle != 0
+
+    def test_elementwise_kernel_compiles(self, spv_device):
+        """``ElementwiseKernel`` — vec_load + per-elem op (add/mul/etc.) +
+        vec_store. Cohort backbone for the attention block's scalar
+        epilogues."""
+        from quark.kernels.elementwise.kernel import ElementwiseKernel
+        from quark.kernels.elementwise.spec import ElementwiseSpec
+        from quark.kernels.elementwise.config import ElementwiseConfig
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            ElementwiseKernel,
+            ElementwiseSpec(N=256, dtype=DType.F32, op="add"),
+            ElementwiseConfig(n_warps=1, elems_per_block=256),
+        )
+        assert ck.module.handle != 0
+
+    def test_value_residual_packed_kernel_compiles(self, spv_device):
+        """``ValueResidualPackedKernel`` — packed-QKV variant. First
+        kernel through SPV that needs PRED-typed values (boolean SSA
+        from cmp + and-fold) and ``OpLogicalAnd``."""
+        from quark.kernels.value_residual_packed.kernel import (
+            ValueResidualPackedKernel,
+        )
+        from quark.kernels.value_residual_packed.spec import (
+            ValueResidualPackedSpec,
+        )
+        from quark.kernels.value_residual_packed.config import (
+            ValueResidualPackedConfig,
+        )
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            ValueResidualPackedKernel,
+            ValueResidualPackedSpec(M=4, D_full=512, v_col_offset=256,
+                                     v_width=256, dtype=DType.F32),
+            ValueResidualPackedConfig(n_warps=1, chunk_D=128),
+        )
+        assert ck.module.handle != 0
+
     def test_silu_kernel_compiles(self, spv_device):
         """``SiLUKernel`` (in-tree, the elementwise activation that
         sits in the MLP fc1 epilogue) lowers cleanly through the
