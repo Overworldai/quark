@@ -253,6 +253,58 @@ class TestExistingKernelsCompile:
         assert ck.module.handle != 0
         assert ck.module.n_buffers == 1  # single ``T`` buffer
 
+    def test_silu_runs_end_to_end_against_numpy_reference(self, spv_device):
+        """``SiLUKernel`` runs end-to-end on Battlemage and produces
+        output matching the kernel's own ``silu_reference_numpy``.
+
+        This is the platform-agnostic IR claim verified at the
+        numerics level — the same kernel source produces the same
+        output across CUDA / Metal / Intel SPIR-V. Compare against
+        the kernel's reference function (used by the autotune
+        cache's correctness gate on every backend) at fp32 ULP
+        tolerance — the math goes through ``GLSL.std.450 Exp2`` on
+        Vulkan, which is spec-allowed up to 4 ULP of slack.
+        """
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.silu.kernel import (
+            SiLUConfig,
+            SiLUKernel,
+            SiLUSpec,
+        )
+        from quark.kernels.silu.reference import silu_reference_numpy
+        from quark.launcher import Launcher
+
+        N = 128
+        rng = np.random.default_rng(0xC0FFEE)
+        X = rng.standard_normal(N).astype(np.float32) * 2.0  # spread for sigmoid
+        expected = silu_reference_numpy(SiLUSpec(N=N, dtype=DType.F32), X=X)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            SiLUKernel,
+            SiLUSpec(N=N, dtype=DType.F32),
+            SiLUConfig(n_warps=2, elems_per_block=N),
+        )
+
+        # Two buffers: X (in), Out (out).
+        nbytes = N * 4
+        x_h, x_map = _sd.allocate_buffer(nbytes)
+        o_h, o_map = _sd.allocate_buffer(nbytes)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+        ck.launch(buffers=[x_h, o_h])
+
+        got = np.empty(N, dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+
+        # 1e-4 absolute matches what the framework's autotune-cache
+        # correctness gate asks of f32 elementwise kernels — covers
+        # GLSL.std.450 Exp2's 4-ULP slack vs PTX exp2.approx.
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-4)
+
     def test_increment_kernel_runs_end_to_end(self, spv_device):
         """``IncrementKernel`` not just compiles — actually executes
         on Battlemage and produces the correct output. ``T[0] += 1``
