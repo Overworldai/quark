@@ -658,6 +658,152 @@ def _build_for_loop_window_sum_ir(n: int, win: int):
     return b.module
 
 
+def _build_cmp_select_ir(n: int):
+    """Per-thread bounds-gated copy:
+
+      Out[t] = X[t]              if t < n/2 else
+               X[t] + 100.0      otherwise   (the "lerp" branch — easy
+                                              to detect when wrong)
+
+    Lowers cmp + select on F32 directly in the body. Used as a
+    cross-platform sanity check that ``OpSelect`` is emitted with
+    the (cond, t-arm, f-arm) operand order spirv-as expects.
+    """
+    import quark.lang as qk
+
+    b = Builder("cmp_sel_module")
+    fn = b.begin_function("cmp_sel")
+    b.param("X", BufferType(DType.F32))
+    b.param("Out", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_o = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Out", param=fn.params[1])
+
+    tid = b.thread_idx("x")
+    half = b.const(DType.U32, n // 2)
+    is_lower = b.cmp("lt", tid, half)
+    x_t = b.load(g_x, tid)
+    bonus = b.const(DType.F32, 100.0)
+    upper_val = b.add(x_t, bonus)
+    out = b.select(is_lower, x_t, upper_val)
+    b.store(g_o, out, tid)
+    b.end_function()
+    return b.module
+
+
+def _build_cmp_and_select_ir(n: int):
+    """Per-thread bounds-gated kernel using ``and(cmp, cmp)``:
+
+      in_range = (t >= lo) && (t < hi)
+      Out[t]   = X[t] if in_range else X[t] + 100.0
+
+    With lo=n/4 and hi=3n/4, threads ``[n/4, 3n/4)`` get the X[t]
+    arm; everyone else gets X[t]+100. Mirrors the
+    ``value_residual_packed`` v-col bounds-check pattern that broke
+    in the wider kernel.
+    """
+    import quark.lang as qk
+
+    b = Builder("cmp_and_sel_module")
+    fn = b.begin_function("cmp_and_sel")
+    b.param("X", BufferType(DType.F32))
+    b.param("Out", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_o = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Out", param=fn.params[1])
+
+    tid = b.thread_idx("x")
+    lo_b = b.const(DType.U32, n // 4)
+    hi_b = b.const(DType.U32, 3 * n // 4)
+    cmp_lo = b.cmp("ge", tid, lo_b)
+    cmp_hi = b.cmp("lt", tid, hi_b)
+    in_range = b.and_(cmp_lo, cmp_hi)
+    x_t = b.load(g_x, tid)
+    bonus = b.const(DType.F32, 100.0)
+    upper_val = b.add(x_t, bonus)
+    out = b.select(in_range, x_t, upper_val)
+    b.store(g_o, out, tid)
+    b.end_function()
+    return b.module
+
+
+@pytestmark_e2e
+def test_cmp_and_select_runs_end_to_end(driver):
+    """Per-thread cmp + and + OpSelect on a F32 payload — verifies
+    the boolean ``OpLogicalAnd`` of two ``OpUGreaterThanEqual`` /
+    ``OpULessThan`` results feeds OpSelect correctly. Same pattern
+    that ``value_residual_packed`` uses for its V-col bounds gate."""
+    from quark.lower.spv import text_to_binary
+
+    n = 64
+    lo, hi = n // 4, 3 * n // 4  # in-range = [16, 48)
+    rng = np.random.default_rng(0xFADE_FACE & 0xFFFFFFFF)
+    X = rng.standard_normal(n).astype(np.float32)
+    in_range_mask = (np.arange(n) >= lo) & (np.arange(n) < hi)
+    expected = np.where(in_range_mask, X, X + 100.0).astype(np.float32)
+
+    result = SpirVLowerer(local_size=(n, 1, 1)).lower_module(
+        _build_cmp_and_select_ir(n)
+    )
+    binary = text_to_binary(result.source)
+
+    nbytes = n * 4
+    x_h, x_map = driver.allocate_buffer(nbytes)
+    o_h, o_map = driver.allocate_buffer(nbytes)
+    ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+    compiled = driver.compile(
+        source=binary, entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [x_h, o_h], push_bytes=b"")
+
+    got = np.empty(n, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+    np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
+@pytestmark_e2e
+def test_cmp_select_runs_end_to_end(driver):
+    """Per-thread cmp + OpSelect — verifies the SPV backend's
+    select operand ordering is correct (cond, t-arm, f-arm), which
+    is the lurking suspect when complex kernels see wrong-arm
+    output. Lower-half writes ``X[t]``; upper-half writes
+    ``X[t] + 100`` — diff is huge enough to catch a swapped arm
+    even with rounding."""
+    from quark.lower.spv import text_to_binary
+
+    n = 64
+    rng = np.random.default_rng(0xCAFE_FEED)
+    X = rng.standard_normal(n).astype(np.float32)
+    expected = X.copy()
+    expected[n // 2 :] = X[n // 2 :] + 100.0
+
+    result = SpirVLowerer(local_size=(n, 1, 1)).lower_module(
+        _build_cmp_select_ir(n)
+    )
+    binary = text_to_binary(result.source)
+
+    nbytes = n * 4
+    x_h, x_map = driver.allocate_buffer(nbytes)
+    o_h, o_map = driver.allocate_buffer(nbytes)
+    ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+    compiled = driver.compile(
+        source=binary, entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [x_h, o_h], push_bytes=b"")
+
+    got = np.empty(n, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+    np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
 @pytestmark_e2e
 def test_for_loop_window_sum_end_to_end(driver):
     """Sliding-window sum exercising both iv-derived loads AND a carry.
