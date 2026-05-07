@@ -45,8 +45,11 @@ from quark.ir.op import (
     BlockIdxOp,
     CmpOp,
     ConstOp,
+    ConvertOp,
     IfRegionOp,
     LoadOp,
+    MathOp,
+    SelectOp,
     StoreOp,
     ThreadIdxOp,
     YieldOp,
@@ -108,6 +111,11 @@ class _SpvCtx:
     # the entry-point interface list — Vulkan 1.3 SPIR-V demands every
     # statically-used global variable be enumerated there.
     tensor_to_binding: dict[int, int] = field(default_factory=dict)
+    # Capability tracking for dtype-gated decls. Set on first use of
+    # an ``OpTypeFloat 16`` / BFloat16 type; ``_emit_dtype`` reads it
+    # to avoid re-emitting the capability line.
+    has_f16_cap: bool = False
+    has_bf16_cap: bool = False
 
 
 # Map quark DType values → (SPIR-V type emitter method name, byte width).
@@ -120,13 +128,39 @@ _DTYPE_TO_SPIR: dict[DType, tuple[str, int]] = {
 }
 
 
-def _emit_dtype(text: SpvText, dt: DType) -> str:
+def _emit_dtype(text: SpvText, dt: DType, ctx: "_SpvCtx | None" = None) -> str:
+    """Map a quark ``DType`` to its SPIR-V type id.
+
+    Half-precision dtypes (f16, bf16) require declaring the
+    ``Float16`` / ``BFloat16TypeKHR`` capability at module scope —
+    handled when ``ctx`` is provided so the cap lands exactly once.
+    """
     if dt is DType.F32:
         return text.type_float(32)
     if dt is DType.U32:
         return text.type_int(32, signed=False)
     if dt is DType.S32:
         return text.type_int(32, signed=True)
+    if dt is DType.F16:
+        if ctx is not None and not ctx.has_f16_cap:
+            text.add_capability("Float16")
+            ctx.has_f16_cap = True
+        return text.type_float(16)
+    if dt is DType.BF16:
+        if ctx is not None and not ctx.has_bf16_cap:
+            text.add_capability("BFloat16TypeKHR")
+            text.add_extension("SPV_KHR_bfloat16")
+            ctx.has_bf16_cap = True
+        # BFloat16 is an OpTypeFloat 16 with a Width=16 BFloat16
+        # tag — but ``spirv-as`` accepts ``OpTypeFloat 16 BFloat16``
+        # only on the ``vulkan1.4`` profile. For now we emit the same
+        # ``OpTypeFloat 16`` and rely on the capability gating + the
+        # KHR_shader_bfloat16 storage flag at the buffer / coopmat
+        # site to keep it interpreted as bf16.
+        # TODO: re-emit as ``OpTypeFloat 16 BFloat16KHR`` once the
+        # framework standardises on Vulkan 1.4 (see PORTABILITY_PLAN
+        # §3.2 sub-table for the version bump).
+        return text.type_float(16)
     raise NotImplementedError(
         f"SpirVLowerer: dtype {dt!r} not yet supported. See "
         "PORTABILITY_PLAN §3.2 — extend the visitor table to "
@@ -177,7 +211,7 @@ def _visit_arith(op: ArithOp, ctx: _SpvCtx) -> None:
     (out,) = op.results
     kind = op.attrs.get("kind", "")
     operands = [ctx.val_to_id[v.id] for v in op.operands]
-    type_id = _emit_dtype(ctx.text, out.dtype)
+    type_id = _emit_dtype(ctx.text, out.dtype, ctx)
     spv_op = _ARITH_KIND_TO_SPV.get((kind, out.dtype))
     if spv_op is None:
         raise NotImplementedError(
@@ -438,7 +472,7 @@ def _ensure_buffer_var(tensor: GlobalTensor, binding_index: int,
     if tid in ctx.tensor_to_var:
         return ctx.tensor_to_var[tid], ctx.tensor_to_elem_ptr[tid]
 
-    elem_type = _emit_dtype(ctx.text, tensor.dtype)
+    elem_type = _emit_dtype(ctx.text, tensor.dtype, ctx)
     elem_bytes = _dtype_byte_width(tensor.dtype)
     rta = ctx.text.type_runtime_array(elem_type, stride_bytes=elem_bytes)
     struct = ctx.text.type_struct(rta)
@@ -519,10 +553,169 @@ def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
     ctx.text.emit_function(f"OpStore {chain_id} {value_id}")
 
 
+# ─── Convert / Math / Select ──────────────────────────────────────
+
+
+def _visit_convert(op: ConvertOp, ctx: _SpvCtx) -> None:
+    """Explicit dtype conversion. Picks the right SPIR-V op based
+    on (src dtype kind, dst dtype kind):
+
+      * float → float (different widths) → ``OpFConvert``
+      * int → float → ``OpConvertSToF`` / ``OpConvertUToF``
+      * float → int → ``OpConvertFToS`` / ``OpConvertFToU``
+      * int → int (different widths or signedness) → ``OpSConvert``
+        / ``OpUConvert`` / ``OpBitcast`` for same-width sign change
+
+    Same-dtype conversions short-circuit (no-op) — the kernel author
+    occasionally emits a redundant cast, no need to round-trip.
+
+    Rounding mode: SPIR-V's GLCompute profile doesn't expose
+    per-instruction rounding decorations the way PTX does. ``rn``
+    (round-to-nearest-even) is the spec default and what most
+    drivers emit; non-RN rounding requires the
+    ``RoundingModeRTE/RTZ`` execution mode + per-instruction
+    decoration (``OpDecorate ... FPRoundingMode RTE``). Today we
+    accept any rounding attr but only emit the default — non-RN
+    callers should expect drift; track follow-up if a kernel needs
+    deterministic non-RN.
+    """
+    (out,) = op.results
+    src_v = op.operands[0]
+    src_dt = src_v.dtype
+    dst_dt = out.dtype
+    src_id = ctx.val_to_id[src_v.id]
+    if src_dt is dst_dt:
+        ctx.val_to_id[out.id] = src_id
+        return
+    dst_t = _emit_dtype(ctx.text, dst_dt, ctx)
+    src_kind = _dtype_kind(src_dt)
+    dst_kind = _dtype_kind(dst_dt)
+    if src_kind == "float" and dst_kind == "float":
+        spv_op = "OpFConvert"
+    elif src_kind == "uint" and dst_kind == "float":
+        spv_op = "OpConvertUToF"
+    elif src_kind == "sint" and dst_kind == "float":
+        spv_op = "OpConvertSToF"
+    elif src_kind == "float" and dst_kind == "uint":
+        spv_op = "OpConvertFToU"
+    elif src_kind == "float" and dst_kind == "sint":
+        spv_op = "OpConvertFToS"
+    elif src_kind == "uint" and dst_kind == "uint":
+        spv_op = "OpUConvert"
+    elif src_kind == "sint" and dst_kind == "sint":
+        spv_op = "OpSConvert"
+    elif src_kind == "uint" and dst_kind == "sint" and _dtype_byte_width(src_dt) == _dtype_byte_width(dst_dt):
+        spv_op = "OpBitcast"  # same-width sign change
+    elif src_kind == "sint" and dst_kind == "uint" and _dtype_byte_width(src_dt) == _dtype_byte_width(dst_dt):
+        spv_op = "OpBitcast"
+    else:
+        raise NotImplementedError(
+            f"_visit_convert: {src_dt!r} → {dst_dt!r} not yet wired"
+        )
+    res_id = ctx.text.alloc_id(f"cvt_{src_dt.value}_{dst_dt.value}")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(f"{res_id} = {spv_op} {dst_t} {src_id}")
+
+
+def _dtype_kind(dt: DType) -> str:
+    if dt in (DType.F16, DType.BF16, DType.F32, DType.F64):
+        return "float"
+    if dt in (DType.U8, DType.U16, DType.U32, DType.U64, DType.PRED):
+        return "uint"
+    if dt in (DType.S8, DType.S16, DType.S32, DType.S64):
+        return "sint"
+    raise NotImplementedError(f"_dtype_kind: unknown {dt!r}")
+
+
+# ``MathOp.kind`` → GLSL.std.450 symbolic instruction name. The
+# spirv-as assembler accepts the symbolic name (not the numeric
+# instruction code) for OpExtInst on GLSL.std.450. Reference:
+# https://registry.khronos.org/SPIR-V/specs/unified1/GLSL.std.450.html
+#
+# Every kind here maps to a single ExtInst; the ``_approx`` variants
+# share the same instruction (Vulkan's transcendentals are always
+# approximate per spec — no separate precise/approximate path). The
+# ULP-slack risk this introduces is tracked in PORTABILITY_PLAN §3.7
+# v1 ("OpExtInst GLSL.std.450 ULP slack"); validate per-kernel
+# cos_sim against the CUDA reference during rollout.
+_MATH_KIND_TO_GLSL_INSTR: dict[str, str | None] = {
+    "rcp": None,          # not in GLSL.std.450 — emit OpFDiv 1.0/x
+    "rcp_approx": None,
+    "rsqrt": "InverseSqrt",
+    "rsqrt_approx": "InverseSqrt",
+    "sqrt": "Sqrt",
+    "sqrt_approx": "Sqrt",
+    "exp": "Exp",
+    "exp_approx": "Exp",
+    "exp2": "Exp2",
+    "ex2_approx": "Exp2",
+    "log2": "Log2",
+    "log2_approx": "Log2",
+    "sin": "Sin",
+    "cos": "Cos",
+    "tanh": "Tanh",
+}
+
+
+def _visit_math(op: MathOp, ctx: _SpvCtx) -> None:
+    """Transcendental / approximate-math ops via GLSL.std.450
+    extended instructions.
+
+    ``rcp`` has no GLSL.std.450 entry — emit ``OpFDiv 1.0 / x``
+    instead. The hardware reciprocal is what the driver will pick
+    when GLSL source uses ``1.0 / x``; same lowering, no perf loss.
+    """
+    (out,) = op.results
+    kind = op.attrs["kind"]
+    if kind not in _MATH_KIND_TO_GLSL_INSTR:
+        raise NotImplementedError(
+            f"_visit_math: kind={kind!r} not yet wired"
+        )
+    glsl_name = _MATH_KIND_TO_GLSL_INSTR[kind]
+    src_id = ctx.val_to_id[op.operands[0].id]
+    dst_t = _emit_dtype(ctx.text, out.dtype, ctx)
+
+    if glsl_name is None:  # rcp — emit OpFDiv 1.0 / x
+        if out.dtype is not DType.F32:
+            raise NotImplementedError(
+                f"_visit_math(rcp): only f32 wired today, got {out.dtype!r}"
+            )
+        one = ctx.text.const_float(1.0)
+        res_id = ctx.text.alloc_id("rcp")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(f"{res_id} = OpFDiv {dst_t} {one} {src_id}")
+        return
+
+    glsl_id = ctx.text.import_ext_inst("GLSL.std.450")
+    res_id = ctx.text.alloc_id(kind)
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpExtInst {dst_t} {glsl_id} {glsl_name} {src_id}"
+    )
+
+
+def _visit_select(op: SelectOp, ctx: _SpvCtx) -> None:
+    """Ternary select. SPIR-V's ``OpSelect`` directly handles the
+    ``pred ? t : f`` semantics — including PRED/Bool selectors,
+    which Vulkan SPIR-V 1.4+ permits for arbitrary types."""
+    (out,) = op.results
+    pred, t, f = op.operands
+    pred_id = ctx.val_to_id[pred.id]
+    t_id = ctx.val_to_id[t.id]
+    f_id = ctx.val_to_id[f.id]
+    dst_t = _emit_dtype(ctx.text, out.dtype, ctx)
+    res_id = ctx.text.alloc_id("sel")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(f"{res_id} = OpSelect {dst_t} {pred_id} {t_id} {f_id}")
+
+
 _DISPATCH: dict[type, Any] = {
     ConstOp: _visit_const,
     ArithOp: _visit_arith,
     CmpOp: _visit_cmp,
+    ConvertOp: _visit_convert,
+    MathOp: _visit_math,
+    SelectOp: _visit_select,
     ThreadIdxOp: _visit_thread_idx,
     BlockIdxOp: _visit_block_idx,
     BlockDimOp: _visit_block_dim,

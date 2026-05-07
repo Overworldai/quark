@@ -245,6 +245,133 @@ def test_vec_add_end_to_end_through_lowerer(driver):
     np.testing.assert_allclose(got, expected, rtol=0, atol=0)
 
 
+def _build_math_kernel_ir(n: int):
+    """Per-thread kernel: ``Z[i] = sin(X[i] * 2.0) + sqrt(Y[i] + 1.0)``.
+
+    Exercises ``MathOp`` (sin / sqrt) + ``ConvertOp`` (constant
+    promotion) + ``ArithOp`` (mul / add) in one shape. Ground truth
+    is computed in numpy at the test site; SPIR-V output compared
+    with a small fp tolerance to absorb the GLSL.std.450 ULP slack
+    PORTABILITY_PLAN §3.7 v1 flagged.
+    """
+    import quark.lang as qk
+
+    b = Builder("math_kernel")
+    fn = b.begin_function("math_kernel")
+    b.param("X", BufferType(DType.F32))
+    b.param("Y", BufferType(DType.F32))
+    b.param("Z", BufferType(DType.F32))
+    g_x = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="X", param=fn.params[0])
+    g_y = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Y", param=fn.params[1])
+    g_z = GlobalTensor(dtype=DType.F32, shape=(n,), stride=(1,),
+                       name="Z", param=fn.params[2])
+
+    tid = b.thread_idx("x")
+    x = b.load(g_x, tid)
+    y = b.load(g_y, tid)
+    two = b.const(DType.F32, 2.0)
+    one = b.const(DType.F32, 1.0)
+    sin_term = qk.sin(b.mul(x, two))
+    sqrt_term = qk.sqrt(b.add(y, one))
+    out = b.add(sin_term, sqrt_term)
+    b.store(g_z, out, tid)
+    b.end_function()
+    return b.module
+
+
+class TestMathConvertSelect:
+    """Tier 1 goldens for the new visitors."""
+
+    def test_math_emits_glsl_extinst(self):
+        result = SpirVLowerer(local_size=(64, 1, 1)).lower_module(
+            _build_math_kernel_ir(64)
+        )
+        src = result.source
+        assert 'OpExtInstImport "GLSL.std.450"' in src
+        # spirv-as wants symbolic names, not numeric instruction codes.
+        assert "OpExtInst" in src
+        assert " Sin " in src
+        assert " Sqrt " in src
+
+    def test_convert_short_circuits_same_dtype(self):
+        """``convert(x, dst=x.dtype)`` is a no-op — no OpFConvert /
+        OpUConvert emitted."""
+        b = Builder("noop_convert")
+        b.begin_function("f")
+        x = b.const(DType.F32, 1.0)
+        b.convert(x, dst=DType.F32)
+        b.end_function()
+        src = SpirVLowerer().lower_module(b.module).source
+        assert "OpFConvert" not in src
+        assert "OpUConvert" not in src
+
+    def test_convert_f32_f16_emits_fconvert_and_caps(self):
+        b = Builder("fcvt")
+        b.begin_function("f")
+        x = b.const(DType.F32, 1.5)
+        b.convert(x, dst=DType.F16)
+        b.end_function()
+        src = SpirVLowerer().lower_module(b.module).source
+        assert "OpCapability Float16" in src
+        assert "OpFConvert" in src
+        assert "OpTypeFloat 16" in src
+
+    def test_select_emits_opselect(self):
+        b = Builder("sel")
+        b.begin_function("f")
+        x = b.const(DType.F32, 1.0)
+        y = b.const(DType.F32, 2.0)
+        p = b.cmp("lt", x, y)
+        b.select(p, x, y)
+        b.end_function()
+        src = SpirVLowerer().lower_module(b.module).source
+        assert "OpSelect" in src
+
+
+@pytestmark_e2e
+def test_math_kernel_end_to_end(driver):
+    """End-to-end: lower a kernel using ``MathOp`` (sin / sqrt) +
+    ``ArithOp`` (mul / add), dispatch on Battlemage, compare to a
+    numpy reference. Tolerance accounts for GLSL.std.450 ULP slack —
+    Vulkan's transcendentals carry up to 4 ULP of error vs PTX's
+    ``ex2.approx.f32``."""
+    from quark.lower.spv import text_to_binary
+
+    n = 64
+    rng = np.random.default_rng(0xFEED)
+    X = rng.standard_normal(n).astype(np.float32)
+    Y = (rng.standard_normal(n).astype(np.float32) ** 2)  # ensure y+1 > 0
+    expected = np.sin(X * 2.0) + np.sqrt(Y + 1.0)
+
+    result = SpirVLowerer(local_size=(n, 1, 1)).lower_module(
+        _build_math_kernel_ir(n)
+    )
+    binary = text_to_binary(result.source)
+
+    nbytes = n * 4
+    a_h, a_map = driver.allocate_buffer(nbytes)
+    b_h, b_map = driver.allocate_buffer(nbytes)
+    c_h, c_map = driver.allocate_buffer(nbytes)
+    ctypes.memmove(a_map, X.ctypes.data, X.nbytes)
+    ctypes.memmove(b_map, Y.ctypes.data, Y.nbytes)
+
+    compiled = driver.compile(
+        source=binary, entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [a_h, b_h, c_h], push_bytes=b"")
+
+    got = np.empty(n, dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, c_map, got.nbytes)
+    # 1e-5 absolute tolerance covers Vulkan GLSL.std.450's ULP slack
+    # (per spec, sin/sqrt carry up to 4 ULP of error). Tighter than
+    # 1e-4; loose enough to absorb driver variance.
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+
+
 @pytestmark_e2e
 def test_vec_add_with_bounds_end_to_end(driver):
     """Multi-workgroup dispatch + bounds check. The kernel computes
