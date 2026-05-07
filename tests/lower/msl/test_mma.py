@@ -171,8 +171,8 @@ class TestMmaBf16M8n8k8:
         src = result.source
         # Single m=1, n=1, k=1 tiling → exactly one simdgroup multiply.
         assert src.count("simdgroup_multiply_accumulate(") == 1
-        # A/B are bfloat16_t; acc is float. One fragment per axis.
-        assert "simdgroup_matrix<bfloat16_t, 8, 8>" in src
+        # A/B are bfloat; acc is float. One fragment per axis.
+        assert "simdgroup_matrix<bfloat, 8, 8>" in src
         assert "simdgroup_matrix<float, 8, 8>" in src
 
 

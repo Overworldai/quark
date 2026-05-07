@@ -41,7 +41,7 @@ def patchify(X, W, *, B: int, C: int, H: int, W_spatial: int, ph: int = 2, pw: i
         ph=ph,
         pw=pw,
         d_model=d_model,
-        dtype=DType.from_backend(X.dtype),
+        dtype=DType.from_backend(X),
     )
     provided = {"X": X, "W": W}
     auto_alloc: tuple[str, ...] = ("Out",)

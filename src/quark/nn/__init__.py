@@ -1,16 +1,16 @@
 """``quark.nn`` — minimal inference-only module system.
 
 No autograd, no training, no optimizer. Holds named parameters as
-backend-native tensors (``mx.array`` on Metal, raw CUDA device
-pointers on CUDA — no torch in the runtime path), supports
-``state_dict()`` / ``load_state_dict()``, and a ``forward()``
-convention.
+``QuarkTensor`` (Metal pool buffer on Metal, ``cuMemAlloc`` on CUDA —
+no torch in the runtime path), supports ``state_dict()`` /
+``load_state_dict()``, and a ``forward()`` convention.
 
     import quark.nn as nn
+    from quark.runtime.tensor import QuarkTensor
 
     class MyModel(nn.Module):
         def __init__(self, d):
-            self.weight = nn.Parameter(PT.randn(d, d))
+            self.weight = nn.Parameter(QuarkTensor.randn(d, d, dtype="bf16"))
             self.layers = nn.ModuleList([MyBlock(d) for _ in range(12)])
 
         def forward(self, x):

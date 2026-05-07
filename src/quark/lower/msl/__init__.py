@@ -1,7 +1,8 @@
 """MSL lowerer (Apple Metal).
 
-Walks a quark IR `Module` and emits an MSL kernel body suitable for
-`mx.fast.metal_kernel`. See `lower.py` for the visitor implementation.
+Walks a quark IR `Module` and emits an MSL kernel body for the
+metal-cpp + nanobind driver (`drivers/metal.py`). See `lower.py` for
+the visitor implementation.
 """
 
 from quark.device import DeviceFamily

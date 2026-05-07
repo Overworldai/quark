@@ -4,11 +4,11 @@
 ``work_list`` is a flat ``[(grp_start, expert)] * n_work_items`` array
 of s32 pairs; each entry covers ``BM`` consecutive output slots.
 
-The BM step here is a **test-fixture constant** (32) baked into
-``make_tensors_numpy``, matching the old torch reference. Autotune
-configs that pick ``BM != 32`` will have their work_list shape mismatch
-the kernel's TensorDecl — that's a pre-existing corner, unchanged by
-this port.
+BM is inferred from ``work_list`` spacing (``wl[1].gs - wl[0].gs``)
+so autotune can rebuild work_list at the active ``config.BM`` via
+``prepare_launch_tensors`` and the reference matches without any
+config plumbing. Falls back to ``total_slots`` for single-entry
+work_lists (one block covers everything).
 """
 
 from __future__ import annotations
@@ -16,8 +16,6 @@ from __future__ import annotations
 import numpy as np
 
 from quark.runtime.npconv import astype_numpy, to_f32_numpy
-
-_REF_BM = 32
 
 
 def moe_inproj_reference_numpy(spec, *, X, W_in, token_ids, work_list, H_out=None):
@@ -33,6 +31,8 @@ def moe_inproj_reference_numpy(spec, *, X, W_in, token_ids, work_list, H_out=Non
     tok = to_f32_numpy(token_ids, dtype_hint="s32").astype(np.int64)
     wl = to_f32_numpy(work_list, dtype_hint="s32").astype(np.int64).reshape(-1, 2)
 
+    bm = int(wl[1, 0] - wl[0, 0]) if wl.shape[0] >= 2 else int(spec.total_slots)
+
     H, D = spec.H, x.shape[-1]
     n_experts = spec.n_experts
     w3 = w.reshape(n_experts, H, D)
@@ -40,9 +40,9 @@ def moe_inproj_reference_numpy(spec, *, X, W_in, token_ids, work_list, H_out=Non
     h = np.zeros((spec.total_slots, H), dtype=np.float32)
     for grp_start, expert in wl:
         gs, e = int(grp_start), int(expert)
-        tids = tok[gs : gs + _REF_BM]
+        tids = tok[gs : gs + bm]
         x_g = x[tids]
-        h[gs : gs + _REF_BM] = x_g @ w3[e].T
+        h[gs : gs + bm] = x_g @ w3[e].T
 
     # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
     h = h / (1.0 + np.exp(-h))

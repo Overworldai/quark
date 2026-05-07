@@ -28,7 +28,7 @@ _M16N8K16_BF16 = MmaShape(
     c_regs=4,
 )
 register_backend_payload("m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32")
-register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "bfloat16_t:2:1:2")
+register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "bfloat:2:1:2")
 
 _A_OFFS = ((0, 0), (8, 0), (0, 8), (8, 8))
 _B_OFFS = ((0, 0), (0, 8))
@@ -79,7 +79,7 @@ def test_msl_frag_convert_emits_thread_elements_no_simd_shuffle():
     # The FragConvert body must NOT route through simd_shuffle.
     assert "simd_shuffle" not in msl, f"FragConvertOp MSL body shouldn't use simd_shuffle\n{msl}"
     # Cast pattern appears in the FragConvert body.
-    assert "(bfloat16_t)" in msl, f"FragConvertOp MSL should emit (bfloat16_t) cast\n{msl}"
+    assert "(bfloat)" in msl, f"FragConvertOp MSL should emit (bfloat) cast\n{msl}"
 
 
 def test_msl_frag_convert_registers_frag_values():

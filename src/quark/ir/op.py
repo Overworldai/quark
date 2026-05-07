@@ -98,11 +98,13 @@ _MATH_KINDS = frozenset(
         "rcp",
         "rsqrt",
         "sqrt",
+        "exp",
         "exp2",
         "log2",
         "sin",
         "cos",
         "tanh",
+        "exp_approx",
         "ex2_approx",
         "rcp_approx",
         "rsqrt_approx",
@@ -1027,6 +1029,66 @@ class StoreMatrixOp(Op):
         _validate_reg_offsets(self.attrs, self.operands[0].width, "StoreMatrixOp")
 
 
+@dataclass(eq=False)
+class StoreMatrixGateResidualOp(Op):
+    """Fused NAX-only store: ``dst[r, c] = residual[r, c] + gate[r // M_per_group, c] * frag[r, c]``.
+
+    operands: (frag, row, col)
+    attrs:    dst_tensor, residual_tensor, gate_tensor, shape_id, which,
+              m_per_group
+
+    Lets the GEMM kernel collapse the standalone ``AdaGateResidual``
+    op (post-attn / post-MLP residual on the Waypoint blocks) into the
+    NAX-shape accumulator store. The per-lane MSL emitter walks the
+    same ``BaseNAXFrag`` lane layout as ``StoreMatrixOp``'s NAX
+    visitor, but interleaves a bf16 gmem load of the residual + gate
+    elements before each scalar write. Read in F32 so the multiply
+    keeps accumulator precision; the standalone path runs the
+    multiply in bf16, so the fused store is also a small precision
+    win in addition to the dispatch / round-trip savings.
+
+    The frag must be the destination of a NAX MmaOp (width-16 F32).
+    No CUDA / non-NAX shape support — fall through to the
+    ``StoreMatrixOp`` + standalone ``AdaGateResidualKernel`` chain
+    on those backends.
+    """
+
+    KIND: ClassVar[str] = "store_matrix_gate_residual"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        for key in (
+            "dst_tensor",
+            "residual_tensor",
+            "gate_tensor",
+            "shape_id",
+            "which",
+            "m_per_group",
+        ):
+            if key not in self.attrs:
+                raise ValueError(f"StoreMatrixGateResidualOp: missing '{key}' attr")
+        if self.attrs["which"] != "d":
+            raise ValueError(
+                f"StoreMatrixGateResidualOp: which must be 'd', got {self.attrs['which']!r}"
+            )
+        for tensor_attr in ("dst_tensor", "residual_tensor", "gate_tensor"):
+            t = self.attrs[tensor_attr]
+            if not isinstance(t, (SharedRegion, GlobalTensor)):
+                raise TypeError(
+                    f"StoreMatrixGateResidualOp: {tensor_attr} must be Shared/GlobalTensor, "
+                    f"got {type(t).__name__}"
+                )
+        if self.results:
+            raise ValueError("StoreMatrixGateResidualOp: must have no results")
+        if len(self.operands) != 3:
+            raise ValueError("StoreMatrixGateResidualOp: expected (frag, row, col)")
+        m_per_group = self.attrs["m_per_group"]
+        if not isinstance(m_per_group, int) or m_per_group < 1:
+            raise ValueError(
+                f"StoreMatrixGateResidualOp: m_per_group must be int ≥ 1, got {m_per_group!r}"
+            )
+
+
 def _validate_reg_offsets(attrs: dict, expected_count: int, op_name: str) -> None:
     """Check that `attrs['reg_offsets']` — when present — is a tuple
     of `expected_count` `(int, int)` pairs. The attr is optional."""
@@ -1053,7 +1115,17 @@ def _validate_reg_offsets(attrs: dict, expected_count: int, op_name: str) -> Non
 @dataclass(eq=False)
 class MmaOp(Op):
     """d = a * b + c. Operands are (frag_a, frag_b, frag_c) Values produced
-    by LoadMatrixOp (or a previous MmaOp for c)."""
+    by LoadMatrixOp (or a previous MmaOp for c).
+
+    Attrs:
+      * ``shape_id`` (required): MMA shape name from the registry.
+      * ``transpose_b`` (optional, defaults to ``True``): whether the
+        backend MMA call treats B as transposed. Only meaningful for
+        backends whose MMA primitive exposes the choice (NAX
+        ``matmul2d_descriptor`` does; PTX ``mma.sync`` does not — its
+        layout is fixed by the shape's mnemonic). The PTX visitor
+        asserts this is ``True``; the NAX visitor reads it.
+    """
 
     KIND: ClassVar[str] = "mma"
 
@@ -1065,6 +1137,20 @@ class MmaOp(Op):
             raise ValueError("MmaOp: expected 3 operands (a, b, c)")
         if len(self.results) != 1:
             raise ValueError("MmaOp: expected 1 result (d)")
+        # transpose_b defaults to True (current behavior). Validate type
+        # if explicitly set.
+        if "transpose_b" in self.attrs:
+            tb = self.attrs["transpose_b"]
+            if not isinstance(tb, bool):
+                raise TypeError(f"MmaOp: transpose_b attr must be bool, got {type(tb).__name__}")
+        # accumulate defaults to True. When False, the MMA writes C
+        # directly (mode::multiply) and skips reading the C operand —
+        # used for the first MMA in a K-loop chain to skip the zero
+        # init. NAX-only on MSL today; PTX visitor asserts it's True.
+        if "accumulate" in self.attrs:
+            ac = self.attrs["accumulate"]
+            if not isinstance(ac, bool):
+                raise TypeError(f"MmaOp: accumulate attr must be bool, got {type(ac).__name__}")
 
 
 @dataclass(eq=False)
@@ -1369,6 +1455,57 @@ class FragConvertOp(Op):
     def selectors(self) -> tuple[Value, ...]:
         n = int(self.attrs["num_src_frags"])
         return self.operands[n:]
+
+
+@dataclass(eq=False)
+class FragSliceOp(Op):
+    """Take a contiguous component slice of a fragment Value.
+
+    Used by NAX attention's GEMM2: GEMM1 produces a width-16 S
+    accumulator (two 16×16 N-tiles per lane); GEMM2's A operand wants
+    width-8 (one 16×16 tile). Slicing components ``[0:8]`` and
+    ``[8:16]`` gives two A operands sourcing the same S without copies.
+
+    Pure component-rebinding at lower time — zero MSL emitted. The
+    sliced Value's storage class (NAX vs simdgroup_matrix) is inherited
+    from the source.
+
+    operands: ``(src,)``
+    results:  one Value of width ``length``, dtype matches ``src.dtype``.
+    attrs:
+      * ``start``:  starting component index (0 ≤ start < src.width)
+      * ``length``: number of components to take (start + length ≤ src.width)
+    """
+
+    KIND: ClassVar[str] = "frag_slice"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if len(self.operands) != 1:
+            raise ValueError("FragSliceOp: expected 1 operand (src)")
+        if len(self.results) != 1:
+            raise ValueError("FragSliceOp: expected 1 result")
+        for k in ("start", "length"):
+            if k not in self.attrs:
+                raise ValueError(f"FragSliceOp: missing '{k}' attr")
+            if not isinstance(self.attrs[k], int):
+                raise TypeError(f"FragSliceOp: '{k}' must be int")
+        (src,) = self.operands
+        (out,) = self.results
+        start = int(self.attrs["start"])
+        length = int(self.attrs["length"])
+        if start < 0 or length < 1:
+            raise ValueError(f"FragSliceOp: start={start}, length={length} must be ≥0/≥1")
+        if start + length > src.width:
+            raise ValueError(
+                f"FragSliceOp: slice [{start}:{start + length}] exceeds source width {src.width}"
+            )
+        if out.width != length:
+            raise ValueError(f"FragSliceOp: result width {out.width} != attr length {length}")
+        if out.dtype is not src.dtype:
+            raise TypeError(
+                f"FragSliceOp: result dtype {out.dtype} must match src dtype {src.dtype}"
+            )
 
 
 _FRAG_REDUCE_KINDS = frozenset({"max", "min", "add", "mul"})

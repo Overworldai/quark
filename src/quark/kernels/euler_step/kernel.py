@@ -126,7 +126,7 @@ class EulerStepKernel(Kernel):
         N = 1
         for d in X.shape:
             N *= int(d)
-        return EulerStepSpec(N=N, dtype=DType.from_backend(X.dtype))
+        return EulerStepSpec(N=N, dtype=DType.from_backend(X))
 
     def build(self) -> None:
         s, c = self.spec, self.config

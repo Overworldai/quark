@@ -35,6 +35,42 @@ def _impl(V, V1, lamb):
 
 
 def value_residual(V, V1, lamb):
+    import os
+    import sys
+
+    if sys.platform == "darwin" and os.environ.get("QUARK_FORCE_FASTPATH") == "1":
+        from quark.functional._dispatch import queue_launch_ir
+        from quark.ir import DType
+        from quark.kernels.value_residual.config import ValueResidualConfig
+        from quark.kernels.value_residual.spec import ValueResidualSpec
+
+        orig_shape = tuple(V.shape)
+        N = 1
+        for s in orig_shape:
+            N *= int(s)
+        dtype_str = getattr(V, "quark_dtype", None) or (
+            V.dtype if hasattr(V, "dtype") and isinstance(V.dtype, str) else "f32"
+        )
+        spec = ValueResidualSpec(N=N, dtype=DType(dtype_str))
+        config = None
+        for epb in (1024, 512, 256, 128):
+            cand = ValueResidualConfig(n_warps=4, elems_per_block=epb)
+            if _cls()(spec=spec, config=cand).is_valid():
+                config = cand
+                break
+        if config is not None:
+            V_flat = V.reshape(-1) if len(orig_shape) != 1 else V
+            V1_flat = V1.reshape(-1) if len(orig_shape) != 1 else V1
+            result = queue_launch_ir(
+                _cls(),
+                spec,
+                config,
+                inputs=[V_flat, V1_flat, lamb],
+                out_shape=(N,),
+                out_dtype=dtype_str,
+            )
+            return result.reshape(*orig_shape) if len(orig_shape) != 1 else result
+
     return _impl(V, V1, lamb)
 
 

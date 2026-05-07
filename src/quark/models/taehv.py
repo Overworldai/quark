@@ -217,6 +217,8 @@ class TAEHV(nn.Module):
             MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]), nn.Upsample(scale_factor=2 if decoder_space_upscale[2] else 1), TGrow(n_f[2], 2 if decoder_time_upscale[2] else 1), conv(n_f[2], n_f[3], bias=False),
             nn.ReLU(inplace=True), conv(n_f[3], self.image_channels*self.patch_size**2),
         )
+
+        
         # computed properties
         self.t_downscale = 2**sum(t.stride == 2 for t in self.encoder if isinstance(t, TPool))
         self.t_upscale = 2**sum(t.stride == 2 for t in self.decoder if isinstance(t, TGrow))
@@ -224,6 +226,9 @@ class TAEHV(nn.Module):
 
         if checkpoint_path is not None:
             self.load_state_dict(self.patch_tgrow_layers(torch.load(checkpoint_path, map_location="cpu", weights_only=True)))
+
+        self.encoder_compiled  = torch.compile(self.encoder, dynamic=False, mode='max-autotune', fullgraph=True)
+        self.decoder_compiled = torch.compile(self.decoder, dynamic=False, mode='max-autotune', fullgraph=True)
 
     def patch_tgrow_layers(self, sd):
         """Patch TGrow layers to use a smaller kernel if needed.
@@ -261,7 +266,7 @@ class TAEHV(nn.Module):
             n_pad = self.t_downscale - x.shape[1] % self.t_downscale
             padding = x[:, -1:].repeat_interleave(n_pad, dim=1)
             x = torch.cat([x, padding], 1)
-        return apply_model_with_memblocks(self.encoder, x, parallel, show_progress_bar)
+        return apply_model_with_memblocks(self.encoder_compiled, x, parallel, show_progress_bar)
 
     def postprocess_output_frames(self, x):
         """Postprocess RGB frames after the main decoder sequence."""
@@ -279,7 +284,7 @@ class TAEHV(nn.Module):
         Returns NTCHW RGB tensor with ~[0, 1] values.
         """
         skip_trim = self.is_cogvideox and x.shape[1] % 2 == 0
-        x = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar)
+        x = apply_model_with_memblocks(self.decoder_compiled, x, parallel, show_progress_bar)
         x = self.postprocess_output_frames(x)
         if skip_trim:
             # skip trimming for cogvideox to make frame counts match.
@@ -343,6 +348,7 @@ class StreamingTAEHV(nn.Module):
             self.taehv.encoder, self.encoder_memory, self.encoder_work_queue)
         return xt
 
+    @torch.no_grad()
     def decode(self, x=None):
         """Feed a latent (optional) and try to produce a decoded frame.
 

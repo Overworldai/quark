@@ -1,1 +1,1 @@
-    bfloat16_t _pc_bf_0 = static_cast<bfloat16_t>(1.0f);
+    bfloat _pc_bf_0 = static_cast<bfloat>(1.0f);

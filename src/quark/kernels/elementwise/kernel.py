@@ -126,7 +126,7 @@ class ElementwiseKernel(Kernel):
         N = 1
         for d in X.shape:
             N *= int(d)
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         out_dt = DType.from_backend(out_dtype) if out_dtype is not None else None
         return ElementwiseSpec(N=N, dtype=dt, op=op, out_dtype=out_dt)
 

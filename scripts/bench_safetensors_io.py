@@ -12,6 +12,7 @@ compare the first run for cold-load perf.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 import time
@@ -46,9 +47,16 @@ def _bench_quark(path: str) -> float:
     n_tensors = len(sd)
     total_bytes = 0
     for t in sd.values():
-        total_bytes += t.numel() * {"f32": 4, "f16": 2, "bf16": 2, "s32": 4,
-                                     "s64": 8, "u8": 1, "s8": 1}.get(t.dtype, 0)
-    print(f"quark.nn.io.load_safetensors:")
+        total_bytes += t.numel() * {
+            "f32": 4,
+            "f16": 2,
+            "bf16": 2,
+            "s32": 4,
+            "s64": 8,
+            "u8": 1,
+            "s8": 1,
+        }.get(t.dtype, 0)
+    print("quark.nn.io.load_safetensors:")
     print(f"  {n_tensors} tensors, {total_bytes / 1e9:.2f} GB")
     print(f"  wall: {elapsed * 1000:.0f} ms")
     print(f"  effective rate: {total_bytes / elapsed / 1e9:.2f} GB/s")
@@ -58,7 +66,6 @@ def _bench_quark(path: str) -> float:
 
 def _bench_safetensors(path: str) -> float | None:
     try:
-        import safetensors
         from safetensors import safe_open
     except ImportError:
         print("(safetensors not installed — skipping reference benchmark)")
@@ -68,11 +75,11 @@ def _bench_safetensors(path: str) -> float | None:
     t0 = time.perf_counter()
     sd = {}
     with safe_open(path, framework="pt", device="cuda") as f:
-        for name in f.keys():
+        for name in f:
             sd[name] = f.get_tensor(name)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
-    print(f"safetensors (ref, torch / pt device='cuda'):")
+    print("safetensors (ref, torch / pt device='cuda'):")
     print(f"  wall: {elapsed * 1000:.0f} ms")
     del sd
     return elapsed
@@ -95,10 +102,8 @@ def main():
 
     for i in range(args.runs):
         if i > 0 and args.drop_cache:
-            try:
+            with contextlib.suppress(Exception):
                 os.system("sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null")
-            except Exception:
-                pass
         print(f"── run {i + 1} ──")
         q = _bench_quark(local)
         s = _bench_safetensors(local)

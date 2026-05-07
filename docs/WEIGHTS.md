@@ -34,8 +34,8 @@ out = model(x, sigma_idx=0, frame_t=0)
 
 ## `nn.Parameter` / `nn.Module`
 
-PyTorch-shaped, inference-only. Parameters hold `QuarkTensor`s
-(CUDA) or `mx.array`s (Metal). No autograd, no optimizer.
+PyTorch-shaped, inference-only. Parameters hold `QuarkTensor`s on
+both backends (CUDA and Metal). No autograd, no optimizer.
 
 ```python
 import quark.nn as nn
@@ -50,9 +50,9 @@ class Linear(nn.Module):
         return pcf.gemm(x, self.weight.data, bias=self.bias.data)
 ```
 
-`_randn` / `_zeros` / `_tensor` in `nn.module` are the backend-aware
-allocation helpers — they emit `QuarkTensor` on CUDA and `mx.array`
-on Metal. Parameters are discovered by attribute name; nested
+`_randn` / `_zeros` / `_tensor` in `nn.module` are the
+allocation helpers — they emit `QuarkTensor` on both backends.
+Parameters are discovered by attribute name; nested
 `nn.Module` and `nn.ModuleList` children are walked recursively by
 `state_dict()` / `load_state_dict()` / `parameters()`.
 

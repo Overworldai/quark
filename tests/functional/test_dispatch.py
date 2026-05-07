@@ -164,8 +164,6 @@ def test_moe_outproj_smoke():
     out = pcf.moe_outproj(
         tensors["h_in"],
         tensors["W_out"],
-        tensors["token_ids"],
-        tensors["slot_weights"],
         tensors["work_list"],
         M=spec.M,
         n_experts=spec.n_experts,
@@ -176,14 +174,10 @@ def test_moe_outproj_smoke():
     ref = kernel.reference(
         tensors["h_in"],
         tensors["W_out"],
-        tensors["token_ids"],
-        tensors["slot_weights"],
         tensors["work_list"],
     )
-    # moe_outproj output is always f32
-    from quark.ir import DType
-
-    _check(out, ref, DType.F32, cls)
+    # moe_outproj output: per-slot bf16 partials, dtype=spec.out_dtype.
+    _check(out, ref, spec.out_dtype, cls)
 
 
 def test_kv_cache_update_smoke():

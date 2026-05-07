@@ -58,6 +58,18 @@ class GemmSpec(KernelSpec):
     # the fast rcp+ex2 path on PTX and MSL.
     activation: str | None = None
     has_bias: bool = False
+    # Fused AdaGate-residual epilogue: when True, the kernel reads two
+    # extra inputs (Gate[G, N] and Residual[M, N]) at store time and
+    # writes ``Out = Residual + Gate_bcast * (A @ Bᵀ)`` instead of the
+    # plain ``Out = A @ Bᵀ`` — folds the standalone AdaGateResidual op
+    # (post-attn / post-MLP residual) into the GEMM, saving one
+    # dispatch + one bf16 round-trip on the accumulator. ``G`` is the
+    # gate-broadcast group count (each group of M//G consecutive rows
+    # reads the same gate row), matching ``AdaGateResidualSpec.G``.
+    # Like ``has_bias``/``activation``, the per-block fused path is only
+    # correct at split_k=1 — see ``is_valid`` for the rejection.
+    has_gate_residual: bool = False
+    G: int = 1
     # Whether the caller will hand this kernel a preshuffled B tensor
     # (bytes already permuted to match the vectorized fragment-load
     # layout). This is a property of the B tensor layout, hence a spec
@@ -95,6 +107,11 @@ class GemmSpec(KernelSpec):
             raise ValueError(
                 f"GemmSpec: activation {self.activation!r} not in {_VALID_ACTIVATIONS}"
             )
+        if self.has_gate_residual:
+            if self.G < 1 or self.M % self.G != 0:
+                raise ValueError(
+                    f"GemmSpec: has_gate_residual requires M ({self.M}) divisible by G ({self.G})"
+                )
         # When A (or B) is F32 and the caller didn't pick a compute_dtype,
         # we have to downcast on load — F32 has no MMA path. Pick B's
         # dtype if it's MMA-capable, otherwise A's.

@@ -18,14 +18,41 @@ These functions handle:
 
 from __future__ import annotations
 
+import ctypes as _ctypes
 import math
 import random
 import struct as _struct
+import sys as _sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from quark.launcher.launcher import CompiledKernel
     from quark.runtime.tensor import QuarkTensor
+
+_IS_METAL = _sys.platform == "darwin"
+
+
+def _dev_memcpy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Backend-neutral device→device byte copy.
+
+    On CUDA: routes through ``CudaRuntime.memcpy_dtod`` (async, stream 0).
+    On Metal: the buffer pool is host-shared, so ``ctypes.memmove`` after
+    a queue drain is the equivalent. The drain (``synchronize``) flushes
+    any pending ``queue_launch`` writes into the source buffer before
+    we copy from it; without it a recently-produced buffer would race
+    the host read.
+    """
+    if nbytes == 0:
+        return
+    if _IS_METAL:
+        from quark.runtime.sync import synchronize
+
+        synchronize()
+        _ctypes.memmove(dst_ptr, src_ptr, nbytes)
+        return
+    from quark.runtime.cuda import CudaRuntime
+
+    CudaRuntime.instance().memcpy_dtod(dst_ptr, src_ptr, nbytes)
 
 
 def _stream() -> int:
@@ -158,12 +185,9 @@ def _binary_tensors(
         Out = Out[:N]
     result = Out.reshape(*orig_shape)
     if out is not None:
-        from quark.runtime.cuda import CudaRuntime
         from quark.runtime.tensor import PC_BYTES
 
-        CudaRuntime.instance().memcpy_dtod(
-            out.data_ptr(), result.contiguous().data_ptr(), N * PC_BYTES[orig_dtype]
-        )
+        _dev_memcpy(out.data_ptr(), result.contiguous().data_ptr(), N * PC_BYTES[orig_dtype])
         return out
     return result
 
@@ -359,12 +383,9 @@ def cast(
     if out is not None:
         # Honor the caller's output buffer contract by copying into it —
         # this path is cold so one D→D memcpy is acceptable.
-        from quark.runtime.cuda import CudaRuntime
         from quark.runtime.tensor import PC_BYTES
 
-        CudaRuntime.instance().memcpy_dtod(
-            out.data_ptr(), result.contiguous().data_ptr(), N * PC_BYTES[target_dtype]
-        )
+        _dev_memcpy(out.data_ptr(), result.contiguous().data_ptr(), N * PC_BYTES[target_dtype])
         return out
     return result
 
@@ -418,9 +439,7 @@ def copy_strided(t: QuarkTensor) -> QuarkTensor:
 
     if _is_contiguous(t.shape, t.strides) and t._offset > 0:
         out = QuarkTensor.empty(*t.shape, dtype=t.dtype)
-        from quark.runtime.cuda import CudaRuntime
-
-        CudaRuntime.instance().memcpy_dtod(out.data_ptr(), t.data_ptr(), N * elem)
+        _dev_memcpy(out.data_ptr(), t.data_ptr(), N * elem)
         return out
 
     # General strided copy via the copy_strided kernel.
@@ -484,18 +503,14 @@ def copy_strided_into(dst: QuarkTensor, src: QuarkTensor) -> None:
     if dst.is_contiguous() and src.is_contiguous():
         n = dst.numel()
         elem = PC_BYTES[dst.dtype]
-        from quark.runtime.cuda import CudaRuntime
-
-        CudaRuntime.instance().memcpy_dtod(dst.data_ptr(), src.data_ptr(), n * elem)
+        _dev_memcpy(dst.data_ptr(), src.data_ptr(), n * elem)
         return
 
     if dst.is_contiguous():
         src_c = src.contiguous()
         n = dst.numel()
         elem = PC_BYTES[dst.dtype]
-        from quark.runtime.cuda import CudaRuntime
-
-        CudaRuntime.instance().memcpy_dtod(dst.data_ptr(), src_c.data_ptr(), n * elem)
+        _dev_memcpy(dst.data_ptr(), src_c.data_ptr(), n * elem)
         return
 
     raise NotImplementedError("copy_strided_into: strided dst not yet supported")
@@ -508,9 +523,15 @@ def fill_scalar(t: QuarkTensor, value: float) -> None:
     if value == 0.0 and t.is_contiguous():
         n = t.numel()
         elem = PC_BYTES[t.dtype]
-        from quark.runtime.cuda import CudaRuntime
+        if _IS_METAL:
+            from quark.runtime.sync import synchronize
 
-        CudaRuntime.instance().memset_d8(t.data_ptr(), 0, n * elem)
+            synchronize()
+            _ctypes.memset(t.data_ptr(), 0, n * elem)
+        else:
+            from quark.runtime.cuda import CudaRuntime
+
+            CudaRuntime.instance().memset_d8(t.data_ptr(), 0, n * elem)
         return
 
     # General fill: create a scalar-filled tensor, copy into the view.
@@ -615,9 +636,7 @@ def cat(tensors: list[QuarkTensor], dim: int = 0) -> QuarkTensor:
             tc = t.contiguous()
             nbytes = tc.numel() * elem
             if nbytes > 0:
-                from quark.runtime.cuda import CudaRuntime
-
-                CudaRuntime.instance().memcpy_dtod(
+                _dev_memcpy(
                     out._storage.ptr + offset * elem,
                     tc.data_ptr(),
                     nbytes,
@@ -668,9 +687,7 @@ def _pad_tensor(t: QuarkTensor, padded_N: int) -> QuarkTensor:
         return t
     out = QuarkTensor.zeros(padded_N, dtype=t.dtype)
     elem = PC_BYTES[t.dtype]
-    from quark.runtime.cuda import CudaRuntime
-
-    CudaRuntime.instance().memcpy_dtod(out.data_ptr(), t.data_ptr(), t.numel() * elem)
+    _dev_memcpy(out.data_ptr(), t.data_ptr(), t.numel() * elem)
     return out
 
 
@@ -686,30 +703,53 @@ def _fill_tensor(n: int, value: float, dtype: str) -> QuarkTensor:
         return QuarkTensor.zeros(n, dtype=dtype)
 
     t = QuarkTensor.empty(n, dtype=dtype)
-    from quark.runtime.cuda import CudaRuntime
 
-    rt = CudaRuntime.instance()
-
+    # Pre-compute the per-element bit pattern + element width.
     if dtype == "f32":
-        # Reinterpret f32 as u32 for memset.
         bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
-        rt.memset_d32(t.data_ptr(), bits, n)
+        elem_w, pattern = 4, bits
     elif dtype == "bf16":
         # Truncate f32 → bf16: top 16 bits of f32.
         bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
-        bf16_bits = (bits >> 16) & 0xFFFF
-        rt.memset_d16(t.data_ptr(), bf16_bits, n)
+        elem_w, pattern = 2, (bits >> 16) & 0xFFFF
     elif dtype == "f16":
-        # Pack one f16 value and memset.
-        raw = _struct.pack("<e", value)
-        bits = _struct.unpack("<H", raw)[0]
-        rt.memset_d16(t.data_ptr(), bits, n)
+        bits = _struct.unpack("<H", _struct.pack("<e", value))[0]
+        elem_w, pattern = 2, bits
     elif dtype in ("s32", "u32"):
-        rt.memset_d32(t.data_ptr(), int(value) & 0xFFFFFFFF, n)
+        elem_w, pattern = 4, int(value) & 0xFFFFFFFF
     elif dtype in ("s8", "u8"):
-        rt.memset_d8(t.data_ptr(), int(value) & 0xFF, n)
+        elem_w, pattern = 1, int(value) & 0xFF
     else:
-        # Fallback: pack one element, memset with appropriate width.
-        rt.memset_d8(t.data_ptr(), int(value) & 0xFF, n)
+        elem_w, pattern = 1, int(value) & 0xFF
+
+    if _IS_METAL:
+        # Metal pool buffers are host-shared; build the repeated
+        # pattern in a staging array and memmove. Sync first to
+        # serialize with any pending kernel writes that targeted
+        # this buffer.
+        from quark.runtime.sync import synchronize
+
+        synchronize()
+        if elem_w == 1:
+            _ctypes.memset(t.data_ptr(), pattern, n)
+        else:
+            # ctypes-typed staging: c_uint8 / c_uint16 / c_uint32 array
+            # of n elements, all set to pattern, then memmove into the
+            # Metal buffer. ``array.array`` would also work but ctypes
+            # avoids the buffer-protocol round-trip.
+            ctype = {2: _ctypes.c_uint16, 4: _ctypes.c_uint32}[elem_w]
+            staged = (ctype * n)(*([pattern] * n))
+            _ctypes.memmove(t.data_ptr(), staged, n * elem_w)
+        return t
+
+    from quark.runtime.cuda import CudaRuntime
+
+    rt = CudaRuntime.instance()
+    if elem_w == 4:
+        rt.memset_d32(t.data_ptr(), pattern, n)
+    elif elem_w == 2:
+        rt.memset_d16(t.data_ptr(), pattern, n)
+    else:
+        rt.memset_d8(t.data_ptr(), pattern, n)
 
     return t

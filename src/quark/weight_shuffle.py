@@ -1,6 +1,6 @@
 """Pre-shuffle weight matrices so each MMA fragment is contiguous in smem.
 
-EXEMPT FROM 500-LINE RULE: the torch + MLX permutation paths share the
+EXEMPT FROM 500-LINE RULE: the torch + numpy permutation paths share the
 per-mma_k fragment-layout derivation + pad-aware stride math. Splitting
 by backend duplicates the layout table; splitting by public API
 (``shuffle_b`` / ``cached_shuffle_b`` / reverse-map utilities) strands
@@ -207,7 +207,7 @@ def _cached_perm_np(K_CHUNK: int, mma_k: int, dtype_bytes: int) -> np.ndarray:
 def shuffle_b_for_frag_load(W, K_CHUNK: int, mma_k: int):
     """Pre-shuffle ``W: [N, K]`` for the contiguous-per-lane bfrag loaders.
 
-    Accepts numpy, torch, or MLX arrays. Returns a same-dtype same-shape
+    Accepts numpy or QuarkTensor arrays. Returns a same-dtype same-shape
     tensor (matching the input backend) with the bytes permuted.
     Bytes-only operation (handles bf16 via uint16 → uint8 view and e4m3
     via uint8 directly), so works for any 2-byte or 1-byte element type.
@@ -219,12 +219,11 @@ def shuffle_b_for_frag_load(W, K_CHUNK: int, mma_k: int):
     """
     # Dispatch by input type:
     #   * QuarkTensor — has ``to_bytes`` + string dtype.
-    #   * MLX — has .dtype as mlx.core.Dtype.
-    #   * numpy — has .dtype.itemsize.
+    #   * numpy ndarray — has .dtype.itemsize.
     if hasattr(W, "to_bytes") and isinstance(getattr(W, "dtype", None), str):
         return _shuffle_quark(W, K_CHUNK, mma_k)
-    if _is_mlx_array(W):
-        return _shuffle_mlx(W, K_CHUNK, mma_k)
+    if isinstance(W, np.ndarray):
+        return _shuffle_ndarray(W, K_CHUNK, mma_k)
     return _shuffle_numpy(W, K_CHUNK, mma_k)
 
 
@@ -262,41 +261,15 @@ def _shuffle_quark(W, K_CHUNK: int, mma_k: int):
     return QuarkTensor.from_bytes(out_bytes.tobytes(), shape, W.dtype)
 
 
-def _is_mlx_array(W) -> bool:
-    """Detect mlx.core.array without importing mlx unless it's installed."""
-    try:
-        import mlx.core as mx
-    except ImportError:
-        return False
-    return isinstance(W, mx.array)
-
-
-def _shuffle_mlx(W, K_CHUNK: int, mma_k: int):
-    """MLX path — go byte-level: view the MLX array as uint8, copy to
-    numpy, shuffle, then convert back to MLX and re-view as the
-    original dtype. The data is byte-permuted so the round-trip is
-    correct for any dtype; cached_shuffle_b memoizes the result so
-    the host↔device copy happens at most once per W.
+def _shuffle_ndarray(W: np.ndarray, K_CHUNK: int, mma_k: int) -> np.ndarray:
+    """numpy ndarray path (Metal) — go byte-level: view as uint8,
+    shuffle, then re-view as the original dtype.
     """
-    import mlx.core as mx
-    import numpy as _np
-
-    orig_mx_dtype = W.dtype
+    orig_dtype = W.dtype
     N, K = W.shape
-    # View as uint8 (mx.uint8 == "B") — gives us 1-byte elements with a
-    # total row byte-count of K * dtype.bytes. ``np.array(...)``
-    # materializes it via the buffer protocol; uint8 has itemsize 1 so
-    # the buffer-format assertion passes for any element dtype.
-    elem_bytes = orig_mx_dtype.size
+    elem_bytes = orig_dtype.itemsize
     K_bytes = K * elem_bytes
-    np_bytes = _np.array(W.view(mx.uint8)).reshape(N, K_bytes)
-    # The shuffle is a byte permutation — operate on the uint8 view
-    # so _shuffle_numpy's itemsize arithmetic works, but rewrap the
-    # logical shape (N, K) with a dummy bf16-equivalent dtype so the
-    # shuffle's per-element dtype-aware tiling matches the kernel's
-    # expected layout. We skip that by calling the low-level permute
-    # directly: reshape into (n8_tiles, 8, n_k_tiles, K_CHUNK_BYTES),
-    # apply the perm, reshape back.
+    np_bytes = W.view(np.uint8).reshape(N, K_bytes)
     n8_tiles = N // 8
     K_CHUNK_BYTES = K_CHUNK * elem_bytes
     if K_bytes % K_CHUNK_BYTES != 0 or N % 8 != 0:
@@ -305,15 +278,14 @@ def _shuffle_mlx(W, K_CHUNK: int, mma_k: int):
         )
     n_k_tiles = K_bytes // K_CHUNK_BYTES
     W_tiled = np_bytes.reshape(n8_tiles, 8, n_k_tiles, K_CHUNK_BYTES)
-    W_tiled = _np.ascontiguousarray(W_tiled.transpose(0, 2, 1, 3))
+    W_tiled = np.ascontiguousarray(W_tiled.transpose(0, 2, 1, 3))
     flat = W_tiled.reshape(n8_tiles * n_k_tiles, 8 * K_CHUNK_BYTES)
     perm = _cached_perm_np(K_CHUNK, mma_k, elem_bytes)
     out_flat = flat[:, perm]
     out_tiled = out_flat.reshape(n8_tiles, n_k_tiles, 8, K_CHUNK_BYTES)
-    out_tiled = _np.ascontiguousarray(out_tiled.transpose(0, 2, 1, 3))
+    out_tiled = np.ascontiguousarray(out_tiled.transpose(0, 2, 1, 3))
     out_bytes = out_tiled.reshape(N, K_bytes)
-    # Back to MLX uint8, then re-view as the original element dtype.
-    return mx.array(out_bytes).reshape(N * K_bytes).view(orig_mx_dtype).reshape(N, K)
+    return out_bytes.view(orig_dtype).reshape(N, K)
 
 
 def _shuffle_numpy(W: np.ndarray, K_CHUNK: int, mma_k: int) -> np.ndarray:
@@ -366,7 +338,7 @@ class ShuffledWeight:
     smem rows using the shuffled per-lane layout. Everything matches.
     """
 
-    tensor: Any  # physical [N, K_shuffled] on device — QuarkTensor / mx.array
+    tensor: Any  # physical [N, K_shuffled] on device — QuarkTensor
     logical_K: int  # original K (before shuffle + pad)
     kchunk: int  # logical K elements per pipeline stage
     bpad: int  # pad elements per k-tile (0 = no pad)
@@ -398,7 +370,7 @@ class ShuffledWeight:
     def from_plain(W, *, kchunk: int, bpad: int = 0, mma_k: int = 16):
         """Offline shuffle ``W: [N, K]`` → ``ShuffledWeight([N, K_shuffled])``.
 
-        Accepts ``QuarkTensor`` (CUDA) or ``mx.array`` (Metal). Handles
+        Accepts a ``QuarkTensor``. Handles
         bf16 and e4m3 via byte-level permutation. The padding is baked
         into the output's K dimension — each ``[8, kchunk]`` source tile
         becomes an ``[8, kchunk + bpad]`` shuffled tile.
@@ -418,15 +390,13 @@ class ShuffledWeight:
             orig_dtype = W.dtype  # short string
             is_quark = True
         else:
-            # MLX path (import lazily to keep CUDA-only envs free of mlx).
-            import mlx.core as mx
-
-            if not isinstance(W, mx.array):
+            # numpy ndarray path (Metal backend).
+            if not isinstance(W, np.ndarray):
                 raise TypeError(f"ShuffledWeight.from_plain: unsupported input {type(W).__name__}")
             N, K = tuple(W.shape)
-            elem_bytes = W.dtype.size
-            W_np_bytes = np.array(W.view(mx.uint8)).reshape(N, K * elem_bytes).copy()
-            orig_dtype = W.dtype  # mx.Dtype
+            elem_bytes = W.dtype.itemsize
+            W_np_bytes = W.view(np.uint8).reshape(N, K * elem_bytes).copy()
+            orig_dtype = W.dtype  # np.dtype
             is_quark = False
 
         bstride = kchunk + bpad
@@ -463,14 +433,8 @@ class ShuffledWeight:
 
             out = QuarkTensor.from_bytes(out_bytes.tobytes(), (N, K_shuffled), orig_dtype)
         else:
-            import mlx.core as mx
-
-            out = (
-                mx.array(out_bytes)
-                .reshape(N * K_shuffled_bytes)
-                .view(orig_dtype)
-                .reshape(N, K_shuffled)
-            )
+            # numpy ndarray — re-view bytes as the original dtype.
+            out = out_bytes.view(orig_dtype).reshape(N, K_shuffled)
 
         return ShuffledWeight(
             tensor=out,

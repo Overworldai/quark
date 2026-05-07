@@ -2,28 +2,74 @@
 name = "quark"
 version = "0.1.0"
 requires-python = ">=3.11"
-# Runtime deps: numpy everywhere (inference path + numpy-refs oracle),
-# mlx on Metal (kernel launch driver). No torch — the numpy-refs
-# migration dropped it from every runtime code path and from the
-# autotune correctness gate.
+# Runtime deps: numpy only. The Metal backend is a built-in C++
+# extension (_metal_dispatch) compiled from metal-cpp headers —
+# no PyObjC, no MLX, no torch. The extension is only built on
+# macOS. ``world_engine`` is no longer a quark dependency at any
+# tier (runtime, tests, dev) — the model path consumes raw
+# safetensors via ``huggingface_hub``.
 dependencies = [
+    "huggingface-hub>=1.12.2",
     "numpy",
-    "mlx; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
-# ``pip install .[dev]`` pulls the test runner. A couple of legacy
-# cross-check scripts (``tests/cross_check_world_engine.py``,
-# ``scripts/bench_world_engine.py``) and the VAE encode/decode helpers
-# (``scripts/{encode_frame,decode_latents}.py``) still reach for torch
-# — they're kept as standalone diagnostics and gate a graceful
-# ``ImportError`` when torch isn't installed.
+# ``pip install .[dev]`` pulls the test runner.
 dev = [
     "pytest",
 ]
+# ``pip install .[taehv]`` enables the ANE TAEHV decoder via
+# CoreML at runtime. Pure-numpy: coremltools loads the
+# ``.mlpackage`` artifacts and ``predict()`` runs on the Apple
+# Neural Engine; Pillow handles the bilinear resizes that the
+# torch path used to do via ``F.interpolate``. NO torch, NO MLX.
+# Use ``python -m quark.taehv.export`` (with the ``[export]``
+# extras below) once per resolution to generate the ``.mlpackage``
+# artifacts the runtime reads.
+taehv = [
+    "coremltools>=8.0",
+    "Pillow",
+]
+# ``pip install .[export]`` pulls the torch + taehv deps needed
+# only for the one-time CoreML export of TAEHV encoder/decoder
+# (run by maintainers / when adding a new resolution). The runtime
+# ``quark.taehv`` package never imports either.
+export = [
+    "torch>=2.0",
+    "taehv",
+    "coremltools>=8.0",
+    "huggingface-hub>=1.12.2",
+]
+# ``pip install .[engine]`` enables ``quark.Engine`` — the standalone
+# Waypoint-1.5 inference wrapper that matches the ``world_engine``
+# API. Needs torch (for the vendored TAEHV VAE in
+# ``quark.models.vae``), Pillow (image IO), PyYAML (config loader
+# transitive via ``huggingface_hub``), and einops (TAEHV layers).
+# Quark's runtime DiT path is torch-free; the dependency surface
+# here is for the VAE side only.
+#
+# On Apple Silicon, ``Engine`` uses ``quark.taehv`` (CoreML/ANE)
+# for the VAE instead of the torch ChunkedStreamingTAEHV — pull
+# in the ``[taehv]`` extra so ``coremltools`` is present at
+# runtime. Self-referential pin via ``quark[taehv]`` rather than
+# duplicating the dep list, so any future changes to ``[taehv]``
+# propagate.
+engine = [
+    "torch>=2.0",
+    "Pillow",
+    "PyYAML",
+    "einops",
+    "quark[taehv] ; sys_platform == 'darwin'",
+]
+
+[tool.uv.sources]
+# ``taehv`` ships only on the upstream GitHub; pulled in by the
+# ``[export]`` extras for the one-time CoreML export of the encoder /
+# decoder ``.mlpackage`` artifacts. Runtime never imports it.
+taehv = { url = "https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip" }
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "nanobind>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -121,7 +167,7 @@ call-non-callable = "error"
 # warn on them.
 unresolved-attribute = "warn"
 unresolved-import = "warn"
-# MLX and numpy's type stubs are incomplete in spots (lazy attribute
+# NumPy's type stubs are incomplete in spots (lazy attribute
 # exposure, overload gaps). Ignore missing-attr noise so lint stays
 # actionable on real bugs.
 possibly-missing-attribute = "ignore"

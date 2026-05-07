@@ -26,19 +26,54 @@ without a config raises a clear error pointing at the future bundle.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import numpy as _np
+
 from quark.device import Device, DeviceFamily, current_device
-from quark.ir import DType, Module
-from quark.launcher.param_spec import ParamSpec, ProgramFootprint
+
+# Quark short-string dtype → numpy carrier dtype. Used in the hot path
+# to read tensor metadata without reaching for ``np.asarray`` on a
+# QuarkTensor (which copies device→host).
+_IR_DT_TO_NP_DT: dict[str, _np.dtype] = {
+    "f32": _np.dtype("float32"),
+    "f16": _np.dtype("float16"),
+    "bf16": _np.dtype("uint16"),
+    "s32": _np.dtype("int32"),
+    "s64": _np.dtype("int64"),
+    "u8": _np.dtype("uint8"),
+    "s8": _np.dtype("int8"),
+}
+
+# Resolved once at import time to avoid an os.environ.get() on every
+# dispatch (~10k/frame). Re-import won't pick up live env changes,
+# which matches the rest of the launcher's startup-only knobs. The
+# ``import os as _os; ... ; del _os`` shape is intentional — keeps
+# ``os`` out of the module's public namespace. The remaining quark
+# imports below the env-var read are also intentional (see ruff
+# E402 below).
+import os as _os  # noqa: E402
+
+_DISABLE_OUTPUT_HANDLES: bool = _os.environ.get("QUARK_DISABLE_OUTPUT_HANDLES") == "1"
+del _os
+from quark.ir import DType, Module  # noqa: E402
+from quark.launcher.param_spec import ParamSpec, ProgramFootprint  # noqa: E402
+
+# Lazy-eval flag for the Metal path. When True, ``CompiledKernel.launch``
+# skips the per-call ``driver.sync()`` so dispatches accumulate in a
+# single command-buffer and the GPU pipelines across kernel boundaries.
+# Flipped by the ``quark.lazy()`` context manager. Async-safe via
+# ContextVar (matches ``max_autotune`` / autotune ``_SEARCH_DEPTH``).
+_LAZY: ContextVar[bool] = ContextVar("_LAZY", default=False)
 
 if TYPE_CHECKING:
     from quark.autotune import AutotuneCache
 
 
 def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> float:
-    """Budget-based timer using CUDA events or MLX sync. Returns μs/call.
+    """Budget-based timer using CUDA events or Metal sync. Returns μs/call.
 
     Two-phase design, both phases driven by a wall-clock budget rather
     than a fixed iteration count (which is fragile when per-iter time
@@ -74,24 +109,18 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
 
     dev = current_device()
     if dev.family is DeviceFamily.METAL:
-        # Metal path: drive the timing loop directly over mlx.sync.
-        import mlx.core as _mx
-
-        _mx.synchronize()
+        # Metal / PyObjC path: dispatch is synchronous (waitUntilCompleted),
+        # so no explicit sync needed between calls.
         t0 = _time.perf_counter()
         n_warm = 0
         while (_time.perf_counter() - t0) * 1000 < warmup_ms:
             fn()
             n_warm += 1
-            if n_warm % 32 == 0:
-                _mx.synchronize()
-        _mx.synchronize()
         t_bench = _time.perf_counter()
         n_bench = 0
         while (_time.perf_counter() - t_bench) * 1000 < bench_ms:
             fn()
             n_bench += 1
-        _mx.synchronize()
         elapsed_s = _time.perf_counter() - t_bench
         return (elapsed_s * 1e6) / max(n_bench, 1)
 
@@ -146,58 +175,30 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
 
 
 # ---------------------------------------------------------------------------
-# Backend ↔ IR DType bridge — MLX (Metal) + QuarkTensor (CUDA) only.
+# Backend ↔ IR DType bridge — Metal (numpy) + QuarkTensor (CUDA).
 # ---------------------------------------------------------------------------
 
 
-def _mlx_dtype_table() -> dict[Any, DType]:
-    """Build the mlx→IR DType map lazily."""
-    import mlx.core as mx
-
-    return {
-        mx.float32: DType.F32,
-        mx.float16: DType.F16,
-        mx.bfloat16: DType.BF16,
-        mx.int8: DType.S8,
-        mx.uint8: DType.U8,
-        mx.int32: DType.S32,
-        mx.int64: DType.S64,
-        mx.uint16: DType.U16,
-        mx.uint32: DType.U32,
-    }
+_IR_TO_NP: dict[DType, _np.dtype] = {
+    DType.F32: _np.dtype("float32"),
+    DType.F16: _np.dtype("float16"),
+    DType.BF16: _np.dtype("uint16"),  # storage type
+    DType.S8: _np.dtype("int8"),
+    DType.U8: _np.dtype("uint8"),
+    DType.S16: _np.dtype("int16"),
+    DType.U16: _np.dtype("uint16"),
+    DType.S32: _np.dtype("int32"),
+    DType.U32: _np.dtype("uint32"),
+    DType.S64: _np.dtype("int64"),
+}
 
 
-def _ir_to_mlx_dtype(dtype: DType) -> Any:
-    """Map an IR DType to an mlx.core dtype."""
-    import mlx.core as mx
-
-    table = {
-        DType.F32: mx.float32,
-        DType.F16: mx.float16,
-        DType.BF16: mx.bfloat16,
-        DType.S8: mx.int8,
-        DType.U8: mx.uint8,
-        DType.S32: mx.int32,
-        DType.U32: mx.uint32,
-        DType.S64: mx.int64,
-    }
-    result = table.get(dtype)
+def _ir_to_np_dtype(dtype: DType) -> _np.dtype:
+    """Map an IR DType to a NumPy dtype."""
+    result = _IR_TO_NP.get(dtype)
     if result is None:
-        raise TypeError(f"_ir_to_mlx_dtype: no mlx equivalent for {dtype}")
+        raise TypeError(f"_ir_to_np_dtype: no numpy equivalent for {dtype}")
     return result
-
-
-def _check_dtype_mlx(buf, expected: DType) -> None:
-    """Validate that an mx.array's dtype matches what the kernel expects."""
-    table = _mlx_dtype_table()
-    actual = table.get(buf.dtype)
-    if actual is None:
-        raise TypeError(f"_check_dtype_mlx: mlx dtype {buf.dtype} has no quark IR equivalent")
-    if actual is not expected:
-        raise TypeError(
-            f"_check_dtype_mlx: buffer dtype mismatch — kernel expects "
-            f"{expected!r}, got array of {actual!r} ({buf.dtype})"
-        )
 
 
 _CUDA_TENSOR_DTYPE_MAP: dict[str, DType] = {
@@ -275,6 +276,11 @@ class CompiledKernel:
     # Y for unary ops). Populated lazily by the functional dispatch
     # layer on first call.
     _input_dummies: dict = field(default_factory=dict)
+    # Lazily-populated dispatch packet for the Metal hot path — see
+    # ``_launch_metal``. Holds invariants derived from the spec
+    # (output shapes/dtypes, nbytes, default handle lists) so the
+    # per-call loop only walks inputs to extract their ``metal_handle``.
+    _metal_packet: Any = None
 
     def launch(
         self,
@@ -282,11 +288,12 @@ class CompiledKernel:
         buffers: list,
         scalars: tuple = (),
         stream: int | None = None,
+        persistent_outs: set | None = None,
     ) -> list | None:
         """Validate, extract pointers, pack scalars, and dispatch.
 
         On CUDA: writes into preallocated output buffers, returns None.
-        On Metal: returns list of mx.array outputs (MLX allocates them).
+        On Metal: returns list of numpy array outputs (driver allocates them).
         """
         if len(buffers) != len(self.param_spec.buffers):
             raise ValueError(
@@ -299,7 +306,7 @@ class CompiledKernel:
         from quark.device import DeviceFamily
 
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.METAL:
-            return self._launch_metal(buffers, scalars)
+            return self._launch_metal(buffers, scalars, persistent_outs=persistent_outs)
 
         return self._launch_cuda(buffers, scalars, stream)
 
@@ -345,29 +352,110 @@ class CompiledKernel:
         )
         return None
 
-    def _launch_metal(self, buffers, scalars) -> list:
-        """Metal launch path — mx.array objects, MLX allocates outputs."""
-        import mlx.core as mx
+    def _launch_metal(self, buffers, scalars, persistent_outs=None) -> list:
+        """Metal launch — NumPy arrays / QuarkTensors in, driver
+        allocates outputs.
 
-        input_arrays: list = []
-        output_shapes: list[tuple[int, ...]] = []
-        output_dtypes: list = []
+        Inputs that are ``QuarkTensor`` with a Metal pool ``metal_handle``
+        go zero-copy via the handle path; everything else goes through
+        the input cache (memcpy into a fresh Metal buffer).
+        """
+        import numpy as np
 
-        for buf, pspec in zip(buffers, self.param_spec.buffers, strict=False):
-            _check_dtype_mlx(buf, pspec.dtype)
-            if pspec.readonly:
-                input_arrays.append(buf)
+        # Hot-path packet: precomputed per-CompiledKernel invariants.
+        # On first call we walk ``param_spec.buffers``+``buffers`` once
+        # to derive output shapes/dtypes/nbytes (fixed by spec) and the
+        # ordered lists of readonly-input vs output buffer indices.
+        # Subsequent calls reuse these and only re-extract per-buffer
+        # ``metal_handle`` for inputs — no shape/dtype branching.
+        packet = self._metal_packet
+        if packet is None:
+            _in_idx: list[int] = []
+            _in_names: list[str] = []
+            _out_idx: list[int] = []
+            _out_names: list[str] = []
+            _out_shapes: list[tuple[int, ...]] = []
+            _out_dtypes: list = []
+            for i, b in enumerate(self.param_spec.buffers):
+                if b.readonly:
+                    _in_idx.append(i)
+                    _in_names.append(b.name)
+                else:
+                    _out_idx.append(i)
+                    _out_names.append(b.name)
+                    buf = buffers[i]
+                    shape = tuple(int(s) for s in buf.shape)
+                    if isinstance(buf.dtype, str):
+                        dt = _IR_DT_TO_NP_DT.get(buf.dtype)
+                        if dt is None:
+                            dt = np.dtype(buf.dtype)
+                    else:
+                        dt = buf.dtype
+                    _out_shapes.append(shape)
+                    _out_dtypes.append(dt)
+            packet = (
+                tuple(_in_idx),
+                tuple(_out_idx),
+                tuple(_out_names),
+                tuple(_out_shapes),
+                tuple(_out_dtypes),
+            )
+            self._metal_packet = packet
+        in_idx, out_idx, out_names, output_shapes, output_dtypes = packet
+        output_shapes = list(output_shapes)
+        output_dtypes = list(output_dtypes)
+
+        _disable_oh = _DISABLE_OUTPUT_HANDLES
+
+        # Inputs: walk readonly indices in a tight loop.
+        n_in = len(in_idx)
+        input_arrays = [None] * n_in
+        input_handles = [-1] * n_in
+        for k in range(n_in):
+            buf = buffers[in_idx[k]]
+            h = getattr(buf, "metal_handle", None)
+            if h is not None:
+                input_arrays[k] = buf  # placeholder; ndarray view built in driver
+                input_handles[k] = int(h)
             else:
-                # Output buffer — record shape/dtype for MLX to allocate.
-                output_shapes.append(tuple(buf.shape))
-                output_dtypes.append(buf.dtype)
+                input_arrays[k] = np.asarray(buf)
+                # input_handles[k] already -1
+        # Outputs: default -1 (pool-alloc), or route to caller-pinned
+        # handles. Two trigger paths:
+        #   1. ``persistent_outs={...}``: explicit list from the
+        #      ``call_with_bindings`` caller, used for state buffers
+        #      like KV caches that must survive eval recycling.
+        #   2. The caller passed a QuarkTensor with a ``metal_handle``
+        #      as the output slot — common for layers that pre-allocate
+        #      a cached ``out=`` buffer (``nn.Add``, ``nn.SiLU``,
+        #      ``nn.EulerStep``, the ``_maybe_cached_out`` family) and
+        #      hand it straight to ``compiled.launch(buffers=[...])``
+        #      without going through ``call_with_bindings``. Without
+        #      this, the kernel writes into a fresh pool buffer and
+        #      the caller's pre-allocated tensor stays at its initial
+        #      (typically zero-filled) state — the
+        #      ``ctrl_residual``/``mlp_gate`` chain silently produced
+        #      zeros for every block that touched a cached-out path.
+        n_out = len(out_idx)
+        output_handles = [-1] * n_out
+        if not _disable_oh:
+            for k in range(n_out):
+                buf = buffers[out_idx[k]]
+                h = getattr(buf, "metal_handle", None)
+                if h is None:
+                    continue
+                if persistent_outs is not None and out_names[k] in persistent_outs:
+                    output_handles[k] = int(h)
+                else:
+                    # Auto-route any caller-provided pinned output buffer
+                    # so the kernel writes land where the caller expects.
+                    output_handles[k] = int(h)
 
-        # Scalars become 0-d mx.arrays appended to inputs.
         scalar_arrays: list = []
         for val, sspec in zip(scalars, self.param_spec.scalars, strict=False):
-            scalar_arrays.append(mx.array(val, dtype=_ir_to_mlx_dtype(sspec.dtype)))
+            scalar_arrays.append(np.array(val, dtype=_ir_to_np_dtype(sspec.dtype)))
 
-        return self.driver.launch_mlx(
+        results = self.driver.launch_metal(
             self.module,
             grid=self.grid_fn(*self.grid_args),
             block=self.block_fn(*self.block_args),
@@ -375,7 +463,38 @@ class CompiledKernel:
             output_shapes=output_shapes,
             output_dtypes=output_dtypes,
             scalar_arrays=scalar_arrays,
+            input_handles=input_handles,
+            output_handles=output_handles,
         )
+        if not _LAZY.get():
+            self.driver.sync(None)
+        return results
+
+    def launch_metal_fast(
+        self,
+        input_arrays: list,
+        output_shapes: list[tuple[int, ...]],
+        output_np_dtypes: list,
+    ) -> list:
+        """Metal fast path: skip buffer-list splitting and scalar packing.
+
+        Caller provides input arrays and precomputed output shapes/dtypes
+        directly. No dict construction, no alloc_from_decl, no
+        prepare_launch_tensors. Used by functional wrappers for the
+        repeat-call hot path where the launch setup is invariant.
+        """
+        results = self.driver.launch_metal(
+            self.module,
+            grid=self.grid_fn(*self.grid_args),
+            block=self.block_fn(*self.block_args),
+            input_arrays=input_arrays,
+            output_shapes=output_shapes,
+            output_dtypes=output_np_dtypes,
+            scalar_arrays=[],
+        )
+        if not _LAZY.get():
+            self.driver.sync(None)
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -385,15 +504,15 @@ class CompiledKernel:
 
 def _driver_for(family: DeviceFamily):
     """Return the Driver class that owns this family. Importing the
-    module is lazy so non-CUDA processes never load libcuda/MLX."""
+    module is lazy so non-CUDA processes never load libcuda."""
     if family is DeviceFamily.CUDA:
         from quark.drivers.cuda import CudaDriver
 
         return CudaDriver
     if family is DeviceFamily.METAL:
-        from quark.drivers.mlx import MlxDriver
+        from quark.drivers.metal import MetalDriver
 
-        return MlxDriver
+        return MetalDriver
     raise NotImplementedError(f"_driver_for: backend {family.value!r} not yet implemented")
 
 

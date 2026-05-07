@@ -6,15 +6,14 @@ Splitting would scatter the module hierarchy across files with no
 readability benefit.
 
 No autograd, no training hooks, no optimizer state. Just:
-- Named parameter storage (QuarkTensor on CUDA, mx.array on Metal)
+- Named parameter storage (QuarkTensor on CUDA, np.ndarray on Metal)
 - Nested sub-modules
 - state_dict() / load_state_dict() with key remapping
 - forward() convention
 
 On CUDA, all tensors are ``QuarkTensor`` instances with no torch or
-numpy dependency. On Metal (until Stage 2 migration), the existing
-MLX path uses ``mx.array`` directly; the old ``quark.backend.PT``
-polymorphic tensor was retired in the numpy-refs migration.
+numpy dependency. On Metal, tensors are ``np.ndarray`` instances with
+bf16 stored as uint16 carriers.
 """
 
 from __future__ import annotations
@@ -24,33 +23,51 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from typing import Any
 
+import numpy as _np
+
 _IS_METAL = sys.platform == "darwin"
 
+# Mapping from quark short strings → numpy carrier dtypes.
+_NP_DT_MAP = {
+    "bf16": _np.uint16,  # bf16 stored as uint16
+    "f16": _np.float16,
+    "f32": _np.float32,
+    "s32": _np.int32,
+    "e4m3": _np.uint8,
+    "e5m2": _np.uint8,
+    "u16": _np.uint16,
+    "u8": _np.uint8,
+    "s8": _np.int8,
+}
 
-_MX_DT_MAP = None
+
+# ndarray subclass that carries a ``quark_dtype`` tag. Plain numpy
+# carriers (uint16 for bf16, uint8 for fp8) are ambiguous to
+# ``DType.from_backend`` — the tag lets the dispatcher resolve them
+# back to the intended quark dtype at call time.
+class _Tagged(_np.ndarray):
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.quark_dtype = getattr(obj, "quark_dtype", None)
 
 
-def _mx_dt(dtype: str):
-    """Map quark short strings → mlx dtype. Metal only."""
-    global _MX_DT_MAP
-    if _MX_DT_MAP is None:
-        import mlx.core as mx
-
-        _MX_DT_MAP = {
-            "bf16": mx.bfloat16,
-            "f16": mx.float16,
-            "f32": mx.float32,
-            "s32": mx.int32,
-        }
-    return _MX_DT_MAP.get(dtype, _MX_DT_MAP["bf16"])
+def _tag(arr, dtype: str):
+    out = arr.view(_Tagged)
+    out.quark_dtype = dtype
+    return out
 
 
 def _randn(*shape, dtype="bf16"):
     """Create a random normal tensor on the active backend."""
     if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.random.normal(shape=shape).astype(_mx_dt(dtype))
+        rng = _np.random.default_rng()
+        np_dt = _NP_DT_MAP.get(dtype, _np.uint16)
+        if np_dt == _np.uint16:
+            # bf16 as uint16 storage: generate f32 then truncate top 16 bits
+            f32 = rng.standard_normal(shape).astype(_np.float32)
+            return _tag((f32.view(_np.uint32) >> 16).astype(_np.uint16), dtype)
+        return _tag(rng.standard_normal(shape).astype(np_dt), dtype)
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.randn(*shape, dtype=dtype)
@@ -58,9 +75,8 @@ def _randn(*shape, dtype="bf16"):
 
 def _zeros(*shape, dtype="bf16"):
     if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.zeros(shape, dtype=_mx_dt(dtype))
+        np_dt = _NP_DT_MAP.get(dtype, _np.uint16)
+        return _tag(_np.zeros(shape, dtype=np_dt), dtype)
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.zeros(*shape, dtype=dtype)
@@ -68,9 +84,11 @@ def _zeros(*shape, dtype="bf16"):
 
 def _tensor(data, dtype="f32"):
     if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.array(data).astype(_mx_dt(dtype))
+        np_dt = _NP_DT_MAP.get(dtype, _np.float32)
+        arr = _np.array(data, dtype=_np.float32)
+        if np_dt == _np.uint16:
+            return _tag((arr.view(_np.uint32) >> 16).astype(_np.uint16), dtype)
+        return _tag(arr.astype(np_dt), dtype)
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.from_list(data, dtype=dtype)
@@ -78,7 +96,21 @@ def _tensor(data, dtype="f32"):
 
 def _astype(x, dtype: str):
     if _IS_METAL:
-        return x.astype(_mx_dt(dtype))
+        # bf16 ↔ f16 / f32 needs to widen-then-narrow (uint16 carrier
+        # holds bf16 *bits*, not values — a numpy .astype would treat
+        # them as integers).
+        from quark.runtime.npconv import astype_numpy, to_f32_numpy
+
+        src_qd = getattr(x, "quark_dtype", None)
+        if src_qd is None:
+            np_dt = _NP_DT_MAP.get(dtype, _np.uint16)
+            if x.dtype == np_dt:
+                return x
+            return _tag(x.astype(np_dt), dtype)
+        if src_qd == dtype:
+            return x
+        f32 = to_f32_numpy(x, dtype_hint=src_qd)
+        return _tag(astype_numpy(f32, dtype), dtype)
     return x.astype(dtype)
 
 

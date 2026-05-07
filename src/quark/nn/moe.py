@@ -45,6 +45,21 @@ because the fused-silu epilogue can't yet store fp8 (PTX has no scalar
 fp8 cvt — pending the ``packed_convert`` refactor); outproj reads it
 back and casts on smem-load via ``compute_dtype``.
 
+Outproj writes per-slot **f32** partials ``[total_slots, D]`` (not an
+atomic scatter into ``[M, D]``). The router emits a
+``token_slot_table[M, top_k]`` inverse-index, and ``moe_reduce``
+gathers + weighted-sums the partials into the final ``[M, D]`` bf16
+output. The f32 partial keeps the bf16 quantization confined to a
+single cast at the end of the per-token sum (matching the precision
+of the previous f32-atomic-add design); compared to bf16 partials,
+this cuts per-call MoE error by ~3-4×, which matters because each
+frame's MoE error gets baked into K/V via the commit pass and
+compounds across frames.
+
+Replaces the previous ``atomic_fetch_add`` design, which on Metal
+was racy against the host-memset ``zero_()`` of its F32 accumulator
+buffer and produced gibberish from frame 2+.
+
 **``moe_fp8`` kwarg**: opt the MoE block out of fp8 independently of
 the surrounding model (``Waypoint15Config.quant.moe = "bf16"``).
 Propagated through ``Waypoint15.prepare`` → ``MoE.prepare`` so the
@@ -57,23 +72,21 @@ from __future__ import annotations
 
 import sys
 
-from quark.nn.layers import Cast, Linear
+from quark.nn.layers import Linear
 from quark.nn.module import Module, Parameter, _quantize_to_e4m3, _tensor, _zeros
 
 _IS_METAL = sys.platform == "darwin"
 
 
 def _empty(*shape, dtype: str):
-    """Backend-native uninitialized tensor — mx.array on Metal,
-    QuarkTensor on CUDA. Mirrors ``module._zeros`` minus the zero-fill
-    so the cached output buffers don't pay for a memset they'll
-    immediately overwrite."""
-    if _IS_METAL:
-        import mlx.core as mx
+    """Backend-native pinned device tensor.
 
-        from quark.nn.module import _mx_dt
-
-        return mx.zeros(shape, dtype=_mx_dt(dtype))
+    Returns a real ``QuarkTensor`` so the buffer carries a
+    ``metal_handle`` (Metal) / ``data_ptr`` (CUDA). The launcher's
+    auto-route picks those up and writes the kernel's output INTO the
+    cached buffer; downstream readers (next kernel in the MoE chain)
+    read real data, not a host-side scratch.
+    """
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.empty(*shape, dtype=dtype)
@@ -145,9 +158,15 @@ class MoE(Module):
         self._routing = routing
         self._out_dtype = out_dtype
 
-        # f32 router output → pcf.moe_router consumes directly. fp8_skip:
-        # E is tiny and routing is precision-sensitive.
-        self.router = Linear(d_model, n_experts, out_dtype="f32", fp8_skip=True)
+        # Router output: bf16 (the well-tested NAX-GEMM dtype on
+        # Metal). f32 output of the GEMM has known correctness bugs
+        # at small N — the audit caught NaN/Inf in some output rows
+        # for the small-E router shape. ``forward`` casts the bf16
+        # logits up to f32 before handing them to
+        # ``moe_router_correct``, which expects f32 for softmax
+        # precision. ``fp8_skip``: E is tiny and routing is
+        # precision-sensitive.
+        self.router = Linear(d_model, n_experts, out_dtype="bf16", fp8_skip=True)
 
         # Same layout as world_engine's ``.view()``'d expert_in/out so
         # the state-dict remap is one ``.reshape`` per layer.
@@ -172,17 +191,29 @@ class MoE(Module):
             # are overwritten before being read.
             self.work_list = _empty(wl_size, dtype="s32")
 
-        # Pre-allocate every output buffer the kernels write into. Reusing
-        # them across calls saves ~5 ``cuMemAllocAsync`` per forward (~150 µs
-        # each on Ada/Blackwell), which is most of the gap vs ``F.grouped_mm``
-        # for a 24-layer × 5-NFE inference loop. Routing outputs are zeroed
-        # by the router kernel itself; the outproj output is atomic-add'd
-        # into so it gets a per-call ``zero_()`` in forward.
+        # Pre-allocate every output buffer the kernels write into.
+        # Reusing them across calls saves ~5 ``cuMemAllocAsync`` per
+        # forward. Routing outputs are zeroed by the router kernel
+        # itself; per-slot partials and the final ``[M, D]`` output
+        # are fully overwritten before being read, so they don't need
+        # per-call zero_().
         self._buf_token_ids = _empty(total_slots, dtype="s32")
         self._buf_slot_weights = _empty(total_slots, dtype="f32")
         self._buf_counts = _empty(n_experts, dtype="s32")
         self._buf_h = _empty(total_slots, d_intermediate, dtype=out_dtype)
-        self._buf_out_f32 = _empty(M, d_model, dtype="f32")
+        # Per-slot f32 partials from moe_outproj, gathered + reduced
+        # into per-token bf16 output by moe_reduce. f32 (vs bf16)
+        # doubles the buffer but keeps the bf16 quantization confined
+        # to a single cast at the very end of the per-token sum,
+        # matching the precision of the previous f32-atomic-add
+        # design. Per-call MoE error otherwise compounds via the KV
+        # cache (each frame's residual gets baked into K/V, the next
+        # frame reads it back through attention).
+        self._buf_partials = _empty(total_slots, d_model, dtype="f32")
+        # Per-token reduce output [M, D] in the residual-stream dtype.
+        # The reduce kernel writes every element it owns so no
+        # zero-init is needed.
+        self._buf_out = _empty(M, d_model, dtype=out_dtype)
         # Workspace buffers used only by shared_experts routing.
         if routing == "shared_experts":
             self._buf_cum_probs = _empty(n_experts, dtype="f32")
@@ -190,8 +221,11 @@ class MoE(Module):
         # Workspace used only by correct routing.
         if routing == "correct":
             self._buf_offsets = _empty(n_experts + 1, dtype="s32")
-
-        self._cast_out = Cast(out_dtype)
+            # Inverse of token_ids: ``token_slot_table[m, k]`` is the
+            # slot in token_ids/slot_weights that received token m's
+            # k-th expert assignment. Emitted by moe_router_correct,
+            # consumed by moe_reduce.
+            self._buf_token_slot_table = _empty(M, top_k, dtype="s32")
 
     def prepare(self, *, fp8: bool = False, moe_fp8: bool | None = None, **kwargs) -> None:
         """Optionally quantize expert weights to e4m3 for fp8 MMA compute.
@@ -225,13 +259,12 @@ class MoE(Module):
                 n_total *= int(d)
             x = x.reshape(n_total, orig_shape[-1])
 
-        logits = self.router(x)  # [M, E] f32
-
-        # The router kernel zero-inits its three outputs at entry — we
-        # only need to ``zero_()`` the outproj output (atomic-add target)
-        # before each invocation.
-        if not _IS_METAL:
-            self._buf_out_f32.zero_()
+        # Router GEMM (bf16 output) → cast to f32 for the softmax.
+        # See the ``self.router`` construction comment for why we
+        # don't run the GEMM at f32 directly.
+        logits = self.router(x)  # [M, E] bf16
+        if logits.dtype != "f32":
+            logits = logits.astype("f32")
 
         if self._routing == "balanced":
             pcf.moe_router(
@@ -267,12 +300,14 @@ class MoE(Module):
                 counts_out=self._buf_counts,
                 work_list_out=self.work_list,
                 offsets_out=self._buf_offsets,
+                token_slot_table_out=self._buf_token_slot_table,
             )
 
         # Fp8 compute: when expert weights have been quantized to e4m3
-        # via ``prepare(fp8=True)``, both kernels need ``compute_dtype="e4m3"``
-        # so the bf16-side input gets cast on the smem load and the MMA
-        # runs in fp8. b_dtype is inferred from the weight tensor dtype.
+        # via ``prepare(fp8=True)``, both kernels need
+        # ``compute_dtype="e4m3"`` so the bf16-side input gets cast on
+        # the smem load and the MMA runs in fp8. b_dtype is inferred
+        # from the weight tensor dtype.
         compute_dtype = "e4m3" if getattr(self, "_fp8", False) else None
 
         pcf.moe_inproj(
@@ -287,20 +322,42 @@ class MoE(Module):
             out=self._buf_h,
         )
 
-        y_f32 = pcf.moe_outproj(
+        # outproj: per-slot f32 partials [total_slots, D]. Each block
+        # writes its BM rows in full; sentinel-skipped chunks leave
+        # their slice untouched (moe_reduce only reads slots indexed
+        # by token_slot_table, which never points at sentinel chunks).
+        # f32 (not bf16) so the bf16 quantization happens once on the
+        # final per-token sum — see ``_buf_partials`` comment above.
+        pcf.moe_outproj(
             self._buf_h,
             self.expert_out.data,
-            self._buf_token_ids,
-            self._buf_slot_weights,
             self.work_list,
             M=self._M,
             n_experts=self._E,
             top_k=self._K,
+            out_dtype="f32",
             compute_dtype=compute_dtype,
-            out=self._buf_out_f32,
+            out=self._buf_partials,
         )
 
-        y = self._cast_out(y_f32)
+        # reduce: gather + weighted sum → [M, D] bf16. Only the
+        # ``correct`` routing emits ``token_slot_table``; the other
+        # routing modes still need updating to use this kernel.
+        if self._routing != "correct":
+            raise NotImplementedError(
+                "MoE.forward: routing modes other than 'correct' need "
+                "their routers updated to emit token_slot_table for "
+                "the new outproj/reduce pipeline. Use routing='correct'."
+            )
+        y = pcf.moe_reduce(
+            self._buf_partials,
+            self._buf_slot_weights,
+            self._buf_token_slot_table,
+            n_experts=self._E,
+            out_dtype=self._out_dtype,
+            out=self._buf_out,
+        )
+
         if len(orig_shape) > 2:
             y = y.reshape(*orig_shape)
         return y

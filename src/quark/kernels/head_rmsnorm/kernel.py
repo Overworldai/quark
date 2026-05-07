@@ -113,7 +113,7 @@ class HeadRMSNormKernel(Kernel):
     ) -> HeadRMSNormSpec:
         M = int(X.shape[0])
         D_full = int(X.shape[1])
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         return HeadRMSNormSpec(
             M=M,
             D_full=D_full,

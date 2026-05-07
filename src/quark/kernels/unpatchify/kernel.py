@@ -150,7 +150,7 @@ class UnpatchifyKernel(Kernel):
         has_bias: bool = True,
     ):
         d_model = int(X.shape[1])
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         return UnpatchifySpec(
             B=B,
             C=C,

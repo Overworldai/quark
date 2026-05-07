@@ -106,17 +106,12 @@ def shuffle_b_for_moe_outproj(
     unchanged — see :func:`shuffle_b_for_moe_inproj`.
     """
     cls = get("moe_outproj")
-    from quark.functional._dispatch import _zero_placeholder_f32, _zero_placeholder_s32
+    from quark.functional._dispatch import _zero_placeholder_s32
 
-    total_slots = M * top_k
-    token_ids = _zero_placeholder_s32(total_slots, like=h_in)
-    slot_weights = _zero_placeholder_f32(total_slots, like=h_in)
     work_list = _zero_placeholder_s32(2, like=h_in)
     spec = cls.spec_from_tensors(
         h_in,
         W_out,
-        token_ids,
-        slot_weights,
         work_list,
         M=M,
         n_experts=n_experts,

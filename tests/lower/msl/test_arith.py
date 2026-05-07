@@ -150,7 +150,7 @@ class TestConvert:
         v = b.const(DType.F32, 1.0)
         b.convert(v, DType.BF16)
         out = lower(b)
-        assert "static_cast<bfloat16_t>" in out
+        assert "static_cast<bfloat>" in out
 
     def test_bf16_to_f32(self, fresh_builder):
         b = fresh_builder

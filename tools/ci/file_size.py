@@ -60,6 +60,41 @@ EXCLUDED: frozenset[str] = frozenset(
         "src/quark/ir/op.py",
         "src/quark/lower/ptx/lower.py",
         "src/quark/autotune.py",
+        # MSL lowering visitors — same monolithic-by-design pattern.
+        # ``visitors.py`` is the per-op dispatch table (one ``_visit_*``
+        # per IR op kind, ~50 entries) and ``mma.py`` is the matching
+        # MMA-op catalog (LoadMatrixOp / MmaOp / StoreMatrixOp +
+        # FragOp / NAX helper emission). Both have to read top-to-
+        # bottom against the IR op catalog they mirror; splitting by
+        # op family would force the dispatch table to import its own
+        # cases back across module boundaries.
+        "src/quark/lower/msl/mma.py",
+        "src/quark/lower/msl/visitors.py",
+        # GemmKernel — see kernel.py's docstring for the rationale
+        # (IR emit + autotune + cuBLAS hook + per-shape NAX table all
+        # share GemmSpec/Config). Adding the gate-residual fusion
+        # branch on top of the existing silu / has_bias / NAX paths
+        # pushed the file just past the 800-line cap.
+        "src/quark/kernels/gemm/kernel.py",
+        # NAX flash attention is one IR-emitted ``@kernel`` body —
+        # ``dispatch_nax_attn`` plus the per-tile q-staging /
+        # online-softmax / NAX-MMA helpers it uses inline. The helpers
+        # share register-tile and smem-layout state with the kernel
+        # body; splitting them out would force re-exporting that
+        # state via globals or extra parameters.
+        "src/quark/kernels/owl_attn/nax.py",
+        # QuarkTensor is the single tensor type for both backends.
+        # Storage classes, factories, view ops, slicing, and arithmetic
+        # dispatch all share the type's __slots__ and would force
+        # circular imports between the pieces if split. The docstring
+        # already declares this exemption explicitly.
+        "src/quark/runtime/tensor.py",
+        # nn.Module catalog — Linear, Patchify, RMSNorm, AdaRMSNorm,
+        # AdaGateResidual, KVCacheUpdate, OwlAttn, MLPFusion, etc. all
+        # share the cached-out / pinned-buffer / metal_handle plumbing
+        # and reach into the same set of pcf.* functional helpers.
+        # Splitting would fragment the layer ↔ functional mapping.
+        "src/quark/nn/layers.py",
         # Test fixtures with offset tables and verbose parametrize
         # blocks that don't decompose well.
         "tests/lower/ptx/test_matmul.py",

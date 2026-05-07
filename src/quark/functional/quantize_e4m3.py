@@ -48,7 +48,7 @@ def quantize_e4m3(X):
         pad = QuarkTensor.zeros(1, dtype=X_flat.dtype)
         X_flat = QuarkTensor.cat([X_flat.contiguous(), pad], dim=0)
 
-    src_dt = DType.from_backend(X.dtype) if not isinstance(X.dtype, str) else DType(X.dtype)
+    src_dt = DType.from_backend(X)
     spec = QuantizeE4M3Spec(N=padded, src_dtype=src_dt)
     config = QuantizeE4M3Config.default_for(spec)
 

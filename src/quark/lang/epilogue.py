@@ -98,6 +98,9 @@ def store_acc(
     cast: DType | None = None,
     activation: str | None = None,
     bias: GlobalTensor | None = None,
+    gate: GlobalTensor | None = None,
+    residual: GlobalTensor | None = None,
+    gate_groups: int = 1,
     stage_in_smem: bool = False,
     staging_smem: SharedRegion | None = None,
     smem_col_offset: Value | None = None,
@@ -228,6 +231,9 @@ def store_acc(
         cast=_cast,
         activation=activation,
         bias=bias,
+        gate=gate,
+        residual=residual,
+        gate_groups=gate_groups,
         row_scale=row_scale,
         atomic=atomic,
     )
@@ -300,6 +306,9 @@ def _emit_scatter_store(
     cast: DType,
     activation: str | None = None,
     bias: GlobalTensor | None = None,
+    gate: GlobalTensor | None = None,
+    residual: GlobalTensor | None = None,
+    gate_groups: int = 1,
     row_scale: list[Value] | None = None,
     atomic: bool = False,
 ) -> None:
@@ -314,6 +323,13 @@ def _emit_scatter_store(
     the output column is added to each accumulator element before
     activation and cast. Fuses ``Out = matmul + bias`` into the
     epilogue, eliminating a separate element-wise add pass.
+
+    ``gate`` + ``residual`` if both provided: fuse the AdaGate-residual
+    op ``Out = Residual[m, n] + Gate[m // (M/G), n] * acc[m, n]`` into
+    the epilogue. ``gate_groups`` is the broadcast group count G —
+    each block of M/G consecutive rows reads the same gate row. Read
+    in F32 (after a one-time bf16/f16 → f32 convert) so the multiply
+    stays in accumulator precision before the cast to ``cast``.
 
     ``row_scale`` if provided: per-(mt, rc) Values whose reciprocal is
     multiplied into each element pre-cast (the attn ``O /= l`` epilogue).
@@ -332,6 +348,31 @@ def _emit_scatter_store(
     log2e = bctx.c(_LOG2E) if activation == "silu" else None
     one = bctx.c(1.0) if activation == "silu" else None
     _bias = bias
+    _gate = gate
+    _residual = residual
+    # gate_groups divides M into G blocks; each block of M//G rows reads
+    # the same gate row. ``M_per_group`` is the row→gate-row stride.
+    # Pre-cache the constant so each lane just does an integer divide.
+    if _gate is not None and _residual is not None:
+        if gate_groups < 1:
+            raise ValueError(f"store_acc: gate_groups must be ≥ 1, got {gate_groups}")
+        # The kernel-level M is acc.MT * m_stride * (M_blocks) — but
+        # ``store_acc`` doesn't see the spec's M directly. We pass
+        # ``gate_groups`` as the broadcast-group count and assume the
+        # caller has validated M % G == 0 in ``GemmSpec.__post_init__``;
+        # the per-row gate index is ``gmem_row // (M // G)``. The
+        # caller communicates that ratio via ``gate_groups`` being the
+        # G dimension and us deriving M_per_group from the GlobalTensor
+        # shape. Use the residual tensor's row count as M (it's
+        # [M, N] by definition for has_gate_residual).
+        m_dim = _residual.shape[0]
+        if m_dim % gate_groups != 0:
+            raise ValueError(
+                f"store_acc: residual rows ({m_dim}) not divisible by gate_groups ({gate_groups})"
+            )
+        _gate_row_div = m_dim // gate_groups
+    else:
+        _gate_row_div = 0
 
     rc_info = _rc_info(cfg) if row_scale is not None else None
     rcps = [rcp_approx(v) for v in row_scale] if row_scale is not None else None
@@ -354,9 +395,29 @@ def _emit_scatter_store(
                 if activation == "silu":
                     assert log2e is not None and one is not None
                     elem = _silu_scalar(elem, log2e, one)
+                gmem_row = _row + (_mt + row)
+                # Fused AdaGate-residual: ``elem = residual + gate * elem``.
+                # Done in F32 (post-activation, pre-cast) so the multiply
+                # keeps accumulator precision. Standalone equivalent runs
+                # the multiply in bf16 — this is a precision improvement
+                # in addition to the dispatch / round-trip savings.
+                if _gate is not None and _residual is not None:
+                    # ``gate_groups == 1`` is the common (Waypoint) case:
+                    # one gate row broadcast over all M rows, so the
+                    # gate-row index is the constant 0 — skip the lane-
+                    # local integer divide entirely.
+                    if gate_groups == 1:
+                        gate_row_idx = bctx.c(0, dtype=DType.U32)
+                    else:
+                        gate_row_idx = gmem_row // _gate_row_div
+                    g_val = load(_gate, gate_row_idx, gmem_col)
+                    g_f32 = convert(g_val, DType.F32) if g_val.dtype != DType.F32 else g_val
+                    elem = elem * g_f32
+                    r_val = load(_residual, gmem_row, gmem_col)
+                    r_f32 = convert(r_val, DType.F32) if r_val.dtype != DType.F32 else r_val
+                    elem = elem + r_f32
                 if cast != DType.F32:
                     elem = convert(elem, cast)
-                gmem_row = _row + (_mt + row)
                 if _use_atomic:
                     from quark.lang import atomic_rmw
 

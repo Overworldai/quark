@@ -20,7 +20,7 @@ from quark.kernels.silu.problems import silu_problems
 from quark.kernels.silu.reference import silu_reference_numpy
 from quark.kernels.silu.spec import SiLUSpec
 
-_LOG2E = math.log2(math.e)
+_LOG2E = math.log2(math.e)  # kept for backward compat; silu now uses exp_approx
 
 
 @kernel(
@@ -55,7 +55,7 @@ class SiLUKernel(Kernel):
         )
 
     def grid(self) -> tuple[int, int, int]:
-        return (1, self.spec.N // self.config.elems_per_block, 1)
+        return (self.spec.N // self.config.elems_per_block, 1, 1)
 
     def flops(self) -> int:
         return 5 * self.spec.N
@@ -83,9 +83,13 @@ class SiLUKernel(Kernel):
         N = 1
         for d in X.shape:
             N *= int(d)
-        return SiLUSpec(N=N, dtype=DType.from_backend(X.dtype))
+        return SiLUSpec(N=N, dtype=DType.from_backend(X))
 
-    def build(self) -> None:
+    def _silu_body(self, *, use_exp: bool) -> None:
+        """Shared body for ``build`` and ``build_metal``. When
+        ``use_exp=True`` emits ``metal::fast::exp(-x)`` (one op);
+        otherwise ``metal::fast::exp2(-x * log2e)`` (two ops, needed
+        on CUDA where exp is not a single SFU instruction)."""
         s, c = self.spec, self.config
         g = self.g
         bctx = self.bctx
@@ -95,16 +99,51 @@ class SiLUKernel(Kernel):
         epl = epb // n_threads
         dtype = s.dtype
 
-        block = qk.block_idx("y")
+        if epl % 4 == 0:
+            vec_w = 4
+        elif epl % 2 == 0:
+            vec_w = 2
+        else:
+            vec_w = 1
+        vecs_per_lane = epl // vec_w
+
+        block = qk.block_idx("x")
         base = block * bctx.c(epb, dtype=DType.U32)
         n_threads_c = bctx.c(n_threads, dtype=DType.U32)
+        vec_w_c = bctx.c(vec_w, dtype=DType.U32)
 
-        log2e = bctx.c(_LOG2E, dtype=DType.F32)
         one_f = bctx.c(1.0, dtype=DType.F32)
+        log2e = bctx.c(_LOG2E, dtype=DType.F32) if not use_exp else None
 
-        for i in range(epl):
-            off = base + bctx.c(i) * n_threads_c + bctx.tid
-            x_f = qk.convert(g.X[off], DType.F32)
-            sig = qk.rcp_approx(one_f + qk.ex2_approx(qk.neg(x_f * log2e)))
-            y = x_f * sig
-            g.Out[off] = qk.convert(y, dtype) if dtype is not DType.F32 else y
+        def _sigmoid(x_f):
+            if use_exp:
+                # metal::fast::exp(-x) → one op; skip the mul by log2e.
+                return qk.rcp_approx(one_f + qk.exp_approx(qk.neg(x_f)))
+            # CUDA: exp2(-x * log2e) — PTX has no native exp, needs 2 ops.
+            return qk.rcp_approx(one_f + qk.ex2_approx(qk.neg(x_f * log2e)))
+
+        if vec_w == 1:
+            for i in range(epl):
+                off = base + bctx.c(i) * n_threads_c + bctx.tid
+                x_f = qk.convert(g.X[off], DType.F32)
+                y = x_f * _sigmoid(x_f)
+                g.Out[off] = qk.convert(y, dtype) if dtype is not DType.F32 else y
+            return
+
+        for v in range(vecs_per_lane):
+            v_off = base + (bctx.c(v) * n_threads_c + bctx.tid) * vec_w_c
+            x_vec = qk.vec_load(g.X, v_off, width=vec_w, dtype=dtype)
+            out_elems = []
+            for j in range(vec_w):
+                x_f = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                y = x_f * _sigmoid(x_f)
+                out_elems.append(qk.convert(y, dtype) if dtype is not DType.F32 else y)
+            qk.vec_store(g.Out, qk.vec_build(out_elems), v_off)
+
+    def build(self) -> None:
+        """CUDA / fallback path: ``exp2(-x * log2e)``."""
+        self._silu_body(use_exp=False)
+
+    def build_metal(self) -> None:
+        """Metal path: ``metal::fast::exp(-x)`` — one op vs two."""
+        self._silu_body(use_exp=True)

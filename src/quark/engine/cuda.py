@@ -1,28 +1,23 @@
-"""``quark.Engine`` — standalone Waypoint-1.5 inference.
+"""``Engine`` — CUDA backend.
 
-Drop-in replacement for the ``world_engine.WorldEngine`` API on the
-quark side: ``append_frame`` / ``gen_frame`` / ``reset`` /
-``set_prompt``. The DiT runs on quark kernels (``Waypoint15`` +
-``GenerateFrame``); the VAE runs on the vendored torch ``TAEHV``
-(``quark.models.vae``).
-
-Quantization is configured via ``Waypoint15Config.quant`` (see
-``QuantConfig``) — no env vars. The ``quant`` constructor kwarg is a
-shorthand: ``"fp8"`` (default) → end-to-end fp8 on sm_89+, ``"bf16"``
-→ ``QuantConfig.all_bf16()`` safe fallback.
-
-Not yet supported (raises): ``set_prompt`` / prompt cross-attention
-(``CrossAttention`` not ported), ``get_state`` / ``load_state`` (KV
-ring-buffer round-trip not implemented).
+Torch and quark share the same CUDA allocator, so the latent
+boundary is a zero-copy ``QuarkTensor.borrow`` over the torch
+storage. The DiT runs through ``GenerateFrame`` graph capture (one
+captured frame, replayed every call); the VAE is the torch-side
+``ChunkedStreamingTAEHV``. Two-thread submit/drain isn't useful on
+this path because there's no asynchronous decode worker — the CUDA
+graph + decode both run synchronously on the device thread; the
+two-thread API is kept only for cross-platform parity with
+:class:`EngineMetal`.
 """
 
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 import torch
 
+from quark.engine.base import Engine, _qt_borrow, _resolve_quant
 from quark.models.config import _resolve_path, load_yaml_config
 from quark.models.vae import ChunkedStreamingTAEHV
 from quark.models.waypoint_15 import (
@@ -35,63 +30,10 @@ from quark.models.waypoint_15 import (
 )
 
 
-def _qt_borrow(t: torch.Tensor, dtype: str = "bf16"):
-    """Zero-copy wrap a contiguous CUDA torch tensor as a ``QuarkTensor``.
-
-    Holds a reference via ``owner`` so the torch storage outlives the
-    wrapper.
-    """
-    from quark.runtime.tensor import QuarkTensor
-
-    assert t.is_cuda, "quark.Engine requires CUDA tensors"
-    assert t.is_contiguous(), "borrowed tensor must be contiguous"
-    return QuarkTensor.borrow(
-        t.data_ptr(),
-        t.numel() * t.element_size(),
-        tuple(t.shape),
-        dtype,
-        owner=t,
-    )
-
-
-def _resolve_quant(quant: str | QuantConfig | None) -> QuantConfig:
-    if quant is None or quant == "fp8":
-        return QuantConfig()
-    if quant == "bf16":
-        return QuantConfig.all_bf16()
-    if isinstance(quant, QuantConfig):
-        return quant
-    raise ValueError(
-        f"quark.Engine: quant must be 'fp8' / 'bf16' / QuantConfig(...), got {quant!r}"
-    )
-
-
-class Engine:
-    """Standalone inference engine for a Waypoint-1.5 checkpoint.
-
-    Parameters
-    ----------
-    model_uri:
-        Path to a model directory or HF repo id. Must contain
-        ``config.yaml`` and ``model.safetensors``.
-    quant:
-        ``"fp8"`` (default) for end-to-end fp8 on sm_89+, ``"bf16"`` for
-        the safe fallback, or a ``QuantConfig`` for per-component
-        control. Replaces the old ``QUARK_NO_FP8`` / ``QUARK_MOE_NO_FP8``
-        env vars.
-    config_overrides:
-        Optional mapping merged into the YAML config before
-        ``Waypoint15Config.from_dict`` (e.g. swap ``ae_uri`` to a local
-        path during development).
-    device:
-        ``torch.device`` or string. Defaults to the current CUDA device.
-    dtype:
-        Latent dtype on the VAE side. ``torch.bfloat16`` matches the
-        DiT residual stream and avoids a cast at the borrow boundary.
-    load_weights:
-        Set ``False`` to construct an architecture-only model (useful
-        for testing the graph capture without a real checkpoint).
-    """
+class EngineCUDA(Engine):
+    """Engine for CUDA / non-Apple-Silicon hosts. Mirror of the legacy
+    monolithic ``Engine`` pre-split — see :class:`Engine` (in
+    ``quark.engine.base``) for the full ctor docstring."""
 
     def __init__(
         self,
@@ -102,9 +44,30 @@ class Engine:
         device=None,
         dtype=torch.bfloat16,
         load_weights: bool = True,
+        # Accepted for cross-platform API parity with EngineMetal; the
+        # torch VAE doesn't consume a CoreML cache so the kwarg is a
+        # no-op on CUDA.
+        taehv_cache_dir: str | None = None,
     ):
+        import warnings
+
         if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
+            # Quark's DiT runs on the local accelerator regardless of
+            # which torch device this attribute names — that's only
+            # used for the VAE side. Pick the best torch backend for
+            # the current OS: CUDA on Linux/Windows, MPS on Apple
+            # Silicon (rare on this subclass — it's selected only when
+            # the platform check in ``Engine.__new__`` lands on CUDA),
+            # CPU otherwise.
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            elif (
+                getattr(torch.backends, "mps", None) is not None
+                and torch.backends.mps.is_available()
+            ):
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
         elif isinstance(device, str):
             device = torch.device(device)
         self.device = device
@@ -125,7 +88,15 @@ class Engine:
                 stacklevel=2,
             )
 
-        cfg = Waypoint15Config.from_dict(raw_cfg, quant=_resolve_quant(quant))
+        # Only override ``quant`` when the caller explicitly asked for
+        # one. Default falls through to ``Waypoint15Config.quant``'s
+        # ``default_factory`` (``QuantConfig.all_bf16`` per the standalone
+        # config) — passing ``QuantConfig()`` (all-fp8) here unconditionally
+        # made ``Engine`` diverge from the WE backend on the same model.
+        if quant is None:
+            cfg = Waypoint15Config.from_dict(raw_cfg)
+        else:
+            cfg = Waypoint15Config.from_dict(raw_cfg, quant=_resolve_quant(quant))
         self.cfg = cfg
         self.model = Waypoint15(cfg)
 
@@ -188,16 +159,20 @@ class Engine:
             self._pixel_shape, device=self.device, dtype=self.dtype
         )
 
+        # Staging buffer for ``submit_frame`` / ``next_pixels``. CUDA has
+        # no worker thread — submit runs inline and stashes the decoded
+        # tensor here for the matching next_pixels() to pop.
+        self._pending_pixels: torch.Tensor | None = None
+
     # ── Public API ──────────────────────────────────────────────
 
     def reset(self) -> None:
         """Reset KV caches, frame counter, and VAE streaming state."""
+        # Drop any frame staged by ``submit_frame`` but never collected.
+        self._pending_pixels = None
         self.gen.reset()
         self._frame_counter = 0
         self.vae.reset()
-
-    def set_prompt(self, prompt: str) -> None:
-        raise NotImplementedError("quark.Engine.set_prompt: prompt cross-attention not yet ported.")
 
     @torch.inference_mode()
     def append_frame(self, img: torch.Tensor, ctrl: CtrlInput | None = None) -> torch.Tensor:
@@ -221,9 +196,46 @@ class Engine:
 
     @torch.inference_mode()
     def gen_frame(self, ctrl: CtrlInput | None = None, return_img: bool = True):
-        """Refill the noise buffer, run ``GenerateFrame`` (denoise +
-        commit + ft++) via a captured CUDA graph, D2D-copy the latent
-        for VAE decode. First call captures the graph."""
+        """Synchronous one-frame inference: denoise + commit + decode.
+
+        Runs the full ``GenerateFrame`` graph + torch decode
+        synchronously. The two-thread submit/drain pattern works on
+        CUDA but doesn't gain anything over plain ``gen_frame`` here
+        (no async decode worker); it's kept for parity with
+        :class:`EngineMetal`.
+        """
+        self.submit_frame(ctrl)
+        if not return_img:
+            self.next_pixels()
+            return None
+        return self.next_pixels()
+
+    def flush_pixels(self) -> torch.Tensor | None:
+        """Drain the last in-flight pipelined decode (if any) and return
+        its pixels. Use after the final ``submit_frame`` call (e.g. on
+        session end) to collect the trailing frame. Returns ``None`` if
+        nothing is pending."""
+        return self.next_pixels()
+
+    @torch.inference_mode()
+    def submit_frame(self, ctrl: CtrlInput | None = None) -> None:
+        """Begin one frame of inference; pair with ``next_pixels``.
+
+        On CUDA there's no worker thread — this runs the full
+        ``gen_frame`` body synchronously and stages the resulting
+        torch tensor for ``next_pixels`` to pop. The two-thread
+        pattern still works (it just doesn't gain anything over
+        ``gen_frame``); see :class:`EngineMetal` for the path where
+        the worker actually overlaps.
+
+        Raises ``RuntimeError`` if a previous ``submit_frame`` hasn't
+        been drained — pipeline depth is bounded at 1.
+        """
+        if self._pending_pixels is not None:
+            raise RuntimeError(
+                "quark.Engine.submit_frame: previous frame not drained — "
+                "call next_pixels() before submitting another."
+            )
         torch.randn(self._flat_shape, out=self._noise_torch)
         ctrl_qt = self._encode_ctrl(ctrl)
 
@@ -237,28 +249,18 @@ class Engine:
         # QuarkTensor → torch: D2D memcpy into the pre-allocated torch
         # output buffer. No host round-trip.
         latent_qt.copy_into_ptr(self._latent_out_torch.data_ptr())
+        # Decode runs synchronously on the same thread — same semantics
+        # as the pre-split ``gen_frame``. Pixels are staged for
+        # ``next_pixels()`` to pop.
+        self._pending_pixels = self.vae.decode(self._latent_out_torch)
 
-        return self.vae.decode(self._latent_out_torch) if return_img else self._latent_out_torch
+    def next_pixels(self) -> torch.Tensor | None:
+        """Block for the previously-submitted frame's pixels.
 
-    def get_state(self):
-        raise NotImplementedError(
-            "quark.Engine.get_state: KV ring-buffer round-trip not implemented."
-        )
-
-    def load_state(self, state):
-        raise NotImplementedError(
-            "quark.Engine.load_state: KV ring-buffer round-trip not implemented."
-        )
-
-    # ── Internals ───────────────────────────────────────────────
-
-    def _encode_ctrl(self, ctrl: CtrlInput | None):
-        """Pack a ``CtrlInput`` into the stable ``[1, padded_in]`` bf16
-        device buffer. Returns ``None`` when ``ctrl_conditioning`` is
-        off; ``ctrl_fill`` writes in place on the pre-allocated device
-        buffer so the graph-captured input pointer stays stable."""
-        if self._ctrl_fill is None:
-            return None
-        if ctrl is None:
-            ctrl = CtrlInput()
-        return self._ctrl_fill(ctrl)
+        Returns the same ``(T, H, W, 3) uint8`` torch tensor
+        ``gen_frame`` returns. Returns ``None`` if no submit is
+        pending.
+        """
+        pixels = self._pending_pixels
+        self._pending_pixels = None
+        return pixels

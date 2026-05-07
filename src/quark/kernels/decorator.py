@@ -44,6 +44,43 @@ from quark.ir import Module
 from quark.kernels.registry import register as _register
 
 
+def _resolve_caps(self: Any):
+    """Return DeviceCaps for this kernel, or None if unavailable.
+
+    Priority: explicitly bound ``self._caps`` (set by tests / autotune
+    via ``Kernel.bind_caps``), then ``current_device().caps`` cached
+    probe. ``None`` means "no caps known" — emit() falls back to the
+    default ``build()``.
+    """
+    caps = getattr(self, "_caps", None)
+    if caps is not None:
+        return caps
+    try:
+        from quark.device import current_device
+
+        return current_device().caps
+    except Exception:
+        return None
+
+
+def _pick_build_method(cls: type, caps) -> str:
+    """Return the most-specific build method name available on ``cls``.
+
+    Lookup order: ``build_<family>`` (e.g. ``build_metal``,
+    ``build_cuda``), then plain ``build``. The family name is
+    ``caps.family.value`` (already lowercase: 'metal' / 'cuda' / ...).
+    Picking the method by name lets a kernel diverge per-backend
+    without duplicating its TENSORS / spec / config / tune_space.
+    """
+    if caps is not None:
+        family = getattr(caps.family, "value", None)
+        if family:
+            specific = f"build_{family}"
+            if specific in cls.__dict__ or any(specific in base.__dict__ for base in cls.__mro__):
+                return specific
+    return "build"
+
+
 def kernel(
     name: str,
     *,
@@ -111,10 +148,13 @@ def kernel(
 
         # Generated emit(): opens the ctx, walks the manifest, runs
         # build(), finalizes. The kernel only writes build().
-        if "build" not in cls.__dict__:
+        if "build" not in cls.__dict__ and not any(
+            k.startswith("build_") and callable(v) for k, v in cls.__dict__.items()
+        ):
             raise TypeError(
                 f"@kernel({name!r}): {cls.__name__} must define a "
-                f"`build(self)` method (replaces the old emit())."
+                f"`build(self)` method (or a backend-specific "
+                f"`build_<family>` such as ``build_metal``)."
             )
         if "emit" in cls.__dict__:
             raise TypeError(
@@ -165,8 +205,12 @@ def kernel(
             if hasattr(self.config, "BN"):
                 self.n_base = block_base("x", self.config.BN)
 
-            # Run kernel-supplied build body.
-            self.build()
+            # Run kernel-supplied build body. Backend-specific
+            # ``build_<family>`` overrides take precedence over the
+            # default ``build`` when caps are known.
+            self.caps = _resolve_caps(self)
+            method_name = _pick_build_method(type(self), self.caps)
+            getattr(self, method_name)()
             return ctx.finalize()
 
         cls.emit = emit  # type: ignore

@@ -247,8 +247,8 @@ class AttnKernel(Kernel):
             seq_len=seq_len,
             kv_len=kv_len,
             Dh=Dh,
-            a_dtype=DType.from_backend(Q.dtype),
-            b_dtype=DType.from_backend(K.dtype),
+            a_dtype=DType.from_backend(Q),
+            b_dtype=DType.from_backend(K),
         )
 
     @classmethod

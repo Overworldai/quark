@@ -18,7 +18,8 @@ Phases (one thread per token; ``n_threads == M`` enforced by is_valid):
   4. Block barrier.
   5. Each thread t: re-uses register tuples (expert_k, weight_k,
      slot_in_e_k) to scatter into ``token_ids[offsets[e] + slot_in_e]``
-     and ``slot_weights[...]``.
+     and ``slot_weights[...]``, and emit ``token_slot_table[t, k] = final``
+     so the downstream reduce kernel can gather without a scatter.
 """
 
 from __future__ import annotations
@@ -95,6 +96,16 @@ class MoeRouterCorrectKernel(Kernel):
             shape=lambda s, c: (s.E + 1,),
             role="out",
         ),
+        # Per-token inverse of token_ids: token_slot_table[t, k] is the
+        # slot index in the expert-major output buffer where token ``t``'s
+        # k-th top-expert partial lands. Lets the downstream reduce
+        # kernel gather without a scatter / atomic.
+        TensorDecl(
+            "token_slot_table",
+            dtype=lambda s, c: DType.S32,
+            shape=lambda s, c: (s.M, s.top_k),
+            role="out",
+        ),
     ]
 
     spec: MoeRouterCorrectSpec
@@ -144,6 +155,7 @@ class MoeRouterCorrectKernel(Kernel):
             "counts": np.zeros((spec.E,), dtype=np.int32),
             "work_list": np.zeros((2 * (spec.total_slots // _BM),), dtype=np.int32),
             "offsets": np.zeros((spec.E + 1,), dtype=np.int32),
+            "token_slot_table": np.zeros((spec.M, spec.top_k), dtype=np.int32),
         }
 
     @classmethod
@@ -316,7 +328,8 @@ class MoeRouterCorrectKernel(Kernel):
 
         qk.barrier("block")
 
-        # ── Phase 3: scatter token_ids/slot_weights ─────────────────────
+        # ── Phase 3: scatter token_ids/slot_weights + emit
+        # token_slot_table[tid, k] = final ─────────────────────
         tid_i = qk.bitcast(tid, DType.S32)
         with qk.if_(in_range, carried=[]) as (_, _, arms):
             with arms.then_():
@@ -328,6 +341,15 @@ class MoeRouterCorrectKernel(Kernel):
                     final_u = qk.bitcast(final, DType.U32)
                     qk.store(g.token_ids, tid_i, final_u)
                     qk.store(g.slot_weights, pri_weight[k], final_u)
+                    # token_slot_table is [M, top_k]; the per-row store
+                    # uses ``(tid, k_const)`` indexing so the lowerer
+                    # picks up the row stride from the tensor's shape.
+                    qk.store(
+                        g.token_slot_table,
+                        final,
+                        tid,
+                        bctx.c(k, dtype=DType.U32),
+                    )
                 qk.yield_()
             with arms.else_():
                 qk.yield_()

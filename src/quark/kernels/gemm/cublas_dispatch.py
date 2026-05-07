@@ -85,6 +85,12 @@ def is_cublas_eligible(spec, caps: Any | None = None) -> bool:
         return False
     if getattr(spec, "activation", None) is not None:
         return False
+    # cuBLAS has no fused-AdaGate-residual epilogue — it would silently
+    # compute the bare ``A @ Bᵀ`` and drop the Gate/Residual buffers,
+    # corrupting the post-attn / post-MLP residual stream. The PTX
+    # ``GemmKernel.build()`` path is the only one that fuses this.
+    if getattr(spec, "has_gate_residual", False):
+        return False
 
     a_dt = _dtype_str(spec.a_dtype)
     b_dt = _dtype_str(spec.b_dtype)

@@ -1,9 +1,7 @@
     uint _pc_u32_0 = 0u;
-    float _pc_f32_0_0 = X[(_pc_u32_0 * 32u) + _pc_u32_0];
-    float _pc_f32_0_1 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 1u];
-    float _pc_f32_0_2 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 2u];
-    float _pc_f32_0_3 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 3u];
-    X[(_pc_u32_0 * 32u) + _pc_u32_0] = _pc_f32_0_0;
-    X[(_pc_u32_0 * 32u) + _pc_u32_0 + 1u] = _pc_f32_0_1;
-    X[(_pc_u32_0 * 32u) + _pc_u32_0 + 2u] = _pc_f32_0_2;
-    X[(_pc_u32_0 * 32u) + _pc_u32_0 + 3u] = _pc_f32_0_3;
+    float4 v0 = *reinterpret_cast<const device float4*>(&X[(_pc_u32_0 * 32u) + _pc_u32_0]);
+    float _pc_f32_0_0 = v0[0];
+    float _pc_f32_0_1 = v0[1];
+    float _pc_f32_0_2 = v0[2];
+    float _pc_f32_0_3 = v0[3];
+    *reinterpret_cast<device float4*>(&X[(_pc_u32_0 * 32u) + _pc_u32_0]) = float4(_pc_f32_0_0, _pc_f32_0_1, _pc_f32_0_2, _pc_f32_0_3);

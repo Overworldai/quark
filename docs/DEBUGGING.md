@@ -66,7 +66,7 @@ Common errors:
   `visitors.py::_visit_vec_load / _visit_vec_store`.
 - **MSL exceeds `max_ir_ops`** — config explores too many
   unrolled MMA tiles for the MSL JIT. Bump `max_ir_ops` in
-  `drivers/mlx.py` or reduce `MTiles × NCW` in the config.
+  `drivers/metal.py` or reduce `MTiles × NCW` in the config.
 
 ## Kernel hangs
 

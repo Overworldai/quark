@@ -24,6 +24,7 @@ import quark.lang as qk
 from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
 from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
+from quark.device import DeviceFamily
 from quark.ir import DType
 from quark.kernels.ada_rmsnorm.baselines import ada_rmsnorm_baselines
 from quark.kernels.ada_rmsnorm.config import AdaRMSNormConfig
@@ -98,7 +99,28 @@ class AdaRMSNormKernel(Kernel):
             return False
         return True
 
+    def _use_metal_multi_sg(self) -> bool:
+        """Mirror of ``RMSNormKernel._use_metal_multi_sg``: pick the
+        multi-simdgroup-per-row variant when the row's load chain
+        would serialize >4 vec chunks per lane on a single warp."""
+        s, c = self.spec, self.config
+        if getattr(self, "caps", None) is None:
+            return False
+        if self.caps.family is not DeviceFamily.METAL:
+            return False
+        if c.n_warps <= 1:
+            return False
+        vec_elems = _CP_BYTES // s.dtype.bytes
+        if _WARP * vec_elems > s.D or s.D % (_WARP * vec_elems) != 0:
+            return False
+        epl = s.D // _WARP
+        if epl % vec_elems != 0:
+            return False
+        return (epl // vec_elems) > 4
+
     def grid(self) -> tuple[int, int, int]:
+        if self._use_metal_multi_sg():
+            return (1, self.spec.B, 1)
         return (1, self.spec.B // self.config.n_warps, 1)
 
     def flops(self) -> int:
@@ -140,8 +162,173 @@ class AdaRMSNormKernel(Kernel):
         if B % G != 0:
             raise ValueError(f"ada_rmsnorm: X rows ({B}) not divisible by G ({G})")
         M = B // G
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         return AdaRMSNormSpec(G=G, M=M, D=D, dtype=dt, eps=eps)
+
+    def build_metal(self) -> None:
+        """Metal-flavored ada_rmsnorm: warp-per-row register-stash.
+
+        Mirrors ``RMSNormKernel.build_metal`` and adds the
+        ``(1 + scale) * y + bias`` epilogue (plus optional silu).
+        scale / bias are read inline from gmem at the same offsets
+        as X (L2-hot since every row in a group hits the same
+        ``[group_row, col]`` slot), so smem is not needed.
+
+        Falls back to the default ``build()`` (pipelined cp.async +
+        smem; benefits from packed vec_load/async_copy lowering even
+        on Metal) when the row layout doesn't divide cleanly into
+        warp-sized vec chunks.
+        """
+
+        s, c = self.spec, self.config
+
+        D = s.D
+        M = s.M
+        n_warps = c.n_warps
+        dtype = s.dtype
+        vec_elems = _CP_BYTES // dtype.bytes
+        min_chunk = _WARP * vec_elems
+        if min_chunk > D or D % min_chunk != 0:
+            self.build()
+            return
+        epl = D // _WARP
+        if epl % vec_elems != 0:
+            self.build()
+            return
+
+        if self._use_metal_multi_sg():
+            self._build_metal_multi_sg(D, M, n_warps, dtype, vec_elems)
+            return
+
+        self._build_metal_warp_per_row(D, M, n_warps, dtype, epl, vec_elems)
+
+    def _build_metal_warp_per_row(self, D, M, n_warps, dtype, epl, vec_elems) -> None:
+        import math as _math
+
+        s = self.spec
+        g = self.g
+        bctx = self.bctx
+        lane = bctx.lane_id
+        vec_w = vec_elems
+        vec_w_c = bctx.c(vec_w, dtype=DType.U32)
+        vecs_per_lane = epl // vec_w
+
+        block_base = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)
+        my_row = block_base + bctx.warp_id
+        M_c = bctx.c(M, dtype=DType.U32)
+        my_group = my_row // M_c
+
+        sum_sq = bctx.c(0.0, dtype=DType.F32)
+        regs: list[list] = []
+        for v in range(vecs_per_lane):
+            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
+            v_regs = []
+            for j in range(vec_w):
+                x_f = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                sum_sq = qk.fma(x_f, x_f, sum_sq)
+                v_regs.append(x_f)
+            regs.append(v_regs)
+
+        total = qk.subgroup_reduce("sum", sum_sq)
+        one_f = bctx.c(1.0, dtype=DType.F32)
+        rms_inv = qk.rsqrt_approx(
+            total * bctx.c(1.0 / D, dtype=DType.F32) + bctx.c(s.eps, dtype=DType.F32)
+        )
+
+        do_silu = s.activation == "silu"
+        log2e = bctx.c(_math.log2(_math.e), dtype=DType.F32) if do_silu else None
+
+        for v in range(vecs_per_lane):
+            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            s_vec = qk.vec_load(g.scale, my_group, col, width=vec_w, dtype=dtype)
+            b_vec = qk.vec_load(g.bias, my_group, col, width=vec_w, dtype=dtype)
+            out_elems = []
+            for j in range(vec_w):
+                sc = qk.convert(qk.vec_extract(s_vec, j), DType.F32)
+                bi = qk.convert(qk.vec_extract(b_vec, j), DType.F32)
+                y = qk.fma(regs[v][j] * rms_inv, one_f + sc, bi)
+                if do_silu:
+                    assert log2e is not None
+                    sig = qk.rcp_approx(one_f + qk.ex2_approx(qk.neg(y * log2e)))
+                    y = y * sig
+                out_elems.append(qk.convert(y, dtype))
+            qk.vec_store(g.Out, qk.vec_build(out_elems), my_row, col)
+
+    def _build_metal_multi_sg(self, D, M, n_warps, dtype, vec_elems) -> None:
+        """Multi-simdgroup-per-row variant. Mirrors
+        ``RMSNormKernel._build_metal_multi_sg`` plus the fused
+        ``(1 + scale) * y + bias`` (+ optional silu) epilogue. Block
+        is one row; ``n_warps`` simdgroups split the columns.
+        Cross-warp reduction via ``tg_sums[n_warps]`` smem buffer.
+        """
+        import math as _math
+
+        s = self.spec
+        g = self.g
+        bctx = self.bctx
+        lane = bctx.lane_id
+        sg_id = bctx.warp_id
+        vec_w = vec_elems
+        vec_w_c = bctx.c(vec_w, dtype=DType.U32)
+
+        n_threads = n_warps * _WARP
+        epl_per_thread = D // n_threads
+        vecs_per_lane = epl_per_thread // vec_w
+        sg_c = bctx.c(_WARP, dtype=DType.U32)
+        tid = sg_id * sg_c + lane
+
+        my_row = qk.block_idx("y")
+        my_group = my_row // bctx.c(M, dtype=DType.U32)
+
+        sum_sq = bctx.c(0.0, dtype=DType.F32)
+        regs: list[list] = []
+        for v in range(vecs_per_lane):
+            col = (tid + bctx.c(v * n_threads, dtype=DType.U32)) * vec_w_c
+            x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
+            v_regs = []
+            for j in range(vec_w):
+                x_f = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                sum_sq = qk.fma(x_f, x_f, sum_sq)
+                v_regs.append(x_f)
+            regs.append(v_regs)
+
+        sg_sum = qk.subgroup_reduce("sum", sum_sq)
+
+        tg_sums = qk.smem_alloc("tg_sums", DType.F32, (n_warps,), pad=0)
+        zero_u = bctx.c(0, dtype=DType.U32)
+        is_lane_zero = qk.cmp("eq", lane, zero_u)
+        qk.store(tg_sums, sg_sum, sg_id, pred=is_lane_zero)
+        qk.barrier("block")
+
+        n_warps_c = bctx.c(n_warps, dtype=DType.U32)
+        is_active = qk.cmp("lt", lane, n_warps_c)
+        partial = qk.load(tg_sums, lane, pred=is_active)
+        total = qk.subgroup_reduce("sum", partial)
+
+        one_f = bctx.c(1.0, dtype=DType.F32)
+        rms_inv = qk.rsqrt_approx(
+            total * bctx.c(1.0 / D, dtype=DType.F32) + bctx.c(s.eps, dtype=DType.F32)
+        )
+
+        do_silu = s.activation == "silu"
+        log2e = bctx.c(_math.log2(_math.e), dtype=DType.F32) if do_silu else None
+
+        for v in range(vecs_per_lane):
+            col = (tid + bctx.c(v * n_threads, dtype=DType.U32)) * vec_w_c
+            s_vec = qk.vec_load(g.scale, my_group, col, width=vec_w, dtype=dtype)
+            b_vec = qk.vec_load(g.bias, my_group, col, width=vec_w, dtype=dtype)
+            out_elems = []
+            for j in range(vec_w):
+                sc = qk.convert(qk.vec_extract(s_vec, j), DType.F32)
+                bi = qk.convert(qk.vec_extract(b_vec, j), DType.F32)
+                y = qk.fma(regs[v][j] * rms_inv, one_f + sc, bi)
+                if do_silu:
+                    assert log2e is not None
+                    sig = qk.rcp_approx(one_f + qk.ex2_approx(qk.neg(y * log2e)))
+                    y = y * sig
+                out_elems.append(qk.convert(y, dtype))
+            qk.vec_store(g.Out, qk.vec_build(out_elems), my_row, col)
 
     def build(self) -> None:
         s, c = self.spec, self.config

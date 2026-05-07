@@ -103,7 +103,7 @@ class Waypoint15Config:
     # end-to-end fp8 on sm_89+; ``QuantConfig.all_bf16()`` for the
     # safe fallback. Replaces the old ``use_fp8`` bool + the
     # ``QUARK_NO_FP8`` / ``QUARK_MOE_NO_FP8`` env-var knobs.
-    quant: QuantConfig = field(default_factory=QuantConfig)
+    quant: QuantConfig = field(default_factory=QuantConfig.all_bf16)
 
     # Spatial-quilting factor for the kv_cache + owl_attn path. ``1``
     # is the no-op default (every token participates in attention every
@@ -118,6 +118,15 @@ class Waypoint15Config:
     moe: bool = False
     moe_n_experts: int = 8
     moe_top_k: int = 2
+    # Fold the post-attn / post-MLP AdaGate-residual into the preceding
+    # GEMM epilogue (``out_proj`` + ``mlp.fc2``). Replaces two separate
+    # dispatches per block × 2 (= 4 dispatches × 24 layers = 96 dispatches
+    # / NFE × 5 NFE = 480 dispatches / frame) with one fused store. Wired
+    # through ``GemmKernel._nax_store_accs`` on Metal NAX; CUDA / non-NAX
+    # falls through to the unfused GemmKernel.build() epilogue. Gate by
+    # default until end-to-end perf is verified — flip on after the bench
+    # confirms the win.
+    fuse_gate_residual: bool = False
     moe_routing: str = "correct"
 
     @property
@@ -226,7 +235,11 @@ def _check_dtype(t, expected: str, where: str) -> None:
     the point in the graph so the stack trace + message identify
     exactly which edge went wrong.
     """
-    actual = t.dtype if isinstance(t.dtype, str) else str(t.dtype)
+    qd = getattr(t, "quark_dtype", None)
+    if qd is not None:
+        actual = qd
+    else:
+        actual = t.dtype if isinstance(t.dtype, str) else str(t.dtype)
     if actual != expected:
         raise TypeError(
             f"Waypoint15: dtype mismatch at {where!r}: expected {expected!r}, got {actual!r}. "
@@ -264,6 +277,11 @@ class TransformerBlock(nn.Module):
         # this block (qkv, activations, ctrl emb, …). Captured once and
         # referenced by the dtype checks in forward().
         self._half_dt = half_dt
+        # Captured at __init__ so each forward() avoids the cfg attr load.
+        # Disabled when MoE is on for this block — the MoE fc2 path doesn't
+        # take a fused gate epilogue (see ``forward`` for the dynamic check
+        # that also covers it via ``isinstance(self.mlp, nn.MoE)``).
+        self._fuse_gate_residual = bool(getattr(cfg, "fuse_gate_residual", False))
         # Intermediate tensors (qkv_proj output, MLP fc1 output) stay in
         # half_dt. The fp8 compute path is driven by Linear.forward
         # pre-casting ``x`` to e4m3 when the weight is fp8 (cuBLAS takes
@@ -279,7 +297,11 @@ class TransformerBlock(nn.Module):
         # KV cache + owl_attn MMAs are driven by ``cfg.quant``:
         #   fp8 path: e4m3 cache + e4m3 MMAs; Q is cast to e4m3 during
         #     the Q-RoPE pass (packed_convert) inside owl_attn. Cache
-        #     bandwidth halves + sm_89+ fp8 MMA throughput win.
+        #     bandwidth halves + sm_89+ fp8 MMA throughput win. CUDA
+        #     only — Metal has no native fp8 (no e4m3 in MSL), so
+        #     callers on Apple Silicon pick ``QuantConfig.all_bf16()``
+        #     or set ``kv_cache``/``attn_compute`` to ``"bf16"`` when
+        #     targeting Metal.
         #   bf16 path: kv cache, Q, K, V all in half_dt; MMAs inherit
         #     that from the tensor dtypes (compute_dtype=None). The
         #     safe fallback when fp8 is misbehaving or the device
@@ -369,6 +391,7 @@ class TransformerBlock(nn.Module):
     ):
         s0, b0, g0, s1, b1, g1 = self._cond_lut[sigma_idx]
         half_dt = self._half_dt
+        fuse = self._fuse_gate_residual
 
         _check_dtype(x, half_dt, "block input x")
 
@@ -383,7 +406,13 @@ class TransformerBlock(nn.Module):
         self.kv_cache(qkv, frame_t, frozen=frozen)
         attn_out = self.attn(qkv, self.kv_cache, frame_t)
         _check_dtype(attn_out, half_dt, "attn_out")
-        x = self.attn_gate(x, self.out_proj(attn_out), g0)
+        if fuse:
+            # Fused: out_proj + attn_gate in one NAX dispatch.
+            # ``g0`` is [G, d_model]; broadcast factor = M / G where
+            # M = x.shape[0] (the per-frame token count).
+            x = self.out_proj(attn_out, gate=g0, residual=x, gate_groups=int(g0.shape[0]))
+        else:
+            x = self.attn_gate(x, self.out_proj(attn_out), g0)
         _check_dtype(x, half_dt, "x (after attn_gate)")
 
         # ── Controller conditioning ──
@@ -395,7 +424,17 @@ class TransformerBlock(nn.Module):
             )
 
         # ── MLP ──
-        x = self.mlp_gate(x, self.mlp(self.pre_mlp_norm(x, s1, b1)), g1)
+        if fuse and not isinstance(self.mlp, nn.MoE):
+            # Fused: mlp.fc2 + mlp_gate in one NAX dispatch (the fc1+silu
+            # epilogue still fires inside mlp.forward as before).
+            x = self.mlp(
+                self.pre_mlp_norm(x, s1, b1),
+                gate=g1,
+                residual=x,
+                gate_groups=int(g1.shape[0]),
+            )
+        else:
+            x = self.mlp_gate(x, self.mlp(self.pre_mlp_norm(x, s1, b1)), g1)
         _check_dtype(x, half_dt, "x (after mlp_gate)")
 
         return x, qkv
@@ -592,6 +631,15 @@ class Waypoint15(nn.Module):
         x = self.patchify(latent)
         _check_dtype(x, half_dt, "patchify output")
         qkv_first = None
+        # Diagnostic: ``QUARK_SERIAL_BLOCKS=1`` forces a ``quark.eval()``
+        # after every block. Used to verify the dispatcher's lazy-handle
+        # lifetime guarantees — refcounted slots in g_lazy_buffers are
+        # supposed to make eval semantically a no-op, so this should
+        # not change the model output. If it does, that's a refcount /
+        # release-handle wiring bug, not a "barrier" issue.
+        import os as _os
+
+        _serial = _os.environ.get("QUARK_SERIAL_BLOCKS") == "1"
         for li, block in enumerate(self.blocks):
             x, qkv = block(
                 x,
@@ -603,6 +651,10 @@ class Waypoint15(nn.Module):
             )
             if li == 0 and self.cfg.value_residual:
                 qkv_first = qkv
+            if _serial:
+                import quark as _qk
+
+                _qk.eval()
 
         x = self.out_norm(x, s_on, b_on, activation="silu")
         _check_dtype(x, half_dt, "out_norm output")

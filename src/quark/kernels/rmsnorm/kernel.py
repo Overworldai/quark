@@ -17,6 +17,7 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import TensorDecl
 from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
+from quark.device import DeviceFamily
 from quark.ir import DType
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
@@ -83,10 +84,34 @@ class RMSNormKernel(Kernel):
             return False
         return True
 
+    def _use_metal_multi_sg(self) -> bool:
+        """True when build_metal should pick the multi-simdgroup-per-row
+        variant: every simdgroup in the block cooperates on the same row
+        with a cross-warp tg-buffer reduction. Worth the cross-warp
+        plumbing only when the row is large enough that the warp-per-row
+        path serializes >4 vec chunks per lane."""
+        s, c = self.spec, self.config
+        if getattr(self, "caps", None) is None:
+            return False
+        if self.caps.family is not DeviceFamily.METAL:
+            return False
+        if c.n_warps <= 1:
+            return False
+        vec_elems = _CP_BYTES // s.dtype.bytes
+        if _WARP * vec_elems > s.D or s.D % (_WARP * vec_elems) != 0:
+            return False
+        epl = s.D // _WARP
+        if epl % vec_elems != 0:
+            return False
+        return (epl // vec_elems) > 4
+
     def grid(self) -> tuple[int, int, int]:
         s, c = self.spec, self.config
         vec_elems = _CP_BYTES // s.dtype.bytes
         if _WARP * vec_elems <= s.D:
+            if self._use_metal_multi_sg():
+                # One block per row; n_warps simdgroups cooperate.
+                return (1, s.B, 1)
             return (1, s.B // c.n_warps, 1)
         n_threads = c.n_warps * _WARP
         rows_per_load = (n_threads * vec_elems) // s.D
@@ -120,7 +145,7 @@ class RMSNormKernel(Kernel):
         for d in X.shape[:-1]:
             B *= int(d)
         D = int(X.shape[-1])
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         return RMSNormSpec(B=B, D=D, dtype=dt, eps=eps)
 
     def build(self) -> None:
@@ -144,6 +169,166 @@ class RMSNormKernel(Kernel):
             )
         else:
             self._build_small_d(D, n_warps, n_threads, dtype, epl, vec_elems, lane, warp_c)
+
+    def build_metal(self) -> None:
+        """Metal-flavored rmsnorm: warp-per-row, register-stash, no smem.
+
+        Skips the two-pass cp.async/smem pipeline ``_build_large_d``
+        uses on CUDA. On Metal cp.async is a synchronous fallback so
+        the pipelined pattern doesn't overlap anything — it just turns
+        each row into 2× gmem reads through a smem detour.
+
+        Path: vec4 loads from gmem into a per-lane register array,
+        accumulate ∑x² alongside the loads, ``simd_sum`` for the warp
+        reduce, then scale + vec_store from the same registers. One
+        gmem read, one gmem write.
+
+        Falls back to the default ``build()`` (the pipelined-smem path,
+        which the lowerer still benefits from via the packed
+        vec_load/async_copy fixes) when the row layout doesn't divide
+        cleanly into vec4s per lane — small-D rows, odd ratios, etc.
+        """
+        s, c = self.spec, self.config
+
+        D = s.D
+        n_warps = c.n_warps
+        dtype = s.dtype
+        vec_elems = _CP_BYTES // dtype.bytes
+        min_chunk = _WARP * vec_elems
+        # Conditions for the warp-per-row register-stash path:
+        #   - D divides evenly across the warp at the vec width
+        #   - one full warp's worth of vecs fits the row (D >= min_chunk)
+        #   - elems_per_lane (= D/_WARP) is a multiple of vec_elems
+        if min_chunk > D or D % min_chunk != 0:
+            self.build()
+            return
+        epl = D // _WARP
+        if epl % vec_elems != 0:
+            self.build()
+            return
+
+        if self._use_metal_multi_sg():
+            self._build_metal_multi_sg(D, n_warps, dtype, vec_elems)
+            return
+
+        self._build_metal_warp_per_row(D, n_warps, dtype, epl, vec_elems)
+
+    def _build_metal_warp_per_row(self, D, n_warps, dtype, epl, vec_elems) -> None:
+        """Single simdgroup per row. Each lane stashes ``epl`` elements
+        in registers, ``simd_sum`` reduces, scale + store from regs.
+        Used when the row is small enough that a single warp's load
+        chain doesn't bottleneck (epl/vec_w ≤ 4)."""
+        g = self.g
+        bctx = self.bctx
+        lane = bctx.lane_id
+        vec_w = vec_elems
+        vec_w_c = bctx.c(vec_w, dtype=DType.U32)
+        vecs_per_lane = epl // vec_w
+
+        block_base = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)
+        my_row = block_base + bctx.warp_id
+
+        sum_sq = bctx.c(0.0, dtype=DType.F32)
+        regs: list[list] = []
+        for v in range(vecs_per_lane):
+            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
+            v_regs = []
+            for j in range(vec_w):
+                x_f = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                sum_sq = qk.fma(x_f, x_f, sum_sq)
+                v_regs.append(x_f)
+            regs.append(v_regs)
+
+        total = qk.subgroup_reduce("sum", sum_sq)
+        rms_inv = qk.rsqrt_approx(
+            total * bctx.c(1.0 / D, dtype=DType.F32) + bctx.c(self.spec.eps, dtype=DType.F32)
+        )
+
+        for v in range(vecs_per_lane):
+            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            out_elems = []
+            for j in range(vec_w):
+                y = regs[v][j] * rms_inv
+                out_elems.append(qk.convert(y, dtype) if dtype is not DType.F32 else y)
+            qk.vec_store(g.Out, qk.vec_build(out_elems), my_row, col)
+
+    def _build_metal_multi_sg(self, D, n_warps, dtype, vec_elems) -> None:
+        """Multi-simdgroup-per-row path. ``n_warps`` simdgroups in the
+        block all process the same row, splitting the column range
+        ``n_warps``-ways. Cross-warp reduction goes through a small
+        ``tg_sums[n_warps]`` smem buffer:
+
+          1. Lane 0 of each warp writes its simd_sum partial.
+          2. Threadgroup barrier.
+          3. Each lane reads tg_sums[lane] (predicated on lane<n_warps;
+             out-of-range lanes get 0). simd_sum across the warp gives
+             every lane the row total — including warps that didn't
+             write, since they all do the same lane-indexed read.
+
+        Grid is (1, B, 1) — see ``grid()``. Block is ``n_warps * 32``.
+        Closes the warp-per-row gap on rows where one simdgroup's load
+        chain is the bottleneck (e.g. D=2048 bf16, 8 vec4s/lane → 4
+        vec4s/lane with 4 simdgroups).
+        """
+        g = self.g
+        bctx = self.bctx
+        lane = bctx.lane_id
+        sg_id = bctx.warp_id
+        vec_w = vec_elems
+        vec_w_c = bctx.c(vec_w, dtype=DType.U32)
+        # Each lane covers ``vecs_per_lane`` vec chunks, strided across
+        # the row by ``n_warps * _WARP * vec_w``.
+        n_threads = n_warps * _WARP
+        epl_per_thread = D // n_threads
+        vecs_per_lane = epl_per_thread // vec_w
+        sg_c = bctx.c(_WARP, dtype=DType.U32)
+        # Linear thread id within the block.
+        tid = sg_id * sg_c + lane
+
+        my_row = qk.block_idx("y")
+
+        # Pass 1: load + ∑x² across this thread's strided chunks.
+        sum_sq = bctx.c(0.0, dtype=DType.F32)
+        regs: list[list] = []
+        for v in range(vecs_per_lane):
+            col = (tid + bctx.c(v * n_threads, dtype=DType.U32)) * vec_w_c
+            x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
+            v_regs = []
+            for j in range(vec_w):
+                x_f = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                sum_sq = qk.fma(x_f, x_f, sum_sq)
+                v_regs.append(x_f)
+            regs.append(v_regs)
+
+        sg_sum = qk.subgroup_reduce("sum", sum_sq)
+
+        # Cross-warp reduction. Allocate one f32 per warp.
+        tg_sums = qk.smem_alloc("tg_sums", DType.F32, (n_warps,), pad=0)
+        zero_u = bctx.c(0, dtype=DType.U32)
+        is_lane_zero = qk.cmp("eq", lane, zero_u)
+        qk.store(tg_sums, sg_sum, sg_id, pred=is_lane_zero)
+        qk.barrier("block")
+
+        # Each lane reads tg_sums[lane] if lane < n_warps else 0; the
+        # predicated load's else-branch is ``static_cast<f32>(0)``.
+        n_warps_c = bctx.c(n_warps, dtype=DType.U32)
+        is_active = qk.cmp("lt", lane, n_warps_c)
+        partial = qk.load(tg_sums, lane, pred=is_active)
+        total = qk.subgroup_reduce("sum", partial)
+
+        rms_inv = qk.rsqrt_approx(
+            total * bctx.c(1.0 / D, dtype=DType.F32) + bctx.c(self.spec.eps, dtype=DType.F32)
+        )
+
+        # Pass 2: scale + store from registers.
+        for v in range(vecs_per_lane):
+            col = (tid + bctx.c(v * n_threads, dtype=DType.U32)) * vec_w_c
+            out_elems = []
+            for j in range(vec_w):
+                y = regs[v][j] * rms_inv
+                out_elems.append(qk.convert(y, dtype) if dtype is not DType.F32 else y)
+            qk.vec_store(g.Out, qk.vec_build(out_elems), my_row, col)
 
     def _build_large_d(self, D, n_warps, n_threads, dtype, epl, vec_elems, min_chunk, lane, warp_c):
         """Warp-per-row, double-buffered pipeline. No register stash —

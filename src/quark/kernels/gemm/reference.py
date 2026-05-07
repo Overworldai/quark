@@ -15,7 +15,7 @@ import numpy as np
 from quark.runtime.npconv import astype_numpy, to_f32_numpy
 
 
-def gemm_reference_numpy(spec, *, A, B, Bias=None, Out=None):
+def gemm_reference_numpy(spec, *, A, B, Bias=None, Gate=None, Residual=None, Out=None):
     del Out
     a_hint = spec.a_dtype.value
     b_hint = spec.b_dtype.value
@@ -35,5 +35,14 @@ def gemm_reference_numpy(spec, *, A, B, Bias=None, Out=None):
         c = c * (1.0 / (1.0 + np.exp(-c)))
     elif spec.activation is not None:
         raise ValueError(f"gemm_reference: unsupported activation {spec.activation!r}")
+
+    if spec.has_gate_residual and Gate is not None and Residual is not None:
+        out_hint = spec.out_dtype.value
+        gate_f32 = to_f32_numpy(Gate, dtype_hint=out_hint)  # [G, N]
+        residual_f32 = to_f32_numpy(Residual, dtype_hint=out_hint)  # [M, N]
+        m_per_group = spec.M // spec.G
+        # Broadcast gate over each group's M//G rows: gate[m // (M/G)].
+        gate_bcast = np.repeat(gate_f32, m_per_group, axis=0)  # [M, N]
+        c = residual_f32 + gate_bcast * c
 
     return astype_numpy(c, spec.out_dtype)

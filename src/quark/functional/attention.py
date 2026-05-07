@@ -1,4 +1,4 @@
-"""``quark.functional.attention`` — torch/MLX-native flash attention.
+"""``quark.functional.attention`` — flash attention over QuarkTensor.
 
 Signature:
 

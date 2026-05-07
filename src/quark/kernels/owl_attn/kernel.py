@@ -286,7 +286,7 @@ class OwlAttnKernel(Kernel):
             )
         if int(n_segments.shape[0]) != B:
             raise ValueError(f"pcf.owl_attn: n_segments shape {tuple(n_segments.shape)} != ({B},)")
-        a_dt = DType.from_backend(Q.dtype)
+        a_dt = DType.from_backend(Q)
         return OwlAttnSpec(
             B=B,
             n_kv_heads=n_kv_heads,
@@ -297,7 +297,7 @@ class OwlAttnKernel(Kernel):
             pinned_dilation=pinned_dilation,
             Dh=Dh,
             a_dtype=a_dt,
-            kv_dtype=DType.from_backend(K_cache.dtype),
+            kv_dtype=DType.from_backend(K_cache),
             out_dtype=DType.coerce(out_dtype) or a_dt,
             compute_dtype=DType.coerce(compute_dtype),
             max_segments=max_segments,

@@ -133,7 +133,7 @@ _BF16_M8N8K8 = MmaConfig(
     min_cuda_cc=None,  # no PTX path
     cuda=None,
     min_metal_gen=ChipGeneration.METAL_M3,
-    metal="bfloat16_t:1:1:1",
+    metal="bfloat:1:1:1",
 )
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ _BF16_K16 = MmaConfig(
     # future kernel opts in explicitly via ``main_shape``, so we carry
     # the MSL payload for that path.
     min_metal_gen=None,
-    metal="bfloat16_t:2:1:2",
+    metal="bfloat:2:1:2",
 )
 
 # ---------------------------------------------------------------------------
@@ -372,9 +372,120 @@ _BF16xE4M3_K16 = MmaConfig(
 # Every descriptor known to Quark. Adding a new MMA means adding one
 # row here; ``shapes_for_chip`` / ``lookup_mma`` / ``_MMA_TABLE`` all
 # read from this list.
+# ---------------------------------------------------------------------------
+# bf16 × bf16 → f32 (m16n32k16) — NAX MPP matmul2d on Metal 4+ (M5 Max etc.)
+#
+# Uses Apple's MetalPerformancePrimitives mpp::tensor_ops::matmul2d which
+# computes 16×32×16 per simdgroup in one hardware instruction. 16× more
+# compute per instruction than the 8×8×8 simdgroup_matrix path.
+#
+# Fragment layout: 16×16 per fragment, 8 elements per thread (2 rows × 4 cols),
+# kElemRowsJump=8. See MLX's nax.h BaseNAXFrag for the lane map:
+#   fm = ((qid & 4) | ((lane >> 1) & 3))
+#   fn = ((qid & 2) | (lane & 1)) * 4
+# Two 16×16 fragments tile the 16×32 output (TN=2).
+#
+# Not emittable on PTX — Metal-only (NAX hardware + Metal 4 API).
+# ---------------------------------------------------------------------------
+
+_BF16_M16N32K16_NAX = MmaConfig(
+    shape=MmaShape(
+        name="m16n32k16_nax_bf16",
+        m=16,
+        n=32,
+        k=16,
+        a_dtype=DType.BF16,
+        b_dtype=DType.BF16,
+        acc_dtype=DType.F32,
+        # Per-thread registers: 8 elements per 16×16 fragment.
+        # A is TM×TK fragments (1×1 for the base unit),
+        # B is TK×TN fragments (1×2: 16×32 output needs 2 B-tiles of 16×16).
+        a_regs=8,
+        b_regs=16,  # 8 per 16×16 tile × 2 tiles for N=32
+        c_regs=16,  # 8 per 16×16 output tile × 2 tiles for N=32
+    ),
+    # NAX fragment offsets — per-lane element coordinates within the
+    # full MMA tile. The NAX MSL visitor uses its own coordinate map
+    # (BaseNAXFrag fm/fn formulas) so these aren't consulted directly,
+    # but ``LoadMatrixOp`` / ``StoreMatrixOp`` validators check that
+    # ``len(reg_offsets) == fragment_width``. The d/c (16×32) and b
+    # (16×32 transpose_b) fragments are 2 BaseNAXFrag sub-tiles wide;
+    # spell out the per-lane offsets for both so callers can pass these
+    # directly without the validator rejecting the 16-wide fragment.
+    #
+    # Per BaseNAXFrag: per lane covers 2 rows × 4 cols, rows jump by 8.
+    # A is 1 sub-tile (16×16), so 8 per-lane positions.
+    # B (transpose_b, [N, K]) is 2 sub-tiles split along N (row): frag 0 at
+    # row 0..15, frag 1 at row 16..31; per-lane K-cols 0..3 in each.
+    # C/D ([M, N]) are 2 sub-tiles split along N (col): frag 0 at col 0..15,
+    # frag 1 at col 16..31; per-lane rows 0/8 within each.
+    a_offsets=tuple((r * 8, c) for r in range(2) for c in range(4)),
+    b_offsets=tuple(
+        (frag_r * 16 + r * 8, c) for frag_r in range(2) for r in range(2) for c in range(4)
+    ),
+    cd_offsets=tuple(
+        (r * 8, frag_c * 16 + c) for frag_c in range(2) for r in range(2) for c in range(4)
+    ),
+    lane_col_step=4,  # 4 cols per thread per fragment row
+    min_cuda_cc=None,  # no PTX path
+    cuda=None,
+    min_metal_gen=ChipGeneration.METAL_M5,
+    metal="nax:1:2:1",  # frag_dtype:TM:TN:TK — tells the MSL visitor to use MPP
+)
+
+
+# ---------------------------------------------------------------------------
+# bf16 × bf16 → f32 (m32n32k16) — NAX MPP matmul2d, larger M-fragment.
+#
+# Apple's matmul2d_descriptor accepts arbitrary (M, N, K) at the threadgroup
+# tile level — m16n32k16 is the per-MMA-instruction fragment, and bigger
+# tiles get decomposed into multiple m16 fragments by Apple's compiler.
+# This descriptor doubles the M dimension to 32. With single-simdgroup
+# execution, Apple emits 2 stacked m=16 fragments → per-lane regs double:
+#   A: 2 stacked 16×16 = 16 lane elements
+#   B: same as m=16 (N unchanged) = 16 lane elements
+#   C: 2 stacked × 2 N-tiled = 4 sub-fragments = 32 lane elements
+#
+# Per-lane fragment offsets follow the same BaseNAXFrag layout (fm, fn)
+# repeated per sub-fragment, just with M offset 16 for the stacked half.
+# Confirmed via probe in the world_engine MLX path (M32NAXFrag in nax_m32.h)
+# — same Apple cooperative_tensor distribution rule applies here.
+#
+# Single-simdgroup; for execution_simdgroups<N> support add a separate
+# entry with proportional output size + n_simdgroups field.
+# ---------------------------------------------------------------------------
+
+_BF16_M32N32K16_NAX = MmaConfig(
+    shape=MmaShape(
+        name="m32n32k16_nax_bf16",
+        m=32,
+        n=32,
+        k=16,
+        a_dtype=DType.BF16,
+        b_dtype=DType.BF16,
+        acc_dtype=DType.F32,
+        a_regs=16,  # 2 stacked 16×16 = 2 vec<8>
+        b_regs=16,  # unchanged: 16×32 split into 2 N-tiles
+        c_regs=32,  # 2 M-stacked × 2 N-tiled × 8 = 4 vec<8>
+    ),
+    # Same per-fragment offsets as the m=16 entry — the multi-fragment
+    # composition is handled by the nax visitor's _nax_frag_layout, not here.
+    a_offsets=tuple((r * 8, c) for r in range(2) for c in range(4)),
+    b_offsets=tuple((r * 8, c) for r in range(2) for c in range(4)),
+    cd_offsets=tuple((r * 8, c) for r in range(2) for c in range(4)),
+    lane_col_step=4,
+    min_cuda_cc=None,
+    cuda=None,
+    min_metal_gen=ChipGeneration.METAL_M5,
+    metal="nax:2:2:1",  # 2 M-frags × 2 N-frags × 1 K-frag
+)
+
+
 ALL_SHAPES: tuple[MmaConfig, ...] = (
     _BF16_M8N8K8,  # Metal-native 8x8x8
     _BF16_M16N8K8,  # PTX m16n8k8 (Ampere+)
+    _BF16_M16N32K16_NAX,  # Metal NAX 16x32x16 (M5+)
+    _BF16_M32N32K16_NAX,  # Metal NAX 32x32x16 (M5+, larger M-fragment)
     _BF16_K16,
     _F16_K16,
     _E4M3_K16,
@@ -481,7 +592,13 @@ def _normalize_dtype_str(s: str) -> str:
 # intentional: today's kernels only request k ∈ {16, 32}.
 _MMA_TABLE: dict[tuple[str, str, int], MmaConfig] = {}
 _TABLE_COLLISIONS: set[tuple[str, str, int]] = set()
+# NAX shapes (M5+) are only reachable via shapes_for_chip + main_shape;
+# exclude from the legacy (a, b, k) table to avoid collisions with the
+# same-dtype same-k simdgroup_matrix shapes that the fallback path uses.
+_LEGACY_EXCLUDE_GENS = {ChipGeneration.METAL_M5}
 for _cfg in ALL_SHAPES:
+    if _cfg.min_metal_gen in _LEGACY_EXCLUDE_GENS and _cfg.min_cuda_cc is None:
+        continue
     _a = _dtype_key(_cfg.shape.a_dtype)
     _b = _dtype_key(_cfg.shape.b_dtype)
     _k = _cfg.shape.k

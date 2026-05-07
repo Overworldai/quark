@@ -162,7 +162,6 @@ def to_f32_numpy(x: Any, *, dtype_hint: str | None = None) -> np.ndarray:
         a carrier type, e.g. ``dtype_hint="bf16"`` on a u16 array).
       * ``QuarkTensor`` — copied to host via ``to_bytes()`` +
         reinterpret based on the tensor's dtype string.
-      * ``mx.array`` — cast to f32 via mlx then to numpy.
       * plain Python scalars / lists — wrapped via ``np.asarray``.
 
     The output is a fresh array; callers can mutate it without
@@ -211,15 +210,6 @@ def to_f32_numpy(x: Any, *, dtype_hint: str | None = None) -> np.ndarray:
             nt = np.uint16 if dt == "u16" else np.uint32
             return np.frombuffer(raw, nt).reshape(shape).astype(np.float32)
         raise TypeError(f"to_f32_numpy: unsupported QuarkTensor dtype {dt!r}")
-
-    # mlx
-    try:
-        import mlx.core as mx
-
-        if isinstance(x, mx.array):
-            return np.array(x.astype(mx.float32))
-    except ImportError:
-        pass
 
     # last resort — list / scalar
     return np.asarray(x, dtype=np.float32)

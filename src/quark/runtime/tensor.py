@@ -1,4 +1,4 @@
-"""QuarkTensor — mutable GPU tensor without torch or numpy.
+"""QuarkTensor — unified GPU tensor for Metal and CUDA.
 
 EXEMPT FROM 500-LINE RULE: QuarkTensor is the single tensor type for
 both backends. Storage, strides, factories, view ops, slicing, and
@@ -6,8 +6,8 @@ arithmetic dispatch all belong together — splitting would fragment the
 type and force circular imports between the pieces.
 
 A ``QuarkTensor`` wraps a ``cuMemAlloc``'d device pointer (CUDA) or
-an ``MTLBuffer`` (Metal, Stage 2) with shape, dtype, strides, and
-offset metadata. It supports the operations the launcher needs:
+a Metal-pool-backed buffer handle (Metal) with shape, dtype, strides,
+and offset metadata. It supports the operations the launcher needs:
 
     t.data_ptr()        # → int (device pointer to first element)
     t.shape / t.dtype   # metadata
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import sys as _sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -137,7 +138,7 @@ class _CudaStorage:
 class _BorrowedStorage:
     """Non-owning storage that wraps an existing device pointer.
 
-    Holds a reference to the source object (torch.Tensor, mx.array)
+    Holds a reference to the source object (torch.Tensor, np.ndarray)
     to prevent it from being garbage collected. Does NOT free the
     memory on release — the source object owns it.
     """
@@ -160,6 +161,80 @@ class _BorrowedStorage:
         if self._refcount <= 0:
             self.ptr = 0
             self._owner = None
+
+
+# ── Metal storage ────────────────────────────────────────────
+
+_IS_METAL = _sys.platform == "darwin"
+
+
+class _MetalStorage:
+    """Metal-pool-backed buffer (persistent, zero-copy at dispatch time).
+
+    The buffer lives in the C extension's ``g_lazy_buffers`` table,
+    indexed by ``handle``. ``ptr`` is the raw ``MTLBuffer->contents()``
+    pointer for CPU-side reads (after ``eval_queue``). The buffer is
+    never freed — it returns to the pool when the storage is GC'd.
+
+    Created via ``_MetalStorage.alloc`` (empty) or
+    ``_MetalStorage.from_host`` (copy from numpy/host memory).
+    """
+
+    __slots__ = ("_refcount", "handle", "nbytes", "ptr")
+
+    def __init__(self, handle: int, ptr: int, nbytes: int):
+        self.handle = handle
+        self.ptr = ptr
+        self.nbytes = nbytes
+        self._refcount = 1
+        # Tell the dispatcher there's a fresh Python wrapper holding
+        # this handle. Paired with ``release_handle`` from
+        # ``release()`` when the last QuarkTensor referring to this
+        # storage goes away.
+        try:
+            from quark.drivers import _metal_dispatch as _md
+
+            _md.retain_handle(handle)
+        except Exception:
+            pass
+
+    @staticmethod
+    def alloc(nbytes: int) -> _MetalStorage:
+        """Allocate an uninitialized Metal pool buffer."""
+        from quark.drivers import _metal_dispatch as _md
+
+        # pin_buffer with data_ptr=0 allocates without copying.
+        h, p = _md.pin_buffer(0, max(nbytes, 1))
+        return _MetalStorage(h, p, max(nbytes, 1))
+
+    @staticmethod
+    def from_host(ptr: int, nbytes: int) -> _MetalStorage:
+        """Copy host bytes into a new Metal pool buffer."""
+        from quark.drivers import _metal_dispatch as _md
+
+        h, p = _md.pin_buffer(ptr, nbytes)
+        return _MetalStorage(h, p, nbytes)
+
+    def retain(self) -> _MetalStorage:
+        self._refcount += 1
+        return self
+
+    def release(self) -> None:
+        self._refcount -= 1
+        if self._refcount > 0:
+            return
+        # Last reference dropped — tell the dispatcher this handle is
+        # eligible for pool-recycle. The dispatcher waits for the next
+        # ``eval()`` (i.e. for any in-flight kernels that bound this
+        # buffer to actually complete) before returning the buffer to
+        # the pool, so a release racing with a queued kernel is safe.
+        try:
+            from quark.drivers import _metal_dispatch as _md
+
+            _md.release_handle(self.handle)
+        except Exception:
+            # Module-shutdown path: _md may already be torn down.
+            pass
 
 
 # ── Stride helpers ────────────────────────────────────────────
@@ -185,7 +260,7 @@ def _is_contiguous(shape: tuple[int, ...], strides: tuple[int, ...]) -> bool:
 
 
 class QuarkTensor:
-    """Mutable GPU tensor backed by ``cuMemAlloc``.
+    """Unified GPU tensor for CUDA and Metal.
 
     Supports views (slicing, reshape, permute) via stride metadata.
     Arithmetic ops dispatch to PTX utility kernels.
@@ -195,7 +270,7 @@ class QuarkTensor:
 
     def __init__(
         self,
-        storage,  # _CudaStorage | _BorrowedStorage | duck-typed slice storage
+        storage: _CudaStorage | _BorrowedStorage | _MetalStorage,
         shape: tuple[int, ...],
         strides: tuple[int, ...],
         offset: int,
@@ -206,7 +281,23 @@ class QuarkTensor:
         self._strides = strides
         self._offset = offset  # element offset into storage
         self._dtype = dtype
-        self._device = DeviceSpec("cuda", 0)
+        self._device = DeviceSpec("metal" if isinstance(storage, _MetalStorage) else "cuda", 0)
+
+    # ── Metal-specific accessors ──
+
+    @property
+    def metal_handle(self) -> int | None:
+        """Handle into ``g_lazy_buffers`` for zero-copy ``queue_launch``.
+        Returns ``None`` on CUDA."""
+        if isinstance(self._storage, _MetalStorage):
+            return self._storage.handle
+        return None
+
+    @property
+    def quark_dtype(self) -> str:
+        """Short dtype tag (``"bf16"``, ``"f32"``, etc.) for
+        ``pcf.*`` dispatch compatibility."""
+        return self._dtype
 
     # ── Factories ──
 
@@ -214,21 +305,43 @@ class QuarkTensor:
     def empty(*shape: int, dtype: str = "bf16") -> QuarkTensor:
         """Allocate uninitialized device memory.
 
-        During graph capture, uses cuMemAllocAsync (stream-ordered
-        allocation that works during capture). Otherwise uses cuMemAlloc.
-        Tensors allocated during capture are held by the CapturedGraph
-        to prevent GC from freeing memory the graph still references.
+        On CUDA: ``cuMemAlloc`` (or ``cuMemAllocAsync`` during graph
+        capture). On Metal: allocates a persistent Metal pool buffer
+        via ``_md.pin_buffer``.
         """
+        # Accept numpy dtypes from Metal callers — the on-device layout
+        # is byte-identical, but PC_BYTES is keyed by the quark string.
+        if not isinstance(dtype, str):
+            _NP_TO_PC = {
+                "uint16": "bf16",
+                "float16": "f16",
+                "float32": "f32",
+                "int32": "s32",
+                "int64": "s64",
+                "uint8": "u8",
+                "int8": "s8",
+            }
+            name = getattr(dtype, "name", str(dtype))
+            dtype = _NP_TO_PC.get(name, str(dtype))
         numel = math.prod(shape) if shape else 1
         nbytes = numel * PC_BYTES[dtype]
-        storage = _CudaStorage.alloc(nbytes)
+        if _IS_METAL:
+            from quark.drivers import _metal_dispatch as _md
+
+            h, p = _md.pin_buffer(0, max(nbytes, 1))
+            storage = _MetalStorage(h, p, nbytes)
+        else:
+            storage = _CudaStorage.alloc(nbytes)
         return QuarkTensor(storage, tuple(shape), _contiguous_strides(tuple(shape)), 0, dtype)
 
     @staticmethod
     def zeros(*shape: int, dtype: str = "bf16") -> QuarkTensor:
         t = QuarkTensor.empty(*shape, dtype=dtype)
         if t._storage.nbytes > 0:
-            _runtime().memset_d8(t._storage.ptr, 0, t._storage.nbytes)
+            if _IS_METAL:
+                ctypes.memset(t._storage.ptr, 0, t._storage.nbytes)
+            else:
+                _runtime().memset_d8(t._storage.ptr, 0, t._storage.nbytes)
         return t
 
     @staticmethod
@@ -252,10 +365,20 @@ class QuarkTensor:
             import numpy as _np
 
             arr = _np.frombuffer(buf, dtype=_np.uint8, count=expected)
-            _runtime().memcpy_htod(t._storage.ptr, arr.ctypes.data, expected)
+            if _IS_METAL:
+                # Apple unified memory — Metal pool buffers are host-
+                # readable. ctypes.memmove the bytes straight into the
+                # device pointer; the GPU sees them after Metal's
+                # implicit cache-flush on the next dispatch.
+                ctypes.memmove(t._storage.ptr, arr.ctypes.data, expected)
+            else:
+                _runtime().memcpy_htod(t._storage.ptr, arr.ctypes.data, expected)
         else:
             host_arr = (ctypes.c_ubyte * len(buf)).from_buffer_copy(buf)
-            _runtime().memcpy_htod(t._storage.ptr, ctypes.addressof(host_arr), expected)
+            if _IS_METAL:
+                ctypes.memmove(t._storage.ptr, ctypes.addressof(host_arr), expected)
+            else:
+                _runtime().memcpy_htod(t._storage.ptr, ctypes.addressof(host_arr), expected)
         return t
 
     def to_bytes(self) -> bytes:
@@ -266,7 +389,18 @@ class QuarkTensor:
         if nbytes == 0:
             return b""
         host_buf = (ctypes.c_ubyte * nbytes)()
-        _runtime().memcpy_dtoh(ctypes.addressof(host_buf), t.data_ptr(), nbytes)
+        if _IS_METAL:
+            # Metal-backed storage already has a host-shared pointer; flush
+            # the lazy queue so any pending writes hit memory before we
+            # read it, then copy via memmove. CudaRuntime isn't available
+            # on macOS — going through ``_runtime()`` here would raise
+            # CudaError(LIBRARY_NOT_FOUND).
+            from quark.runtime.sync import synchronize
+
+            synchronize()
+            ctypes.memmove(ctypes.addressof(host_buf), t.data_ptr(), nbytes)
+        else:
+            _runtime().memcpy_dtoh(ctypes.addressof(host_buf), t.data_ptr(), nbytes)
         return bytes(host_buf)
 
     @staticmethod
@@ -310,11 +444,19 @@ class QuarkTensor:
 
         arr = np.ascontiguousarray(arr)
         shape = tuple(arr.shape)
+        if _IS_METAL:
+            storage = _MetalStorage.from_host(arr.ctypes.data, int(arr.nbytes))
+            return QuarkTensor(storage, shape, _contiguous_strides(shape), 0, dtype)
         raw = arr.tobytes()
         return QuarkTensor.from_bytes(raw, shape, dtype)
 
     def to_numpy(self):
-        """Convenience: QuarkTensor → numpy array. Tests/debug only."""
+        """QuarkTensor → numpy array.
+
+        On Metal: reads directly from the buffer's ``contents()`` pointer
+        (triggers ``eval_queue`` if lazy ops are pending). On CUDA:
+        ``cuMemcpyDtoH``.
+        """
         import numpy as np
 
         _PC_TO_NP = {
@@ -326,9 +468,35 @@ class QuarkTensor:
             "u8": np.dtype("uint8"),
             "s8": np.dtype("int8"),
         }
-        raw = self.to_bytes()
         np_dt = _PC_TO_NP[self._dtype]
+        if isinstance(self._storage, _MetalStorage):
+            from quark.drivers import _metal_dispatch as _md
+
+            if _md.has_lazy_pending():
+                _md.eval_queue()
+                from quark.functional._dispatch import clear_strided_copy_meta
+
+                clear_strided_copy_meta()
+            elem_size = np_dt.itemsize
+            buf_ptr = self._storage.ptr + self._offset * elem_size
+            total = math.prod(self._shape) * elem_size
+            # ctypes char arrays implement the buffer protocol; ty's stubs
+            # for np.frombuffer don't list it as a buffer-protocol overload.
+            return (
+                np.frombuffer(  # ty: ignore[no-matching-overload]
+                    (ctypes.c_char * total).from_address(buf_ptr), dtype=np_dt
+                )
+                .reshape(self._shape)
+                .copy()
+            )
+        raw = self.to_bytes()
         return np.frombuffer(raw, dtype=np_dt).reshape(self._shape)
+
+    def __array__(self, dtype=None):
+        """numpy interop: ``np.asarray(tensor)`` triggers data transfer."""
+        import numpy as np
+
+        return np.asarray(self.to_numpy(), dtype=dtype)
 
     @staticmethod
     def from_list(data, dtype: str = "f32") -> QuarkTensor:
@@ -374,47 +542,6 @@ class QuarkTensor:
             strides = _contiguous_strides(tuple(shape))
         storage = _BorrowedStorage(ptr, nbytes, owner=owner)
         return QuarkTensor(storage, tuple(shape), tuple(strides), offset, dtype)
-
-    @staticmethod
-    def from_mlx(t) -> QuarkTensor:
-        """Zero-copy wrap an ``mx.array`` as a QuarkTensor.
-
-        Apple silicon uses unified memory, so ``mx.array``'s data
-        pointer is valid on both CPU and GPU. QuarkTensor borrows
-        the pointer — no memcpy.
-        """
-        import mlx.core as mx
-
-        _MLX_TO_PC = {
-            mx.float32: "f32",
-            mx.float16: "f16",
-            mx.bfloat16: "bf16",
-            mx.int32: "s32",
-            mx.int64: "s64",
-            mx.int8: "s8",
-            mx.uint8: "u8",
-            mx.uint16: "u16",
-            mx.uint32: "u32",
-        }
-        dtype = _MLX_TO_PC.get(t.dtype)
-        if dtype is None:
-            raise ValueError(f"from_mlx: unsupported dtype {t.dtype}")
-        shape = tuple(t.shape)
-        elem = PC_BYTES.get(dtype, 4)
-        nbytes = t.size * elem
-        # mx.array on Apple silicon: the data pointer from the array
-        # object is in unified memory (CPU + GPU visible).
-        import ctypes as _ct
-
-        # Force evaluation so the data is materialized.
-        mx.eval(t)
-        raw_ptr = _ct.cast(
-            _ct.c_void_p(t.__array_interface__["data"][0]),
-            _ct.c_void_p,
-        ).value
-        arr_ptr = raw_ptr if raw_ptr is not None else 0
-        storage = _BorrowedStorage(arr_ptr, nbytes, owner=t)
-        return QuarkTensor(storage, shape, _contiguous_strides(shape), 0, dtype)
 
     # ── Launcher interface ──
 
@@ -510,7 +637,21 @@ class QuarkTensor:
         """Return a contiguous copy, or self if already contiguous."""
         if self.is_contiguous() and self._offset == 0:
             return self
-        # Need to copy via _copy_strided utility kernel.
+        if _IS_METAL:
+            from quark.functional._dispatch import queue_strided_copy
+
+            handle = self.metal_handle
+            assert handle is not None, "Metal path requires _MetalStorage"
+            t = queue_strided_copy(
+                handle,
+                self._offset,
+                self._strides,
+                self._shape,
+                PC_BYTES[self._dtype],
+            )
+            t._dtype = self._dtype
+            return t
+        # CUDA: copy via _copy_strided utility kernel.
         from quark.runtime.kernels import copy_strided
 
         return copy_strided(self)
@@ -590,14 +731,72 @@ class QuarkTensor:
     # ── Arithmetic (dispatched to utility kernels) ──
 
     def __add__(self, other) -> QuarkTensor:
+        if _IS_METAL:
+            return self._metal_binop(other, "add")
         from quark.runtime.kernels import elemwise_binary
 
         return elemwise_binary("add", self, other)
 
     def __radd__(self, other) -> QuarkTensor:
+        if _IS_METAL:
+            return self._metal_binop(other, "add")
         from quark.runtime.kernels import elemwise_binary
 
         return elemwise_binary("add", self, other)
+
+    def _metal_binop(self, other, op: str) -> QuarkTensor:
+        """Element-wise binary op on Metal.
+
+        For bf16 add with both operands having metal_handle, dispatches
+        a lazy queue_launch kernel (no pipeline break). Falls back to
+        numpy round-trip for other cases.
+        """
+        # Fast path: lazy bf16 add when both operands have metal_handle.
+        if (
+            op == "add"
+            and self._dtype == "bf16"
+            and isinstance(other, QuarkTensor)
+            and self.metal_handle is not None
+            and other.metal_handle is not None
+        ):
+            from quark.functional._dispatch import queue_elemwise_add_bf16
+
+            a_numel = self.numel()
+            b_numel = other.numel()
+            h, ptr, nbytes = queue_elemwise_add_bf16(
+                self.metal_handle,
+                other.metal_handle,
+                a_numel,
+                b_numel,
+            )
+            storage = _MetalStorage(h, ptr, nbytes)
+            out_shape = self._shape  # broadcast: result has A's shape
+            return QuarkTensor(
+                storage,
+                out_shape,
+                _contiguous_strides(out_shape),
+                0,
+                self._dtype,
+            )
+
+        import numpy as np
+
+        a = self.to_numpy()
+        if isinstance(other, QuarkTensor):
+            b = other.to_numpy()
+        elif hasattr(other, "__array__"):
+            b = np.asarray(other)
+        else:
+            b = other
+        if op == "add":
+            out = a + b
+        elif op == "sub":
+            out = a - b
+        elif op == "mul":
+            out = a * b
+        else:
+            raise NotImplementedError(f"_metal_binop: {op}")
+        return QuarkTensor.from_numpy(out.reshape(self._shape), dtype=self._dtype)
 
     def __sub__(self, other) -> QuarkTensor:
         from quark.runtime.kernels import elemwise_binary
@@ -694,18 +893,25 @@ class QuarkTensor:
     def clone(self) -> QuarkTensor:
         """Return a contiguous copy with its own storage (async D2D)."""
         dst = QuarkTensor.empty(*self._shape, dtype=self._dtype)
-        from quark.runtime.cuda import CudaRuntime
-
         nbytes = self.numel() * PC_BYTES[self._dtype]
-        CudaRuntime.instance().memcpy_dtod(dst.data_ptr(), self.contiguous().data_ptr(), nbytes)
+        src = self.contiguous()
+        if _IS_METAL:
+            ctypes.memmove(dst.data_ptr(), src.data_ptr(), nbytes)
+        else:
+            from quark.runtime.cuda import CudaRuntime
+
+            CudaRuntime.instance().memcpy_dtod(dst.data_ptr(), src.data_ptr(), nbytes)
         return dst
 
     def zero_(self) -> QuarkTensor:
         """Zero this tensor in-place (async). Returns self."""
-        from quark.runtime.cuda import CudaRuntime
-
         nbytes = self.numel() * PC_BYTES[self._dtype]
-        CudaRuntime.instance().memset_d8(self.data_ptr(), 0, nbytes)
+        if _IS_METAL:
+            ctypes.memset(self.data_ptr(), 0, nbytes)
+        else:
+            from quark.runtime.cuda import CudaRuntime
+
+            CudaRuntime.instance().memset_d8(self.data_ptr(), 0, nbytes)
         return self
 
     def set_value(self, value: int) -> None:

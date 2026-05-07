@@ -14,7 +14,10 @@ _MSL_TYPE: dict[DType, str] = {
     DType.F64: "double",  # Metal doesn't support double on GPU, but keep for completeness
     DType.F32: "float",
     DType.F16: "half",
-    DType.BF16: "bfloat16_t",
+    # Apple's MSL exposes brain-float16 as ``bfloat`` (the type ``bfloat16``
+    # itself is reserved — using it triggers Apple's
+    # ``__Reserved_Name__Do_not_use_bfloat16`` typedef and a compile error).
+    DType.BF16: "bfloat",
     DType.E4M3: "fp8_e4m3",  # MLX fp8 software struct
     DType.E5M2: "fp8_e5m2",  # MLX fp8 software struct
     DType.U8: "uchar",

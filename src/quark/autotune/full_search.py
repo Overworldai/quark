@@ -20,6 +20,8 @@ import os
 import random
 from typing import Any, Optional
 
+import numpy as np
+
 from quark.autotune import _crossover, _log, _mutate, _parallel_compile
 
 
@@ -163,13 +165,9 @@ def _evaluate_config(
     ``None`` if the kernel's ``prepare_launch_tensors`` raised (caller
     logs and skips). Side effect: logs outcome via ``say``.
     """
-    import sys as _sys
-
     from quark.correctness import check_correctness
     from quark.launcher.launcher import _time_callable
     from quark.runtime.sync import ir_dtype_of, synchronize, zero_buffer
-
-    _is_metal = _sys.platform == "darwin"
 
     # Drain any async error queued by a prior config. Without the sync
     # a prior launch's misaligned / OOB access surfaces on the NEXT
@@ -234,17 +232,21 @@ def _evaluate_config(
     try:
         cfg_output_buf = zero_buffer(cfg_buffers[out_idx])
         cfg_buffers[out_idx] = cfg_output_buf
-        _launch_result = compiled.launch(buffers=cfg_buffers)
+        compiled.launch(buffers=cfg_buffers)
         synchronize()
     except BaseException as _e:
         say(f"  [launch err] {cfg}: {type(_e).__name__}: {_e}")
         return float("inf"), "launch"
 
-    if _is_metal and _launch_result:
-        out_pos = sum(1 for b in pspec.buffers[:out_idx] if not b.readonly)
-        actual_output = _launch_result[out_pos]
-    else:
-        actual_output = cfg_output_buf
+    # ``cfg_output_buf`` is a QuarkTensor with a metal_handle on Metal /
+    # a CUDA buffer on CUDA — the launcher auto-routes the kernel's
+    # writes into the caller-pinned output, so the data is here on both
+    # paths. (Metal's ``launch_metal`` returns a list of
+    # ``(handle, ptr, nbytes)`` tuples, not arrays — those would have
+    # to be wrapped into QuarkTensors by hand to feed ``ir_dtype_of`` /
+    # ``check_correctness``, and the auto-routed buffer is the same
+    # storage anyway.)
+    actual_output = cfg_output_buf
 
     out_dtype = ir_dtype_of(actual_output)
     cr = check_correctness(
@@ -253,9 +255,7 @@ def _evaluate_config(
         out_dtype=out_dtype,
         threshold=kernel_cls.correctness_threshold(out_dtype),
     )
-    if not cr.passed:
-        say(f"  [wrong] {cfg}: cos={cr.cos_sim:.4f}")
-        return float("inf"), "wrong"
+    wrong = not cr.passed
 
     try:
         cfg_output_buf = zero_buffer(cfg_buffers[out_idx])
@@ -266,8 +266,18 @@ def _evaluate_config(
             bench_ms=bench_ms,
         )
     except BaseException as _e:
+        if wrong:
+            say(f"  [wrong] {cfg}: cos={cr.cos_sim:.4f} (bench err: {type(_e).__name__})")
+            return float("inf"), "wrong"
         say(f"  [bench err] {cfg}: {type(_e).__name__}: {_e}")
         return float("inf"), "time"
+
+    if wrong:
+        # Time wrong configs too — useful when triaging a near-miss
+        # alternative path (NAX MoE in development): if the wrong
+        # config is also slower, it's not worth chasing the bug.
+        say(f"  [wrong] {us:8.2f} μs  cos={cr.cos_sim:.4f}  {cfg}")
+        return float("inf"), "wrong"
 
     say(f"  {us:8.2f} μs  cos={cr.cos_sim:.6f}  {cfg}")
     return us, ""
@@ -320,6 +330,38 @@ def run_full_search(
         _log(name, f"full search: ref setup failed ({e}), falling back to fast")
         fast_cfg = cache._search_fast(kernel_cls, spec, seeds)
         return (fast_cfg, float("inf")) if fast_cfg is not None else None
+
+    # Per-config input cache: kernels with config-dependent test inputs
+    # (MoE in/out: ``work_list`` step is ``config.BM``) override
+    # ``autotune_input_key`` + ``rebuild_autotune_inputs`` so we can
+    # rebuild inputs + reference once per distinct key. Empty key
+    # (default) shares the base ``tensors`` / ``reference`` across
+    # every config.
+    _input_cache: dict[tuple, tuple[Any, Any]] = {(): (tensors, reference)}
+
+    def _inputs_for_cfg(cfg) -> tuple[Any, Any]:
+        try:
+            cfg_kernel_for_key = kernel_cls(spec_cls(**spec_dict), cfg)
+            key = tuple(cfg_kernel_for_key.autotune_input_key())
+        except Exception:
+            return tensors, reference
+        cached = _input_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            adj_inputs_np = cfg_kernel_for_key.rebuild_autotune_inputs(inputs_np)
+            adj_outputs_np = kernel_cls.reference_numpy(
+                spec, **{k: v for k, v in adj_inputs_np.items() if not k.startswith("_")}
+            )
+            if isinstance(adj_outputs_np, np.ndarray):
+                adj_outputs_np = {output_name: adj_outputs_np}
+            adj_tensors = numpy_to_device_dict(kernel_cls, default_kernel.spec, adj_inputs_np)
+            adj_ref = adj_outputs_np[output_name]
+        except Exception as _e:
+            _log(name, f"per-cfg input rebuild failed for key {key}: {type(_e).__name__}: {_e}")
+            adj_tensors, adj_ref = tensors, reference
+        _input_cache[key] = (adj_tensors, adj_ref)
+        return adj_tensors, adj_ref
 
     if tune_space is None:
         try:
@@ -452,6 +494,7 @@ def run_full_search(
                     seen[key] = (float("inf"), cfg)
                     continue
 
+                cfg_tensors, cfg_reference = _inputs_for_cfg(cfg)
                 result = _evaluate_config(
                     cfg,
                     kernel_cls,
@@ -459,10 +502,10 @@ def run_full_search(
                     spec_cls,
                     spec_dict,
                     compiled,
-                    tensors,
+                    cfg_tensors,
                     pspec,
                     out_idx,
-                    reference,
+                    cfg_reference,
                     cache.bench_ms,
                     _say,
                 )

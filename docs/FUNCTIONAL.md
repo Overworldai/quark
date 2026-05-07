@@ -1,15 +1,17 @@
 # `quark.functional` — call surface
 
 Every quark production kernel is exposed as a callable that accepts
-backend-native tensors. Dispatch is decided per-call from the input
-type:
-
-- `QuarkTensor` (from `quark.runtime.tensor`) → CUDA path.
-- `mx.array` (MLX) → Metal path.
+`QuarkTensor` (from `quark.runtime.tensor`) — the unified device-tensor
+type for both backends. The active backend is decided by the device
+the tensor lives on: CUDA via the ctypes driver
+(`runtime/cuda.py`) on Linux/Windows, Metal via metal-cpp + nanobind
+(`drivers/_metal_dispatch`) on Apple Silicon.
 
 No torch runtime dep on either leg. Torch is only pulled in if a test
 baseline or reference implementation reaches for it (optional dev
-extra).
+extra). MLX is no longer a runtime dependency on Metal — the legacy
+`mx.array` interop was removed when the native metal-cpp driver
+landed.
 
 ```python
 import quark.functional as pcf
@@ -147,14 +149,6 @@ C = QuarkTensor.zeros(M, N, dtype="bf16")
 for batch in loader:
     pcf.gemm(batch, W, out=C)             # writes into C, no fresh allocation
 ```
-
-## Using under MLX
-
-No compile wrapping today. `pcf.*` on `mx.array` inputs calls into
-the kernel eagerly and returns a fresh `mx.array` (since MLX arrays
-are immutable — kernels that logically write in place still return
-new buffers). `mx.compile` wrapping of `pcf.*` callables is a
-follow-up.
 
 ## CUDA graph capture
 

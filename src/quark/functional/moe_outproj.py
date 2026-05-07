@@ -1,18 +1,23 @@
-"""``quark.functional.moe_outproj`` — MoE atomic-scatter out-projection.
+"""``quark.functional.moe_outproj`` — MoE per-slot partial out-projection.
 
 Signature:
 
-    out = pcf.moe_outproj(h_in, W_out, token_ids, slot_weights, work_list,
-                          *, M, n_experts, top_k=2,
-                          out_dtype="bf16", compute_dtype=None, out=None)
+    partials = pcf.moe_outproj(h_in, W_out, work_list,
+                               *, M, n_experts, top_k=2,
+                               out_dtype="bf16", compute_dtype=None,
+                               out=None)
 
-h_in: ``[M*top_k, H]``. W_out: ``[n_experts * D, H]``. Returns ``[M, D]``
-in f32 (the kernel output is always f32; caller casts as needed).
+h_in: ``[total_slots, H]``. W_out: ``[n_experts * D, H]``. Returns
+``[total_slots, D]`` in ``out_dtype`` (bf16 by default) — one row per
+slot, ``partials[s, :] = h_in[s] @ W_out[expert(s)].T`` for slots in
+``work_list`` whose expert >= 0; sentinel chunks are skipped.
 
-``out``: optional pre-allocated f32 output buffer. ``nn.MoE`` reuses a
-cached buffer to avoid per-call ``cuMemAllocAsync``. The kernel does
-atomic-add into this buffer, so callers reusing it must ``zero_()``
-between invocations — auto-alloc gives a fresh zero buffer for free.
+The per-token sum (``slot_weights[s] * partials[s, :]`` summed over
+each token's top_k slots) is finished by ``pcf.moe_reduce``, gathering
+via the router's ``token_slot_table``.
+
+``out``: optional pre-allocated ``[total_slots, D]`` output buffer.
+``nn.MoE`` reuses a cached buffer across calls.
 """
 
 from __future__ import annotations
@@ -33,8 +38,6 @@ def _cls():
 def _impl(
     h_in,
     W_out,
-    token_ids,
-    slot_weights,
     work_list,
     *,
     M,
@@ -48,8 +51,6 @@ def _impl(
     spec = cls.spec_from_tensors(
         h_in,
         W_out,
-        token_ids,
-        slot_weights,
         work_list,
         M=M,
         n_experts=n_experts,
@@ -57,18 +58,12 @@ def _impl(
         out_dtype=out_dtype,
         compute_dtype=compute_dtype,
     )
-    provided: dict = {
-        "h_in": h_in,
-        "W_out": W_out,
-        "token_ids": token_ids,
-        "slot_weights": slot_weights,
-        "work_list": work_list,
-    }
+    provided: dict = {"h_in": h_in, "W_out": W_out, "work_list": work_list}
     auto_alloc: tuple[str, ...] = ()
     if out is not None:
-        provided["output"] = out
+        provided["partials"] = out
     else:
-        auto_alloc = ("output",)
+        auto_alloc = ("partials",)
     result = call_with_bindings(
         cls,
         spec,
@@ -76,14 +71,12 @@ def _impl(
         auto_alloc=auto_alloc,
         like=h_in,
     )
-    return result["output"]
+    return result["partials"]
 
 
 def moe_outproj(
     h_in,
     W_out,
-    token_ids,
-    slot_weights,
     work_list,
     M,
     n_experts,
@@ -95,8 +88,6 @@ def moe_outproj(
     return _impl(
         h_in,
         W_out,
-        token_ids,
-        slot_weights,
         work_list,
         M=M,
         n_experts=n_experts,

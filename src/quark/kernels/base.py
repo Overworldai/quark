@@ -278,6 +278,19 @@ class Kernel(ABC):
         self.spec = spec
         self.config = config
         self._compiled = None
+        # Optional explicit caps binding. None means emit() falls back
+        # to ``current_device().caps`` (probed lazily). Tests and the
+        # autotune harness set this directly via ``bind_caps`` to pin
+        # a kernel to a specific device profile without touching the
+        # process-wide ``current_device`` cache.
+        self._caps = None
+
+    def bind_caps(self, caps) -> Kernel:
+        """Pin this kernel to a specific ``DeviceCaps`` for emit-time
+        backend dispatch (``build_<family>`` selection). Returns self
+        for chaining."""
+        self._caps = caps
+        return self
 
     # ── Tuned config JSON loader ──
 
@@ -759,6 +772,30 @@ class Kernel(ABC):
             bpad=cfg_any.b_pad,
         )
         return {**tensors, name: shuffled}
+
+    def autotune_input_key(self) -> tuple:
+        """Identify which config knobs change the autotune input tensors.
+
+        Default: empty tuple — every config shares the cached inputs +
+        reference produced by ``make_tensors_numpy`` /
+        ``reference_numpy``.
+
+        Kernels whose inputs depend on a config knob (MoE in/out:
+        ``work_list`` step is ``config.BM``) override this so the
+        autotune harness recomputes inputs + reference once per
+        distinct key, and reuses across configs that share it.
+        """
+        return ()
+
+    def rebuild_autotune_inputs(self, base_inputs_np: dict) -> dict:
+        """Return a fresh ``inputs_np`` tailored to this kernel's config.
+
+        Only called by the autotune harness when ``autotune_input_key``
+        differs from the base. Default: identity. Override alongside
+        ``autotune_input_key`` so the test fixture's tensor layout
+        tracks the active config.
+        """
+        return base_inputs_np
 
     def tflops(self, runtime_us: float) -> float:
         return self.flops() / (runtime_us * 1e-6) / 1e12

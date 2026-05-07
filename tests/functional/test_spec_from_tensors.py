@@ -79,7 +79,7 @@ _INPUT_TENSOR_NAMES: dict[str, tuple[str, ...]] = {
         "K_cache",
     ),
     "moe_inproj": ("X", "W_in", "token_ids", "work_list"),
-    "moe_outproj": ("h_in", "W_out", "token_ids", "slot_weights", "work_list"),
+    "moe_outproj": ("h_in", "W_out", "work_list"),
 }
 
 

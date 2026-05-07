@@ -26,7 +26,7 @@ _M16N8K16_BF16 = MmaShape(
     c_regs=4,
 )
 register_backend_payload("m16n8k16_bf16", DeviceFamily.CUDA, "m16n8k16.row.col.f32.bf16.bf16.f32")
-register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "bfloat16_t:2:1:2")
+register_backend_payload("m16n8k16_bf16", DeviceFamily.METAL, "bfloat:2:1:2")
 
 _A_OFFS = ((0, 0), (8, 0), (0, 8), (8, 8))
 _B_OFFS = ((0, 0), (0, 8))

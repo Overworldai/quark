@@ -95,18 +95,32 @@ class DType(str, Enum):  # noqa: UP042
 
         Accepts:
           * ``QuarkTensor``-style short strings (``"bf16"``, ``"f32"``, ...).
-          * ``mx.Dtype`` (identified by its ``str()`` repr, e.g.
-            ``"mlx.core.bfloat16"``).
+          * ``numpy.dtype`` (via ``.name`` → ``"float32"`` etc.).
+          * Objects with a ``.quark_dtype`` attribute (e.g. legacy
+            tagged ndarrays that carry the intended quark dtype).
 
-        Torch dtypes aren't accepted — the runtime inference path does
-        not import torch in the numpy-refs era."""
+        On Metal, bf16 is stored as uint16 in numpy. If the object has
+        a ``.quark_dtype`` attribute, that takes precedence over the
+        numpy dtype name — this lets bf16-as-uint16 carriers resolve
+        correctly."""
+        # Tagged objects with .quark_dtype: use the tag.
+        quark_dt = getattr(dt, "quark_dtype", None)
+        if quark_dt is not None:
+            return cls(quark_dt)
+        # QuarkTensor-style short string ("bf16", "f32", ...).
         if isinstance(dt, str):
             try:
                 return cls(dt)
             except ValueError as e:
                 raise ValueError(f"DType.from_backend: no mapping for {dt!r}") from e
-        # mx.Dtype stringifies to "mlx.core.<name>" — strip the prefix.
-        _MX_MAP = {
+        # Array-like whose .dtype is a short string (QuarkTensor).
+        inner_str = getattr(dt, "dtype", None)
+        if isinstance(inner_str, str):
+            try:
+                return cls(inner_str)
+            except ValueError:
+                pass  # fall through to numpy name map
+        _NAME_MAP = {
             "float32": cls.F32,
             "float16": cls.F16,
             "bfloat16": cls.BF16,
@@ -117,11 +131,13 @@ class DType(str, Enum):  # noqa: UP042
             "uint16": cls.U16,
             "uint32": cls.U32,
         }
-        dt_str = str(dt)
-        if dt_str.startswith("mlx.core."):
-            dt_str = dt_str[len("mlx.core.") :]
-        if dt_str in _MX_MAP:
-            return _MX_MAP[dt_str]
+        # Array-like object (numpy ndarray, etc.) — resolve via its
+        # .dtype attribute. Check .quark_dtype first (handled above),
+        # then fall through to numpy dtype name mapping.
+        inner_dtype = getattr(dt, "dtype", dt)
+        name = getattr(inner_dtype, "name", str(inner_dtype))
+        if name in _NAME_MAP:
+            return _NAME_MAP[name]
         raise ValueError(f"DType.from_backend: no mapping for {dt!r}")
 
     @classmethod
@@ -192,7 +208,12 @@ class MemSpace(Enum):
 
 # Vector widths we permit for short SIMD-style Values. Anything wider lives
 # in a MemRef, not a Value.
-_VALID_VECTOR_WIDTHS = frozenset({1, 2, 3, 4, 8, 16})
+#
+# Width 32 is the per-lane element count for NAX shapes with M=32 (e.g.
+# m32n32k16 — 4 sub-fragments × 8 elements each). Apple's compiler accepts
+# vec<T, 32> via cooperative_tensor and the existing IR ops are parametric
+# over c_regs, so the only friction is this validity gate.
+_VALID_VECTOR_WIDTHS = frozenset({1, 2, 3, 4, 8, 16, 32})
 
 
 @dataclass(frozen=True)

@@ -174,20 +174,38 @@ class AutotuneCache:
 
     def lookup(self, kernel_cls, spec) -> Optional[Any]:
         """Walk the three-level chain. Returns the cached config or None."""
+        # Hot-path: skip the full key build (spec_fingerprint + hash) on
+        # repeat calls with identical (cls, spec). Specs are frozen
+        # dataclasses, hashable; we keep a tiny LRU keyed on (id(cls),
+        # spec) → config to short-circuit when the same shape recurs
+        # (which is the common case in a transformer forward).
+        spec_cache = getattr(self, "_spec_cache", None)
+        if spec_cache is None:
+            spec_cache = {}
+            self._spec_cache = spec_cache
+        sk = (id(kernel_cls), spec)
+        cached_cfg = spec_cache.get(sk)
+        if cached_cfg is not None:
+            return cached_cfg
+
         key = self._make_key(kernel_cls, spec)
         if key in self._hot:
-            return self._hot[key]
+            cfg = self._hot[key]
+            spec_cache[sk] = cfg
+            return cfg
 
         from_disk = load_from_disk(
             self.cache_dir, key, self.device.fingerprint(), kernel_cls=kernel_cls
         )
         if from_disk is not None:
             self._hot[key] = from_disk
+            spec_cache[sk] = from_disk
             return from_disk
 
         bundled = load_bundled_default(self.bundled_dir, kernel_cls, spec)
         if bundled is not None:
             self._hot[key] = bundled
+            spec_cache[sk] = bundled
             return bundled
 
         return None
@@ -518,17 +536,15 @@ class AutotuneCache:
                 cfg_output_buf = zero_buffer(cfg_buffers[out_idx])
                 cfg_buffers[out_idx] = cfg_output_buf
                 compiled = lnch.compile(kernel_cls, spec, cfg)
-                _launch_result = compiled.launch(buffers=cfg_buffers)
+                compiled.launch(buffers=cfg_buffers)
                 synchronize()
-                # On CUDA the kernel writes ``cfg_output_buf`` in place;
-                # on Metal MLX returns fresh mx.arrays for every non-
-                # readonly buffer in pspec order — pick the launch's
-                # actual output there.
-                if _is_metal and _launch_result:
-                    out_pos = sum(1 for b in pspec.buffers[:out_idx] if not b.readonly)
-                    actual_output = _launch_result[out_pos]
-                else:
-                    actual_output = cfg_output_buf
+                # ``cfg_output_buf`` is a QuarkTensor with a metal_handle
+                # on Metal / a CUDA buffer on CUDA — the launcher auto-
+                # routes the kernel's writes into the caller-pinned
+                # output (see ``CompiledKernel._launch_metal``), so the
+                # data is here on both paths. Mirror of the same fix in
+                # ``full_search._evaluate_config`` (commit 53d1885).
+                actual_output = cfg_output_buf
                 out_dtype = ir_dtype_of(actual_output)
                 cr = check_correctness(
                     actual_output,

@@ -132,7 +132,7 @@ class RandnKernel(Kernel):
 
     @classmethod
     def spec_from_tensors(cls, counter_offset, Out) -> RandnSpec:
-        dt = DType.from_backend(Out.dtype)
+        dt = DType.from_backend(Out)
         return RandnSpec(N=int(Out.shape[0]), dtype=dt)
 
     # ------------------------------------------------------------------

@@ -1,8 +1,8 @@
 """Model implementations on ``quark.functional`` + ``quark.nn``.
 
 Each module wires the quark kernel surface into a full forward pass.
-No torch in the runtime path — tensor storage is backend-native
-(``mx.array`` on Metal, future ctypes CUDA tensors on CUDA).
+No torch in the runtime path — tensor storage is ``QuarkTensor``
+on both backends (Metal pool buffer on Metal, ``cuMemAlloc`` on CUDA).
 
     from quark.models.waypoint_15 import Waypoint15, Waypoint15Config
 

@@ -89,8 +89,7 @@ def _precompute_cuda(sigmas, freqs_list, fourier_dim, n, W1, W2):
 
 
 def _precompute_metal(sigmas, freqs_list, fourier_dim, n, W1, W2):
-    """Metal path — mlx directly, no PT."""
-    import mlx.core as mx
+    """Metal path — numpy + PyObjC Metal dispatch."""
     import numpy as np
 
     BM_MIN = 16
@@ -107,12 +106,23 @@ def _precompute_metal(sigmas, freqs_list, fourier_dim, n, W1, W2):
         pad_np = np.zeros((BM_MIN - n, fourier_np.shape[1]), dtype=np.float32)
         fourier_np = np.concatenate([fourier_np, pad_np], axis=0)
 
+    # bf16 storage as uint16, tagged so DType.from_backend resolves
+    # to BF16 (plain uint16 → U16 fails the GEMM dtype check).
     fourier_u16 = (fourier_np.view(np.uint32) >> 16).astype(np.uint16)
-    fourier_dev = mx.array(fourier_u16).view(mx.bfloat16)
-    out_dt = _dtype_str(W2.dtype)
+
+    class _Tagged(np.ndarray):
+        def __array_finalize__(self, obj):
+            if obj is None:
+                return
+            self.quark_dtype = getattr(obj, "quark_dtype", None)
+
+    fourier_dev = fourier_u16.view(_Tagged)
+    fourier_dev.quark_dtype = "bf16"
+    # W2.dtype on Metal is the carrier (np.uint16); prefer the tag.
+    out_dt = getattr(W2, "quark_dtype", None) or _dtype_str(W2.dtype)
     h = _pcf_gemm(fourier_dev, W1, activation="silu", out_dtype=out_dt)
     emb = _pcf_gemm(h, W2, out_dtype=out_dt)
-    mx.synchronize()
+    # PyObjC Metal dispatch is synchronous — no sync needed.
 
     return emb[:n]
 

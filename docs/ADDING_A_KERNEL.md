@@ -112,27 +112,31 @@ For each MMA call site the kernel emits, add one
 
 ## 3. reference.py
 
-Backend-agnostic torch-or-mlx reference via `PT`.
+Pure numpy reference. Per-kernel `reference.py` files use
+`quark.runtime.npconv.to_f32_numpy` to upcast device tensors to f32
+numpy arrays, run the math in numpy, and `astype_numpy` to cast back
+to the spec's output dtype.
 
 ```python
-from quark.backend import PT
+import numpy as np
+
+from quark.runtime.npconv import astype_numpy, to_f32_numpy
 
 
-def my_reference(kernel, A, B):
-    s = kernel.spec
-    A_f = PT.astype(A, PT.float32)
-    B_f = PT.astype(B, PT.float32)
-    C = PT.matmul(A_f, PT.transpose(B_f))
-    return PT.astype(C, s.out_dtype.backend)
+def my_reference(spec, *, A, B, output=None):
+    del output
+    A_f = to_f32_numpy(A, dtype_hint=spec.a_dtype.value)
+    B_f = to_f32_numpy(B, dtype_hint=spec.b_dtype.value)
+    C = A_f @ B_f.T
+    return astype_numpy(C, spec.out_dtype)
 ```
 
-The decorator's `reference=` hook passes `(kernel, *tensors)`. Pull
-spec / config off `kernel` instead of taking them as args so the
-signature stays aligned with the kernel's `make_tensors` dict
-(which `bench` / `fuzz` unpack positionally).
+The decorator's `reference=` hook passes `(spec, **tensors_by_name)`.
+The kwargs match the names in the kernel's `TENSORS` manifest.
 
-Rule: **no raw torch / mlx calls**. Everything goes through PT. See
-[BACKEND.md](BACKEND.md).
+Rule: **references are numpy-only**. Torch is no longer a runtime
+dep — wire a conditional torch import in `baselines.py` if you need
+a backend-fast comparison row at bench time.
 
 ## 4. problems.py
 
@@ -168,28 +172,38 @@ Canonical tag scheme (see [BENCHMARKING.md](BENCHMARKING.md#tags)):
 
 ## 5. baselines.py
 
+Most kernels' `baselines.py` is stubbed empty by default since the
+numpy-refs migration dropped torch as a runtime dep. Wire a
+conditional torch import to re-enable a backend-fast comparison row:
+
 ```python
-from quark.backend import IS_METAL, PT
 from quark.kernels.base import Baseline
 
 
 def my_baselines(kernel, tensors: dict) -> list[Baseline]:
+    try:
+        import torch
+    except ImportError:
+        return []
+
     A, B = tensors["A"], tensors["B"]
+    A_t = torch.from_numpy(A) if not isinstance(A, torch.Tensor) else A
+    B_t = torch.from_numpy(B) if not isinstance(B, torch.Tensor) else B
 
     def run():
-        C = PT.matmul(A, PT.transpose(B))
-        PT.synchronize()
+        C = torch.matmul(A_t, B_t.T)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
 
-    return [Baseline("PT.matmul", run)]
+    return [Baseline("torch.matmul", run)]
 ```
 
 `baselines=` hook signature: `fn(kernel, tensors) -> list[Baseline]`.
 Each `Baseline(name, fn)` is a callable the bench harness times.
 
-Backend-specialized baselines (`torch._scaled_mm`, `flex_attention`,
-`mx.fast.scaled_dot_product_attention`) are allowed here — baselines
-by definition measure backend-fast references. Use `IS_METAL` to
-route.
+Backend-specialized baselines (`torch._scaled_mm`, `flex_attention`)
+are allowed here — baselines by definition measure backend-fast
+references. They are opt-in via the conditional import; CI default
+keeps the field empty so a missing torch doesn't break the bench.
 
 ## 6. kernel.py
 
@@ -271,13 +285,19 @@ class MyKernel(Kernel):
         return [MmaSite(name="main", a_dtype=compute, b_dtype=compute)]
 
     @classmethod
-    def make_tensors(cls, problem: dict) -> dict:
-        from quark.backend import PT
+    def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
+        import numpy as np
+
+        from quark.runtime.npconv import astype_numpy, zeros_for_dtype
+
         spec = MySpec(**problem)
+        rng = np.random.default_rng(seed)
         return {
-            "A":   PT.astype(PT.randn(spec.M, spec.K), spec.a_dtype.backend),
-            "B":   PT.astype(PT.randn(spec.N, spec.K), spec.b_dtype.backend),
-            "Out": PT.zeros(spec.M, spec.N, dtype=spec.out_dtype.backend),
+            "A":   astype_numpy(rng.standard_normal((spec.M, spec.K)).astype(np.float32),
+                                spec.a_dtype),
+            "B":   astype_numpy(rng.standard_normal((spec.N, spec.K)).astype(np.float32),
+                                spec.b_dtype),
+            "Out": zeros_for_dtype((spec.M, spec.N), spec.out_dtype),
         }
 
     # param_spec() / _mma_cfg() / block() / entry_name() have sensible

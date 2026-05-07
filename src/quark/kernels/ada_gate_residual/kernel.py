@@ -150,7 +150,7 @@ class AdaGateResidualKernel(Kernel):
         if B % G != 0:
             raise ValueError(f"ada_gate_residual: X rows ({B}) not divisible by G ({G})")
         M = B // G
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         return AdaGateResidualSpec(G=G, M=M, D=D, dtype=dt)
 
     def build(self) -> None:
@@ -158,6 +158,65 @@ class AdaGateResidualKernel(Kernel):
             self._build_direct()
         else:
             self._build_smem_pipeline()
+
+    def build_metal(self) -> None:
+        """Metal-flavored ada_gate_residual: warp-per-row, no smem, no
+        D-chunk grid.
+
+        ``out = x + gate * y`` is purely elementwise; there's no
+        reduction so no register stash is needed — vec_load X / Y /
+        gate, fma, vec_store, all in flight together. Avoids the
+        ``_build_smem_pipeline`` cp.async detour (Metal stub) and the
+        ``_build_direct`` D-chunked grid (which spawns one block per
+        D-chunk; redundant once we use the wide vec_load path below).
+
+        Grid: (1, M//n_warps, G) — same shape as the default smem path
+        so ``grid()`` requires no override.
+        """
+        s, c = self.spec, self.config
+
+        D = s.D
+        M = s.M
+        n_warps = c.n_warps
+        dtype = s.dtype
+        vec_elems = _CP_BYTES // dtype.bytes
+        min_chunk = _WARP * vec_elems
+        if min_chunk > D or D % min_chunk != 0:
+            self.build()
+            return
+        epl = D // _WARP
+        if epl % vec_elems != 0:
+            self.build()
+            return
+
+        g = self.g
+        bctx = self.bctx
+        lane = bctx.lane_id
+        vec_w = vec_elems
+        vec_w_c = bctx.c(vec_w, dtype=DType.U32)
+        vecs_per_lane = epl // vec_w
+
+        my_group = qk.block_idx("z")
+        block_base_in_group = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)
+        my_row_in_group = block_base_in_group + bctx.warp_id
+        my_row = my_group * bctx.c(M, dtype=DType.U32) + my_row_in_group
+
+        for v in range(vecs_per_lane):
+            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            g_vec = qk.vec_load(g.gate, my_group, col, width=vec_w, dtype=dtype)
+            x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
+            y_vec = qk.vec_load(g.Y, my_row, col, width=vec_w, dtype=dtype)
+
+            # Plain f32 fma — Metal has no fma.rn.bf16x2; the packed-b32
+            # path is a CUDA-only optimization and would also block the
+            # packed vec_store reinterpret_cast fast path.
+            out_elems = []
+            for j in range(vec_w):
+                gf = qk.convert(qk.vec_extract(g_vec, j), DType.F32)
+                xf = qk.convert(qk.vec_extract(x_vec, j), DType.F32)
+                yf = qk.convert(qk.vec_extract(y_vec, j), DType.F32)
+                out_elems.append(qk.convert(qk.fma(gf, yf, xf), dtype))
+            qk.vec_store(g.Out, qk.vec_build(out_elems), my_row, col)
 
     # ── Direct gmem path ─────────────────────────────────────────────────
 

@@ -370,6 +370,10 @@ def ex2_approx(*args, **kwargs):
     return current_builder().ex2_approx(*args, **kwargs)
 
 
+def exp_approx(*args, **kwargs):
+    return current_builder().exp_approx(*args, **kwargs)
+
+
 def sqrt(*args, **kwargs):
     return current_builder().sqrt(*args, **kwargs)
 

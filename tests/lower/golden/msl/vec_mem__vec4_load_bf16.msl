@@ -1,5 +1,6 @@
     uint _pc_u32_0 = 0u;
-    bfloat16_t _pc_bf_0_0 = X[(_pc_u32_0 * 32u) + _pc_u32_0];
-    bfloat16_t _pc_bf_0_1 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 1u];
-    bfloat16_t _pc_bf_0_2 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 2u];
-    bfloat16_t _pc_bf_0_3 = X[(_pc_u32_0 * 32u) + _pc_u32_0 + 3u];
+    bfloat4 v0 = *reinterpret_cast<const device bfloat4*>(&X[(_pc_u32_0 * 32u) + _pc_u32_0]);
+    bfloat _pc_bf_0_0 = v0[0];
+    bfloat _pc_bf_0_1 = v0[1];
+    bfloat _pc_bf_0_2 = v0[2];
+    bfloat _pc_bf_0_3 = v0[3];

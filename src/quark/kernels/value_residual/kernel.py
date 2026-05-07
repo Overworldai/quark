@@ -99,7 +99,7 @@ class ValueResidualKernel(Kernel):
         N = 1
         for d in V.shape:
             N *= int(d)
-        dt = DType.from_backend(V.dtype)
+        dt = DType.from_backend(V)
         return ValueResidualSpec(N=N, dtype=dt)
 
     def build(self) -> None:

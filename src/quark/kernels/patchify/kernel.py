@@ -128,7 +128,7 @@ class PatchifyKernel(Kernel):
     def spec_from_tensors(cls, X, W, *, C: int, H: int, W_spatial: int, ph: int = 2, pw: int = 2):
         B = int(X.shape[0])
         d_model = int(W.shape[0])
-        dt = DType.from_backend(X.dtype)
+        dt = DType.from_backend(X)
         return PatchifySpec(B=B, C=C, H=H, W=W_spatial, ph=ph, pw=pw, d_model=d_model, dtype=dt)
 
     def build(self) -> None:

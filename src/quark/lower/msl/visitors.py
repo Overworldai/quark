@@ -29,6 +29,7 @@ from quark.ir import (
     FragConvertOp,
     FragForEachOp,
     FragReduceOp,
+    FragSliceOp,
     GridDimOp,
     GroupIdOp,
     IfRegionOp,
@@ -44,6 +45,7 @@ from quark.ir import (
     ShuffleOp,
     SmemAllocOp,
     SplitB32Op,
+    StoreMatrixGateResidualOp,
     StoreMatrixOp,
     StoreOp,
     SubgroupBroadcastOp,
@@ -93,6 +95,9 @@ from .mma import (
 from .mma import (
     visit_store_matrix as _visit_store_matrix,
 )
+from .mma import (
+    visit_store_matrix_gate_residual as _visit_store_matrix_gate_residual,
+)
 from .types import msl_type
 
 # ---------------------------------------------------------------------------
@@ -112,6 +117,56 @@ def _visit_const(self, op: ConstOp, ctx: _MslCtx) -> None:
     ctx.emit(f"{ty} {name} = {_format_literal(dtype, value)};")
 
 
+def _emit_pointwise(
+    ctx: _MslCtx,
+    out,
+    operand_values,
+    template: str,
+    *,
+    declare_ty: str | None = None,
+) -> None:
+    """Emit one pointwise C statement per output component.
+
+    For width-1 ``out`` this is a single scalar emit. For width-N
+    vec values, walks the parallel ``components()`` of out + each
+    operand and emits N statements, one per element. ``template`` is
+    a Python format string with ``{dst}`` and ``{a0}``, ``{a1}``,
+    ... placeholders for the per-element operand names.
+
+    This is what the IR's ``vec * vec`` (and other pointwise arith /
+    math) ops *must* produce on MSL — ``ctx.names.name_for(value)``
+    returns only the *first* component for width-N values (visitors
+    are expected to iterate ``components()`` themselves), so the
+    naive ``ty {dst} = {a} OP {b};`` emit silently miscompiles for
+    vec inputs (declares only ``_pc_x_0``, then a downstream consumer
+    references ``_pc_x_1..N`` and the kernel fails to compile).
+    """
+    ty = declare_ty if declare_ty is not None else msl_type(out.dtype)
+    width = out.width
+    if width == 1:
+        dst = ctx.names.name_for(out)
+        operand_names = [ctx.names.name_for(v) for v in operand_values]
+        kw = {f"a{i}": n for i, n in enumerate(operand_names)}
+        ctx.emit(f"{ty} {dst} = {template.format(dst=dst, **kw)};")
+        return
+    out_comps = ctx.names.components(out)
+    operand_comps = []
+    for v in operand_values:
+        comps = ctx.names.components(v) if v.width > 1 else (ctx.names.name_for(v),) * width
+        if len(comps) != width:
+            # Mismatched widths can't be element-wise broadcast here;
+            # the IR layer should have inserted a broadcast / vec_build
+            # to widen the smaller operand.
+            raise NotImplementedError(
+                f"_emit_pointwise: operand width {len(comps)} != out width "
+                f"{width}; insert a vec_build to broadcast first."
+            )
+        operand_comps.append(comps)
+    for i in range(width):
+        kw = {f"a{j}": operand_comps[j][i] for j in range(len(operand_values))}
+        ctx.emit(f"{ty} {out_comps[i]} = {template.format(dst=out_comps[i], **kw)};")
+
+
 def _visit_arith(self, op: ArithOp, ctx: _MslCtx) -> None:
     kind = op.attrs["kind"]
     (out,) = op.results
@@ -119,53 +174,76 @@ def _visit_arith(self, op: ArithOp, ctx: _MslCtx) -> None:
     ty = msl_type(out.dtype)
 
     if kind == "neg":
-        src = ctx.names.name_for(op.operands[0])
-        ctx.emit(f"{ty} {dst} = -{src};")
+        _emit_pointwise(ctx, out, op.operands[:1], "-{a0}")
     elif kind == "abs":
-        src = ctx.names.name_for(op.operands[0])
-        ctx.emit(f"{ty} {dst} = metal::abs({src});")
+        _emit_pointwise(ctx, out, op.operands[:1], "metal::abs({a0})")
     elif kind == "fma":
+        _emit_pointwise(ctx, out, op.operands[:3], "metal::fma({a0}, {a1}, {a2})")
+    elif kind == "fma_bf16x2":
+        # PTX ``fma.rn.bf16x2`` operates on B32 regs holding two packed
+        # bf16 values. MSL has no packed-pair fma. On MSL, bfloat is a
+        # real 16-bit type and VecLoad→VecExtract aliasing means the
+        # "B32" operands often resolve to individual bfloat scalars.
         a = ctx.names.name_for(op.operands[0])
         b = ctx.names.name_for(op.operands[1])
         c = ctx.names.name_for(op.operands[2])
-        ctx.emit(f"{ty} {dst} = metal::fma({a}, {b}, {c});")
+        if _is_msl_16bit(a):
+            # Operands are individual bfloat scalars; one scalar fma.
+            ctx.emit(f"bfloat {dst} = metal::fma({a}, {b}, {c});")
+        else:
+            # Operands are real B32 (uint, packed bf16x2): unpack, fma×2, repack.
+            ap = ctx.names.fresh("fma2a")
+            bp = ctx.names.fresh("fma2b")
+            cp = ctx.names.fresh("fma2c")
+            ctx.emit(f"ushort2 {ap} = as_type<ushort2>({a});")
+            ctx.emit(f"ushort2 {bp} = as_type<ushort2>({b});")
+            ctx.emit(f"ushort2 {cp} = as_type<ushort2>({c});")
+            rlo = ctx.names.fresh("fma2lo")
+            rhi = ctx.names.fresh("fma2hi")
+            ctx.emit(
+                f"bfloat {rlo} = metal::fma(as_type<bfloat>({ap}.x), "
+                f"as_type<bfloat>({bp}.x), as_type<bfloat>({cp}.x));"
+            )
+            ctx.emit(
+                f"bfloat {rhi} = metal::fma(as_type<bfloat>({ap}.y), "
+                f"as_type<bfloat>({bp}.y), as_type<bfloat>({cp}.y));"
+            )
+            ctx.emit(
+                f"{ty} {dst} = as_type<uint>(ushort2("
+                f"as_type<ushort>({rlo}), as_type<ushort>({rhi})));"
+            )
     elif kind == "min":
-        a = ctx.names.name_for(op.operands[0])
-        b = ctx.names.name_for(op.operands[1])
-        ctx.emit(f"{ty} {dst} = metal::min({a}, {b});")
+        _emit_pointwise(ctx, out, op.operands[:2], "metal::min({a0}, {a1})")
     elif kind == "max":
-        a = ctx.names.name_for(op.operands[0])
-        b = ctx.names.name_for(op.operands[1])
-        ctx.emit(f"{ty} {dst} = metal::max({a}, {b});")
+        _emit_pointwise(ctx, out, op.operands[:2], "metal::max({a0}, {a1})")
     elif kind == "mul_hi":
-        a = ctx.names.name_for(op.operands[0])
-        b = ctx.names.name_for(op.operands[1])
         # MSL's metal::mulhi computes the high half of an unsigned
         # 32×32→64 multiply (or the matching width for u16/u64 ops).
-        ctx.emit(f"{ty} {dst} = metal::mulhi({a}, {b});")
+        _emit_pointwise(ctx, out, op.operands[:2], "metal::mulhi({a0}, {a1})")
     else:
         sym = _ARITH_OP.get(kind)
         if sym is None:
             raise NotImplementedError(f"ArithOp kind {kind!r} not implemented for MSL")
-        a = ctx.names.name_for(op.operands[0])
-        b = ctx.names.name_for(op.operands[1])
-        ctx.emit(f"{ty} {dst} = {a} {sym} {b};")
+        _emit_pointwise(ctx, out, op.operands[:2], "{a0} " + sym + " {a1}")
 
 
 def _visit_math(self, op: MathOp, ctx: _MslCtx) -> None:
     kind = op.attrs["kind"]
     (out,) = op.results
-    dst = ctx.names.name_for(out)
-    src = ctx.names.name_for(op.operands[0])
     ty = msl_type(out.dtype)
 
     if kind in ("rcp", "rcp_approx"):
-        ctx.emit(f"{ty} {dst} = static_cast<{ty}>(1.0f) / {src};")
+        _emit_pointwise(
+            ctx,
+            out,
+            op.operands[:1],
+            f"static_cast<{ty}>(1.0f) / {{a0}}",
+        )
     else:
         fn = _MATH_FN.get(kind)
         if fn is None:
             raise NotImplementedError(f"MathOp kind {kind!r} not implemented for MSL")
-        ctx.emit(f"{ty} {dst} = {fn}({src});")
+        _emit_pointwise(ctx, out, op.operands[:1], f"{fn}({{a0}})")
 
 
 def _visit_cmp(self, op: CmpOp, ctx: _MslCtx) -> None:
@@ -259,13 +337,33 @@ def _visit_vec_extract(self, op: VecExtractOp, ctx: _MslCtx) -> None:
     ctx.names.alias_component(out, src, idx)
 
 
+def _is_msl_16bit(name: str) -> bool:
+    """Detect if an MSL variable name was allocated for a 16-bit type.
+
+    On MSL, VecLoad→VecExtract aliasing can assign BF16/F16 names to
+    Values that the IR types as B32 (because PTX's "bf16 lives in b32"
+    convention doesn't hold). Downstream ops that assume B32=32-bit
+    need this check to avoid ``as_type`` size mismatches.
+    """
+    return "_pc_bf_" in name or "_pc_f16_" in name or "_pc_b16_" in name
+
+
 def _visit_split_b32(self, op: SplitB32Op, ctx: _MslCtx) -> None:
     lo, hi = op.results
-    src_name = ctx.names.name_for(op.operands[0])
+    src = op.operands[0]
+    src_name = ctx.names.name_for(src)
     lo_name = ctx.names.name_for(lo)
     hi_name = ctx.names.name_for(hi)
-    ctx.emit(f"ushort {lo_name} = as_type<ushort2>({src_name}).x;")
-    ctx.emit(f"ushort {hi_name} = as_type<ushort2>({src_name}).y;")
+    # On MSL, a B32 value is a ``uint`` (32-bit) and the split is a
+    # proper 4B → 2×2B reinterpret. But VecLoad→VecExtract aliasing
+    # can map B32 IR values to 16-bit MSL names (bfloat, half). In that
+    # case the value IS already 16-bit — treat lo as the value, hi as 0.
+    if _is_msl_16bit(src_name):
+        ctx.emit(f"ushort {lo_name} = as_type<ushort>({src_name});")
+        ctx.emit(f"ushort {hi_name} = 0u;")
+    else:
+        ctx.emit(f"ushort {lo_name} = as_type<ushort2>({src_name}).x;")
+        ctx.emit(f"ushort {hi_name} = as_type<ushort2>({src_name}).y;")
 
 
 def _visit_merge_b32(self, op: MergeB32Op, ctx: _MslCtx) -> None:
@@ -369,6 +467,88 @@ def _visit_for_loop(self, op: ForLoopOp, ctx: _MslCtx) -> None:
     ty = msl_type(iv.dtype)
 
     for cin, res, cbv in zip(op.carried_in, op.results, op.carried_body_vars, strict=False):
+        # Multi-component vec carry without simdgroup_matrix backing
+        # (e.g. NAX width-16 F32 accumulator). Emit a single ARRAY
+        # local ``float _accN[width]`` rather than N individual scalar
+        # locals. This gives Apple's shader compiler one contiguous
+        # register allocation to track instead of N independent live
+        # ranges — crucial for NAX GEMMs where 32+ float accumulators
+        # can exceed the simdgroup register budget if declared as
+        # separate scalars (see METAL_BACKEND.md analysis).
+        #
+        # The array persists across loop iterations (declared before
+        # the ``for``). The yield handler writes ``_accN[i] = dN;``
+        # which is a cheap array-element store.
+        if (
+            res.width > 1
+            and not (_is_accumulator_value(res) and ctx.uses_simdgroup_matrix)
+            and not ctx.uses_simdgroup_matrix  # CUDA simdgroup_matrix flag must be off
+        ):
+            cin_comps = ctx.names.components(cin)
+            res_ty = msl_type(res.dtype)
+
+            # NAX-storage carry: width-16 f32 (or any source already in
+            # nax_frag_ids) on a NAX-using kernel uses ``vec<float, 8>
+            # X[2]`` array storage instead of N scalar locals. Apple's
+            # compiler treats the array as 2 contiguous SIMD8 register
+            # groups — same shape as the hand-written kernel's
+            # ``vec<float, 8> O_frags[N]`` declarations. Cuts SSA
+            # fragmentation; matches HW's register-tile usage.
+            is_nax_carry = (
+                ctx.uses_nax and res.dtype is DType.F32 and res.width % 8 == 0 and res.width >= 8
+            ) or cin.id in ctx.nax_frag_ids
+            n_subfrags = res.width // 8 if is_nax_carry else 0
+
+            # Carry-alias optimization: when ``cin`` is itself a loop-
+            # carry body var (its producer is another ForLoopOp), its
+            # components are mutable lane locals declared at the outer
+            # loop's scope. The inner loop body can update them in
+            # place — saves N register copies on entry (``chunk_carry =
+            # seg_carry``) and another N at the outer yield (``seg_carry
+            # = chunk_carry`` becomes a self-assign that the yield
+            # visitor skips).
+            cin_producer = getattr(cin, "producer", None)
+            can_alias_carry = cin_producer is not None and isinstance(cin_producer, ForLoopOp)
+            if can_alias_carry:
+                # Reuse cin's storage; cin_comps may be array-element
+                # strings (NAX) or scalars (other) — either way,
+                # binding directly preserves the layout.
+                ctx.names.bind(res, cin_comps, force=True)
+                ctx.names.alias(cbv, res)
+                # Propagate the cin's array-name registration to the
+                # alias so MMA helpers can pass-by-reference.
+                if cin.id in ctx.nax_frag_arrays:
+                    ctx.nax_frag_arrays[res.id] = ctx.nax_frag_arrays[cin.id]
+                    ctx.nax_frag_arrays[cbv.id] = ctx.nax_frag_arrays[cin.id]
+            elif is_nax_carry:
+                # Allocate a fresh ``vec<float, 8> X[n];`` and seed it
+                # from cin (which may itself be array-form or scalar).
+                arr = ctx.names.fresh(f"{iv_name}_carry")
+                ctx.emit(f"vec<{res_ty}, 8> {arr}[{n_subfrags}];")
+                res_comps = tuple(
+                    f"{arr}[{fi}][{si}]" for fi in range(n_subfrags) for si in range(8)
+                )
+                ctx.names.bind(res, res_comps, force=True)
+                ctx.names.alias(cbv, res)
+                for r_name, c_name in zip(res_comps, cin_comps, strict=True):
+                    ctx.emit(f"{r_name} = {c_name};")
+                # Record the array name so MMA helper-emission can pass
+                # the carry by reference into ``nax_mma_*`` helpers.
+                ctx.nax_frag_arrays[res.id] = (arr, n_subfrags)
+                ctx.nax_frag_arrays[cbv.id] = (arr, n_subfrags)
+            else:
+                res_comps = tuple(ctx.names.fresh(f"{iv_name}_carry") for _ in range(res.width))
+                ctx.names.bind(res, res_comps, force=True)
+                ctx.names.alias(cbv, res)
+                for r_name, c_name in zip(res_comps, cin_comps, strict=True):
+                    ctx.emit(f"{res_ty} {r_name} = {c_name};")
+            # Tag the result + body var as NAX-stored when the source
+            # was a NAX fragment (or by construction width-16 f32 on a
+            # NAX kernel) so downstream Frag* visitors dispatch right.
+            if is_nax_carry:
+                ctx.nax_frag_ids.add(res.id)
+                ctx.nax_frag_ids.add(cbv.id)
+            continue
         if _is_accumulator_value(res) and ctx.uses_simdgroup_matrix:
             # Pre-declare as simdgroup_matrix array for MMA accumulators.
             # Each 8x8 simdgroup_matrix tile stores 2 f32 per lane (Apple
@@ -481,6 +661,16 @@ def _visit_yield(self, op: YieldOp, ctx: _MslCtx) -> None:
                     for i in range(n_frags):
                         ctx.emit(f"{res_name}[{i}] = {val_name}[{i}];")
             else:
+                # Multi-component vec yield (NAX accumulator and similar):
+                # update each carried component slot from the yielded
+                # value's per-component names. Skips no-op self-assigns.
+                res_comps = ctx.names.components(res)
+                yielded_comps = ctx.names.components(yielded)
+                if len(res_comps) > 1 and len(yielded_comps) == len(res_comps):
+                    for r_name, y_name in zip(res_comps, yielded_comps, strict=True):
+                        if r_name != y_name:
+                            ctx.emit(f"{r_name} = {y_name};")
+                    continue
                 res_name = ctx.names.name_for(res)
                 if res_name != val_name:
                     ctx.emit(f"{res_name} = {val_name};")
@@ -512,6 +702,18 @@ def _visit_smem_alloc(self, op: SmemAllocOp, ctx: _MslCtx) -> None:
         ctx.names.bind(backing, (var_name,))
 
 
+def _atomic_access_expr(buf: str, offset_expr: str, ty: str) -> str:
+    """``&buf[offset]`` cast to ``device atomic_<ty>*`` for atomic API calls.
+
+    Mirrors the cast used in ``_visit_atomic_rmw`` so plain load/store
+    on a buffer that some other op targets via ``AtomicRmwOp`` (e.g.
+    moe_router_correct: ``counts`` is initialised by ``qk.store`` and
+    later atomic-added) reads/writes through the same atomic typed
+    pointer the harness declares.
+    """
+    return f"reinterpret_cast<device atomic_{ty}*>(&{buf}[{offset_expr}])"
+
+
 def _visit_load(self, op: LoadOp, ctx: _MslCtx) -> None:
     tensor = op.attrs["tensor"]
     (out,) = op.results
@@ -521,14 +723,23 @@ def _visit_load(self, op: LoadOp, ctx: _MslCtx) -> None:
     indices = op.operands[:-1] if pred is not None else op.operands
     offset_expr = _compute_tensor_offset(tensor, indices, ctx)
     buf = _tensor_buf_name(tensor, ctx)
+    is_atomic = buf in ctx.atomic_output_names
+
+    if is_atomic:
+        load_expr = (
+            f"atomic_load_explicit({_atomic_access_expr(buf, offset_expr, ty)},"
+            f" memory_order_relaxed)"
+        )
+    else:
+        load_expr = f"{buf}[{offset_expr}]"
 
     if pred is not None:
         pred_name = ctx.names.name_for(pred)
         ctx.emit(f"{ty} {dst};")
-        ctx.emit(f"if ({pred_name}) {{ {dst} = {buf}[{offset_expr}]; }}")
+        ctx.emit(f"if ({pred_name}) {{ {dst} = {load_expr}; }}")
         ctx.emit(f"else {{ {dst} = static_cast<{ty}>(0); }}")
     else:
-        ctx.emit(f"{ty} {dst} = {buf}[{offset_expr}];")
+        ctx.emit(f"{ty} {dst} = {load_expr};")
 
 
 def _visit_store(self, op: StoreOp, ctx: _MslCtx) -> None:
@@ -541,12 +752,104 @@ def _visit_store(self, op: StoreOp, ctx: _MslCtx) -> None:
     offset_expr = _compute_tensor_offset(tensor, indices, ctx)
     buf = _tensor_buf_name(tensor, ctx)
     val_name = ctx.names.name_for(value)
+    is_atomic = buf in ctx.atomic_output_names
+
+    if is_atomic:
+        ty = msl_type(value.dtype)
+        store_stmt = (
+            f"atomic_store_explicit({_atomic_access_expr(buf, offset_expr, ty)},"
+            f" {val_name}, memory_order_relaxed)"
+        )
+    else:
+        store_stmt = f"{buf}[{offset_expr}] = {val_name}"
 
     if pred is not None:
         pred_name = ctx.names.name_for(pred)
-        ctx.emit(f"if ({pred_name}) {{ {buf}[{offset_expr}] = {val_name}; }}")
+        ctx.emit(f"if ({pred_name}) {{ {store_stmt}; }}")
     else:
-        ctx.emit(f"{buf}[{offset_expr}] = {val_name};")
+        ctx.emit(f"{store_stmt};")
+
+
+_VEC_PACK_WIDTHS = (2, 3, 4)  # MSL vector widths supported on every dtype
+
+
+def _msl_addr_space(tensor) -> str:
+    """Address-space qualifier for the MSL pointer cast.
+
+    GlobalTensor → ``device``; SharedRegion → ``threadgroup``. Other
+    tensor kinds aren't expected as vec_load/store targets — they fall
+    through to scalar lowering via the caller's None return.
+    """
+    from quark.ir import GlobalTensor, SharedRegion
+
+    if isinstance(tensor, GlobalTensor):
+        return "device"
+    if isinstance(tensor, SharedRegion):
+        return "threadgroup"
+    return ""
+
+
+def _packed_vec_chunks(n: int) -> list[int] | None:
+    """Decompose ``n`` components into a sequence of MSL vector widths.
+
+    Returns the list of chunk widths covering ``n`` (e.g. 8 → [4,4],
+    16 → [4,4,4,4], 4 → [4], 2 → [2], 6 → [4,2]). Returns ``None`` for
+    widths that don't decompose cleanly into 2/3/4-vectors (1, 5, 7,
+    11, ...) so the caller falls back to scalar emission.
+    """
+    if n < 2:
+        return None
+    chunks: list[int] = []
+    remaining = n
+    for w in (4, 3, 2):
+        while remaining >= w:
+            chunks.append(w)
+            remaining -= w
+        if remaining == 0:
+            return chunks
+    if remaining != 0:
+        return None
+    return chunks if all(c in _VEC_PACK_WIDTHS for c in chunks) else None
+
+
+def _emit_packed_vec_load(buf: str, ty: str, addr_space: str, offset_expr: str, comps, ctx) -> bool:
+    """Emit packed ``T{2,3,4}`` reinterpret_cast loads when the layout
+    permits it. Returns True on success; False if the width can't be
+    packed (caller falls back to scalar). Pred-guarded loads always
+    return False — the per-element if/else is hard to vectorize.
+    """
+    if not addr_space:
+        return False
+    chunks = _packed_vec_chunks(len(comps))
+    if chunks is None:
+        return False
+    cursor = 0
+    for w in chunks:
+        bi = f"{offset_expr} + {cursor}u" if cursor > 0 else offset_expr
+        tmp = ctx.names.fresh("v")
+        ctx.emit(f"{ty}{w} {tmp} = *reinterpret_cast<const {addr_space} {ty}{w}*>(&{buf}[{bi}]);")
+        for j in range(w):
+            ctx.emit(f"{ty} {comps[cursor + j]} = {tmp}[{j}];")
+        cursor += w
+    return True
+
+
+def _emit_packed_vec_store(
+    buf: str, ty: str, addr_space: str, offset_expr: str, comps, ctx
+) -> bool:
+    """Mirror of ``_emit_packed_vec_load`` for stores."""
+    if not addr_space:
+        return False
+    chunks = _packed_vec_chunks(len(comps))
+    if chunks is None:
+        return False
+    cursor = 0
+    for w in chunks:
+        bi = f"{offset_expr} + {cursor}u" if cursor > 0 else offset_expr
+        elems = ", ".join(comps[cursor + j] for j in range(w))
+        ctx.emit(f"*reinterpret_cast<{addr_space} {ty}{w}*>(&{buf}[{bi}]) = {ty}{w}({elems});")
+        cursor += w
+    return True
 
 
 def _visit_vec_load(self, op: VecLoadOp, ctx: _MslCtx) -> None:
@@ -561,6 +864,12 @@ def _visit_vec_load(self, op: VecLoadOp, ctx: _MslCtx) -> None:
     payload — not the implicit-narrowing-to-uint pattern the original
     naive lowering produced (which only moved buf_dtype.bytes per
     vec element, dropping half the data on every cooperative store).
+
+    Same-dtype path (vec_dtype == buf_dtype, no pred) emits packed
+    ``T{2,3,4}`` reinterpret_cast loads — one wide read instead of N
+    scalar reads. Required to match hand-written vec4 kernels on
+    Apple GPUs; the Metal compiler does not auto-vectorize sequential
+    indexed scalar loads through register-named offsets.
     """
     tensor = op.attrs["tensor"]
     (out,) = op.results
@@ -575,6 +884,11 @@ def _visit_vec_load(self, op: VecLoadOp, ctx: _MslCtx) -> None:
     vec_bytes = out.dtype.bytes
     stride = vec_bytes // buf_bytes if vec_bytes >= buf_bytes else 1
     needs_pack = vec_bytes > buf_bytes
+
+    if pred is None and not needs_pack and tensor.dtype is out.dtype:
+        addr_space = _msl_addr_space(tensor)
+        if _emit_packed_vec_load(buf, ty, addr_space, offset_expr, comps, ctx):
+            return
     # Pick the unsigned-int type matching the buf's bit width. MSL
     # ``as_type<T>`` requires same byte width on source and dest, so
     # ``as_type<ushort>(int)`` fails (2B vs 4B). Mapping:
@@ -617,7 +931,12 @@ def _visit_vec_store(self, op: VecStoreOp, ctx: _MslCtx) -> None:
     ``_visit_vec_load``: when the source vec dtype is wider than the
     buffer dtype, unpack each vec element into ``stride`` buf elements
     via ``as_type<ushort{stride}>(value)`` and write them out — keeping
-    the per-vec-elem byte count consistent with the requested dtype."""
+    the per-vec-elem byte count consistent with the requested dtype.
+
+    Same-dtype path (vec.dtype == buf.dtype, no pred) emits packed
+    ``T{2,3,4}`` reinterpret_cast stores — see ``_visit_vec_load`` for
+    the rationale.
+    """
     tensor = op.attrs["tensor"]
     vec = op.operands[0]
     rest = op.operands[1:]
@@ -633,6 +952,11 @@ def _visit_vec_store(self, op: VecStoreOp, ctx: _MslCtx) -> None:
     stride = vec_bytes // buf_bytes if vec_bytes >= buf_bytes else 1
     needs_unpack = vec_bytes > buf_bytes
     buf_ty = msl_type(tensor.dtype)
+
+    if pred is None and not needs_unpack and tensor.dtype is vec.dtype:
+        addr_space = _msl_addr_space(tensor)
+        if _emit_packed_vec_store(buf, buf_ty, addr_space, offset_expr, comps, ctx):
+            return
     # Matched-width unsigned int for the pack/unpack. Same table as
     # vec_load; ``as_type`` on MSL requires same byte width both ways.
     _BUF_UINT_BY_BYTES = {1: "uchar", 2: "ushort", 4: "uint", 8: "ulong"}
@@ -663,6 +987,16 @@ def _visit_vec_store(self, op: VecStoreOp, ctx: _MslCtx) -> None:
 
 
 def _visit_async_copy(self, op: AsyncCopyOp, ctx: _MslCtx) -> None:
+    """Synchronous fallback for ``cp.async`` on Metal.
+
+    Metal has no async DMA primitive; the kernel waits for the copy
+    to land before any consumer reads from the dst smem region. Same-
+    dtype gmem→smem (or smem→gmem) copies of width 2/3/4 lower to a
+    register-routed packed reinterpret_cast pair instead of N scalar
+    elementwise copies — fewer dispatch ops and the optimizer keeps
+    the load in registers across the store, which Metal otherwise
+    can't see through indexed scalar reads.
+    """
     dst_tensor, src_tensor = op.attrs["dst_tensor"], op.attrs["src_tensor"]
     count = int(op.attrs["count"])
     n_dst, n_src = int(op.attrs["n_dst_idx"]), int(op.attrs["n_src_idx"])
@@ -673,14 +1007,33 @@ def _visit_async_copy(self, op: AsyncCopyOp, ctx: _MslCtx) -> None:
     src_off = _compute_tensor_offset(src_tensor, src_idxs, ctx)
     dst_buf, src_buf = _tensor_buf_name(dst_tensor, ctx), _tensor_buf_name(src_tensor, ctx)
     n_elems = count // src_tensor.dtype.bytes
+
     if pred is not None:
         pred_name = ctx.names.name_for(pred)
         ctx.emit(f"if ({pred_name}) {{")
         ctx.indent += 1
-    for i in range(n_elems):
-        s = f"{src_off} + {i}u" if i > 0 else src_off
-        d = f"{dst_off} + {i}u" if i > 0 else dst_off
-        ctx.emit(f"{dst_buf}[{d}] = {src_buf}[{s}];")
+
+    chunks = _packed_vec_chunks(n_elems) if src_tensor.dtype is dst_tensor.dtype else None
+    src_space = _msl_addr_space(src_tensor)
+    dst_space = _msl_addr_space(dst_tensor)
+    if chunks is not None and src_space and dst_space:
+        ty = msl_type(src_tensor.dtype)
+        cursor = 0
+        for w in chunks:
+            s = f"{src_off} + {cursor}u" if cursor > 0 else src_off
+            d = f"{dst_off} + {cursor}u" if cursor > 0 else dst_off
+            tmp = ctx.names.fresh("ac")
+            ctx.emit(
+                f"{ty}{w} {tmp} = *reinterpret_cast<const {src_space} {ty}{w}*>(&{src_buf}[{s}]);"
+            )
+            ctx.emit(f"*reinterpret_cast<{dst_space} {ty}{w}*>(&{dst_buf}[{d}]) = {tmp};")
+            cursor += w
+    else:
+        for i in range(n_elems):
+            s = f"{src_off} + {i}u" if i > 0 else src_off
+            d = f"{dst_off} + {i}u" if i > 0 else dst_off
+            ctx.emit(f"{dst_buf}[{d}] = {src_buf}[{s}];")
+
     if pred is not None:
         ctx.indent -= 1
         ctx.emit("}")
@@ -705,6 +1058,11 @@ def _visit_atomic_rmw(self, op: AtomicRmwOp, ctx: _MslCtx) -> None:
     ctx.uses_atomics = True
     offset_expr = _compute_tensor_offset(tensor, indices, ctx)
     buf = _tensor_buf_name(tensor, ctx)
+    # Track which output buffer this rmw targets — kernels with a mix of
+    # atomic and plain-store outputs (moe_router_correct: counts is rmw,
+    # token_ids / slot_weights / offsets get plain stores) need
+    # per-output qualification, not a kernel-wide flag.
+    ctx.atomic_output_names.add(buf)
     fn = _ATOMIC_FN.get(atomic_op)
     if fn is None:
         raise NotImplementedError(f"AtomicRmwOp: op {atomic_op!r} not supported on MSL")
@@ -745,6 +1103,41 @@ def _visit_subgroup_broadcast(self, op: SubgroupBroadcastOp, ctx: _MslCtx) -> No
     dst, src_name = ctx.names.name_for(out), ctx.names.name_for(op.operands[0])
     ty = msl_type(out.dtype)
     ctx.emit(f"{ty} {dst} = simd_broadcast({src_name}, {lane}u);")
+
+
+def _visit_frag_slice(self, op: FragSliceOp, ctx: _MslCtx) -> None:
+    """Bind the result Value to a slice of the source's components.
+
+    Pure rename — no MSL emitted. The sliced fragment shares lane
+    storage with its source. Storage class (NAX vs simdgroup_matrix)
+    is inherited so downstream Frag* visitors dispatch correctly.
+    """
+    (src,) = op.operands
+    (out,) = op.results
+    start = int(op.attrs["start"])
+    length = int(op.attrs["length"])
+    src_comps = ctx.names.components(src)
+    ctx.names.bind(out, tuple(src_comps[start : start + length]))
+    if src.id in ctx.nax_frag_ids:
+        ctx.nax_frag_ids.add(out.id)
+    if src.id in ctx.frag_values:
+        # simdgroup_matrix path: keep the same registration so frag ops
+        # on the slice see the source's tile metadata.
+        ctx.frag_values[out.id] = ctx.frag_values[src.id]
+    # NAX-array slice: when the slice is sub-frag-aligned, the
+    # ``&parent[start//8]`` pointer covers the slice's elements.
+    # That lets MMA helper-call emission pass an array reference for
+    # the slice (e.g. ``&S_array[1]`` for a width-8 slice starting at
+    # index 8 of a width-16 parent). Records the slice's "view" as a
+    # special array entry so ``_visit_mma_nax`` can detect it.
+    if src.id in ctx.nax_frag_arrays and start % 8 == 0 and length % 8 == 0:
+        parent_arr, _parent_n_frags = ctx.nax_frag_arrays[src.id]
+        slice_n_frags = length // 8
+        # Record the slice's name as ``parent`` (start=0) or
+        # ``parent[start//8]`` so the helper-call site can emit
+        # ``&{name}[0]`` uniformly across both cases.
+        slice_arr_name = parent_arr if start == 0 else f"{parent_arr}[{start // 8}]"
+        ctx.nax_frag_arrays[out.id] = (slice_arr_name, slice_n_frags)
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +1187,8 @@ DISPATCH: dict[type, Any] = {
     FragConvertOp: _visit_frag_convert,
     FragForEachOp: _visit_frag_for_each,
     FragReduceOp: _visit_frag_reduce,
+    FragSliceOp: _visit_frag_slice,
     LoadMatrixOp: _visit_load_matrix,
     StoreMatrixOp: _visit_store_matrix,
+    StoreMatrixGateResidualOp: _visit_store_matrix_gate_residual,
 }

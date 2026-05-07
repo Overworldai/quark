@@ -1,15 +1,23 @@
-"""MoE out-projection kernel on the new IR Builder.
+"""MoE out-projection kernel — per-slot partial output.
 
-output[tok_id, :] += weight * (h[slot, :] @ W_out[expert, :, :].T)
+partials[slot, :] = h[slot, :] @ W_out[expert, :, :].T
 
-Architecture (same as inproj but different A loader + epilogue):
+Architecture (mirrors moe_inproj, no SiLU, contiguous A load):
   - Grid: (D // BN, n_work_items, 1)
   - Each block reads (grp_start, expert) from work_list.
-  - Caches token_ids AND slot_weights into smem.
   - A tile: CONTIGUOUS from h[grp_start..+BM, :] (hidden activations)
   - B tile: contiguous from W_out[expert*D + n_tile*BN, :]
   - K-pipelined GEMM body.
-  - Epilogue: scale by weight, atomic scatter-add into output[tok_id, col].
+  - Epilogue: contiguous store into ``partials[grp_start.., col]`` at
+    ``s.out_dtype`` (typically f32 — see ``nn.MoE`` for why).
+
+The per-token reduction (sum over top_k slots, scaled by slot_weight)
+is split into a separate ``moe_reduce`` kernel that gathers via the
+router's ``token_slot_table`` output. This avoids the
+non-deterministic atomic scatter-add the previous design needed and
+keeps the bf16 quantization confined to ``moe_reduce``'s final cast
+(``moe_outproj`` writes f32 partials, ``moe_reduce`` accumulates in
+f32 registers and casts to bf16 once on the final store).
 """
 
 from __future__ import annotations
@@ -24,7 +32,6 @@ from quark.blocks import (
     PipelineBody,
     SmemPlan,
     TensorDecl,
-    barrier,
     block_idx,
 )
 from quark.ir import DType
@@ -47,11 +54,10 @@ from quark.kernels.moe_outproj.spec import MoeOutprojSpec
     reference=moe_outproj_reference_numpy,
 )
 class MoeOutprojKernel(Kernel):
-    # Atomic scatter-add accumulates in non-deterministic order, so
-    # the output drifts ~1e-3 from the reference (CPU sequential
-    # scatter) even when the kernel is computing correctly. Relax to
-    # 0.99 so bench doesn't reject tuned configs on fourth-decimal
-    # numerical noise.
+    # Plain bf16 stores — but the kernel still supports fp8 compute
+    # (config_overrides=c_e4m3 problems), so keep the same loose 0.99
+    # threshold the inproj kernel uses. The atomic-scatter
+    # non-determinism that drove the previous 0.99 threshold is gone.
     CORRECTNESS_THRESHOLD = 0.99
 
     # Parameter manifest — single source of truth for shapes/dtypes of
@@ -67,15 +73,15 @@ class MoeOutprojKernel(Kernel):
                 (s.H // c.BK) * (c.BK + c.b_pad) if c.b_shuffle and c.b_pad > 0 else s.H,
             ),
         ),
-        # Output is always f32: atomic scatter-add only lowers cleanly
-        # at 4-byte granularity on every backend we target (sm_89 has
-        # no bf16 atomic; Metal has no sub-4-byte atomic). Callers cast
-        # scatter outputs to their preferred dtype in the surrounding
-        # runtime code — a single f32→bf16 pass amortizes across the
-        # real pipeline.
-        TensorDecl("output", dtype=DType.F32, shape=lambda s, c: (s.M, s.D), role="out"),
-        TensorDecl("token_ids", dtype=DType.S32, shape=lambda s, c: (s.total_slots,)),
-        TensorDecl("slot_weights", dtype=DType.F32, shape=lambda s, c: (s.total_slots,)),
+        # Per-slot partial output: ``partials[slot, :] = h[slot] @ W_out[expert].T``.
+        # The downstream ``moe_reduce`` kernel folds in slot_weights and
+        # gathers per-token sums via ``token_slot_table``.
+        TensorDecl(
+            "partials",
+            dtype=lambda s, c: s.out_dtype,
+            shape=lambda s, c: (s.total_slots, s.D),
+            role="out",
+        ),
         TensorDecl("work_list", dtype=DType.S32, shape=lambda s, c: (s.total_slots // c.BM * 2,)),
     ]
 
@@ -86,6 +92,13 @@ class MoeOutprojKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
+        # Hard-reject BM != 32 — same reason as ``moe_inproj.is_valid``:
+        # ``moe_router_correct`` emits work_list at a 32-slot step and
+        # this kernel reads one ``(grp_start, expert)`` pair per block,
+        # so BM must match. Catches stale cached configs from before
+        # the tune_space pin.
+        if c.BM != 32:
+            return False
         if s.D % c.BN != 0 or s.H % c.BK != 0:
             return False
         try:
@@ -120,16 +133,14 @@ class MoeOutprojKernel(Kernel):
     def make_tensors_numpy(cls, problem: dict, *, seed: int = 0x5A1E_5EED) -> dict:
         import numpy as np
 
-        from quark.runtime.npconv import astype_numpy
+        from quark.runtime.npconv import astype_numpy, zeros_for_dtype
 
         spec = MoeOutprojSpec(**problem)
-        M, D, H, n_e, _ = spec.M, spec.D, spec.H, spec.n_experts, spec.top_k
+        D, H, n_e = spec.D, spec.H, spec.n_experts
         total = spec.total_slots
         slots_per_expert = spec.capacity
 
         rng = np.random.default_rng(seed)
-        token_ids = (np.arange(total) % M).astype(np.int32)
-        slot_weights = np.full(total, 0.5, dtype=np.float32)
         # Full-coverage work_list: one entry per BM=32 chunk, each
         # labelled with the expert that owns the chunk.
         assert slots_per_expert is not None
@@ -140,10 +151,7 @@ class MoeOutprojKernel(Kernel):
             "W_out": astype_numpy(
                 rng.standard_normal((n_e * D, H)).astype(np.float32), spec.b_dtype
             ),
-            # Output always f32 — atomic scatter-add target.
-            "output": np.zeros((M, D), dtype=np.float32),
-            "token_ids": token_ids,
-            "slot_weights": slot_weights,
+            "partials": zeros_for_dtype((total, D), spec.out_dtype),
             "work_list": work_list,
         }
 
@@ -152,8 +160,6 @@ class MoeOutprojKernel(Kernel):
         cls,
         h_in,
         W_out,
-        token_ids,
-        slot_weights,
         work_list,
         *,
         M: int,
@@ -164,11 +170,13 @@ class MoeOutprojKernel(Kernel):
     ) -> MoeOutprojSpec:
         """Derive a ``MoeOutprojSpec`` from h_in + W_out + routing.
 
-        h_in: ``[M * top_k, H]``; W_out: ``[n_experts * D, H]``.
-        ``M`` can't be recovered from h_in's leading dim without
-        ``top_k``; caller passes both.
+        h_in: ``[total_slots, H]``; W_out: ``[n_experts * D, H]``;
+        work_list: ``[2 * total_slots / BM]``. ``M`` (per-token output
+        rows) and ``top_k`` aren't recoverable from the slot buffers
+        alone; callers pass them. The kernel itself doesn't read ``M``
+        — it's spec metadata used by ``moe_reduce`` downstream.
         """
-
+        del work_list  # shape captured implicitly via h_in's slot count
         if h_in.ndim != 2 or W_out.ndim != 2:
             raise ValueError(
                 f"pcf.moe_outproj: h_in, W_out must be rank-2; "
@@ -194,23 +202,42 @@ class MoeOutprojKernel(Kernel):
                 f"pcf.moe_outproj: W_out.shape[0] ({nW}) not divisible by n_experts ({n_experts})"
             )
         D = nW // n_experts
-        if int(token_ids.shape[0]) != total_slots:
-            raise ValueError(
-                f"pcf.moe_outproj: token_ids shape {tuple(token_ids.shape)} != "
-                f"h_in.shape[0] ({total_slots})"
-            )
         return MoeOutprojSpec(
             M=M,
             D=D,
             H=H,
             n_experts=n_experts,
             top_k=top_k,
-            a_dtype=DType.from_backend(h_in.dtype),
-            b_dtype=DType.from_backend(W_out.dtype),
+            a_dtype=DType.from_backend(h_in),
+            b_dtype=DType.from_backend(W_out),
             out_dtype=DType.coerce(out_dtype) or DType.BF16,
             compute_dtype=DType.coerce(compute_dtype),
             capacity=capacity,
         )
+
+    def autotune_input_key(self) -> tuple:
+        # ``work_list`` step is ``config.BM`` — the autotune harness
+        # rebuilds the test fixture per BM so configs sharing the
+        # same BM reuse one (inputs, reference) pair.
+        return (int(self.config.BM),)
+
+    def rebuild_autotune_inputs(self, base_inputs_np: dict) -> dict:
+        """Rebuild ``work_list`` at ``config.BM`` step. Other inputs
+        (h_in, W_out, token_ids, slot_weights) are unchanged.
+        """
+        import numpy as np
+
+        bm = int(self.config.BM)
+        spec = self.spec
+        total = spec.total_slots
+        slots_per_expert = spec.capacity
+        if total % bm != 0 or slots_per_expert is None or slots_per_expert % bm != 0:
+            return base_inputs_np
+        wl_entries = [
+            (grp_start, grp_start // slots_per_expert) for grp_start in range(0, total, bm)
+        ]
+        work_list = np.array(wl_entries, dtype=np.int32).reshape(-1)
+        return {**base_inputs_np, "work_list": work_list}
 
     @classmethod
     def tune_space(cls) -> dict[str, list]:
@@ -218,7 +245,10 @@ class MoeOutprojKernel(Kernel):
         # off (see Linear.prepare). Problems that explicitly need the
         # shuffled path can pin via config_overrides.
         return {
-            "BM": [32, 64],
+            # BM pinned to 32 to match ``moe_router_correct``'s
+            # hardcoded ``_BM=32`` work_list step. See the same note
+            # in ``moe_inproj/kernel.py::tune_space``.
+            "BM": [32],
             "BN": [64, 128, 256],
             "BK": [16, 32, 64, 128],
             "n_warps": [4, 8],
@@ -245,17 +275,14 @@ class MoeOutprojKernel(Kernel):
 
         # Sentinel-skip for ``moe_router_correct`` filler chunks. See
         # the matching note in moe_inproj — bitcast U32→S32 so the -1
-        # sentinel compares as signed.
+        # sentinel compares as signed. Inactive chunks just leave
+        # ``partials[grp_start..+BM, :]`` at whatever the consumer
+        # wrote previously; ``moe_reduce`` only reads slots indexed by
+        # ``token_slot_table``, which never points at sentinel chunks.
         is_valid = qk.cmp("ge", qk.bitcast(expert, DType.S32), bctx.c(0, dtype=DType.S32))
         with qk.if_(is_valid, carried=[]) as (_, _, arms):
             with arms.then_():
                 b_row_base = expert * s.D + n_base
-
-                toks = qk.index_cache("toks_cache", g.token_ids, count=c.BM, base=grp_start)
-                weights = qk.index_cache(
-                    "weights_cache", g.slot_weights, count=c.BM, base=grp_start, dtype=DType.F32
-                )
-                barrier("block")
 
                 stages = SmemPlan.staged_pairs(
                     compute_ir,
@@ -289,12 +316,18 @@ class MoeOutprojKernel(Kernel):
                     carry=acc,
                 ).run(n_iters=K_outer, n_stages=c.n_stages)
 
-                qk.atomic_store_acc(
-                    g.output,
+                # Plain bf16 store — ``[total_slots, D]`` partials at
+                # ``row=grp_start``. No scaling, no scatter; the
+                # downstream ``moe_reduce`` kernel folds in
+                # ``slot_weights`` and gathers per-token sums via
+                # ``token_slot_table``.
+                warp_col_base = n_base + bctx.warp_id * BN_per_warp
+                qk.store_acc(
+                    g.partials,
                     acc,
-                    col=n_base + bctx.warp_id * BN_per_warp,
-                    index=toks,
-                    weight=weights,
+                    row=grp_start,
+                    col=warp_col_base,
+                    cast=s.out_dtype,
                 )
                 qk.yield_()
             with arms.else_():

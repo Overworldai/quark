@@ -87,6 +87,15 @@ class MoeInprojKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
+        # Hard-rejct BM != 32: ``moe_router_correct`` emits work_list
+        # at a hardcoded 32-slot step and the inproj kernel reads one
+        # ``(grp_start, expert)`` pair per block. Any other BM produces
+        # silent miscompute (slots beyond the first 32 use the wrong
+        # expert). Catches cached on-disk configs from before the
+        # tune_space pin, which would otherwise survive a tune_space
+        # change.
+        if c.BM != 32:
+            return False
         if s.H % c.BN != 0 or s.D % c.BK != 0:
             return False
         try:
@@ -135,9 +144,9 @@ class MoeInprojKernel(Kernel):
         token_ids = (np.arange(total) % M).astype(np.int32)
         # One work_list entry per BM=32 slot chunk, labeled with the
         # expert that owns the chunk. Full coverage: every output slot
-        # gets written (matters on Metal where mx.fast.metal_kernel
-        # allocates outputs uninitialized and uncovered slots diverge
-        # from the reference).
+        # gets written (matters on Metal where the driver allocates
+        # outputs uninitialized and uncovered slots diverge from the
+        # reference).
         assert slots_per_expert is not None
         wl_entries = [
             (grp_start, grp_start // slots_per_expert) for grp_start in range(0, total, 32)
@@ -198,7 +207,7 @@ class MoeInprojKernel(Kernel):
                 f"pcf.moe_inproj: token_ids buffer ({ts}) too small for M*top_k "
                 f"({M * top_k}); need capacity*n_experts >= M*top_k"
             )
-        a_dt = DType.from_backend(X.dtype)
+        a_dt = DType.from_backend(X)
         return MoeInprojSpec(
             M=M,
             D=D,
@@ -206,11 +215,38 @@ class MoeInprojKernel(Kernel):
             n_experts=n_experts,
             top_k=top_k,
             a_dtype=a_dt,
-            b_dtype=DType.from_backend(W_in.dtype),
+            b_dtype=DType.from_backend(W_in),
             out_dtype=DType.coerce(out_dtype) or a_dt,
             compute_dtype=DType.coerce(compute_dtype),
             capacity=capacity,
         )
+
+    def autotune_input_key(self) -> tuple:
+        # ``work_list`` step is ``config.BM`` — the autotune harness
+        # rebuilds the test fixture per BM so configs sharing the
+        # same BM reuse one (inputs, reference) pair.
+        return (int(self.config.BM),)
+
+    def rebuild_autotune_inputs(self, base_inputs_np: dict) -> dict:
+        """Rebuild ``work_list`` at ``config.BM`` step. Other tensors
+        (X, W_in, token_ids) are unchanged — only the work_list shape
+        depends on BM.
+        """
+        import numpy as np
+
+        bm = int(self.config.BM)
+        spec = self.spec
+        total = spec.total_slots
+        slots_per_expert = spec.capacity
+        if total % bm != 0 or slots_per_expert is None or slots_per_expert % bm != 0:
+            # Spec/config mismatch — fall through to base; ``is_valid``
+            # catches it before launch anyway.
+            return base_inputs_np
+        wl_entries = [
+            (grp_start, grp_start // slots_per_expert) for grp_start in range(0, total, bm)
+        ]
+        work_list = np.array(wl_entries, dtype=np.int32).reshape(-1)
+        return {**base_inputs_np, "work_list": work_list}
 
     @classmethod
     def tune_space(cls) -> dict[str, list]:
@@ -226,7 +262,16 @@ class MoeInprojKernel(Kernel):
         # off (see Linear.prepare). Problems that explicitly need the
         # shuffled path can pin via config_overrides.
         return {
-            "BM": [32, 64],
+            # BM pinned to 32 to match ``moe_router_correct``'s
+            # hardcoded ``_BM=32`` work_list step. Each kernel block
+            # reads one ``(grp_start, expert)`` pair and processes
+            # ``BM`` slots; with BM != 32 the routing for slots beyond
+            # the first 32 of the block comes from the wrong work_list
+            # entry and the kernel silently uses the wrong expert.
+            # Lifting to BM=64 would require threading BM through the
+            # router spec so all three kernels (router/inproj/outproj)
+            # agree on the same step.
+            "BM": [32],
             "BN": [64, 128, 256],
             "BK": [16, 32, 64, 128],
             "n_warps": [4, 8],

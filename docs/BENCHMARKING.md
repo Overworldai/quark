@@ -159,4 +159,8 @@ Per-kernel table with columns:
 - `Status` — `ok` / `ERR:<type>: <message>` / `slow` warnings.
 
 Baselines appear as additional rows labelled with the baseline name
-(`mx.fast.sdpa[bf16]`, `torch._scaled_mm[e4m3]`, etc.).
+(`torch.nn.functional.scaled_dot_product_attention[bf16]`,
+`torch._scaled_mm[e4m3]`, etc.). Most kernels' `baselines.py` is
+stubbed empty by default since the numpy-refs migration dropped torch
+as a runtime dep — wire a conditional torch import in the kernel's
+``baselines.py`` to re-enable a backend-fast comparison row.

@@ -8,6 +8,8 @@ benefit.
 
 from __future__ import annotations
 
+import sys
+
 from quark.nn.module import (
     Module,
     Parameter,
@@ -15,6 +17,220 @@ from quark.nn.module import (
     _tensor,
     _zeros,
 )
+
+_IS_METAL = sys.platform == "darwin"
+
+
+def _quark_dtype(t) -> str:
+    """Return ``t``'s quark dtype string regardless of backend.
+
+    QuarkTensor on CUDA exposes ``.dtype = "bf16"`` (string). Metal
+    carriers are numpy arrays where ``.dtype`` is ``uint16`` etc., so
+    fall back to the ``quark_dtype`` tag, then to a numpy-name map.
+    """
+    qd = getattr(t, "quark_dtype", None)
+    if isinstance(qd, str):
+        return qd
+    raw = getattr(t, "dtype", None)
+    if isinstance(raw, str):
+        return raw
+    name = getattr(raw, "name", str(raw))
+    return {
+        "uint16": "bf16",
+        "float16": "f16",
+        "float32": "f32",
+        "int32": "s32",
+        "int64": "s64",
+        "uint8": "u8",
+        "int8": "s8",
+    }.get(name, name)
+
+
+class _TaggedNdarray:
+    """Lazy import of the ndarray subclass used to tag carriers on Metal."""
+
+    _cls = None
+
+    @classmethod
+    def get(cls):
+        if cls._cls is None:
+            import numpy as np
+
+            class _Tagged(np.ndarray):
+                def __array_finalize__(self, obj):
+                    if obj is None:
+                        return
+                    self.quark_dtype = getattr(obj, "quark_dtype", None)
+
+            cls._cls = _Tagged
+        return cls._cls
+
+
+def _tag_carrier(arr, dtype: str):
+    """Tag a numpy carrier array with ``quark_dtype = dtype``."""
+    out = arr.view(_TaggedNdarray.get())
+    out.quark_dtype = dtype
+    return out
+
+
+def _set_s32(t, value: int) -> None:
+    """Write a single-element s32 tensor to ``value`` (Metal-aware)."""
+    if _IS_METAL:
+        # Numpy carrier — write directly via ctypes.
+        import ctypes
+
+        bits = (int(value) & 0xFFFFFFFF).to_bytes(4, "little")
+        if hasattr(t, "metal_handle") or hasattr(t, "data_ptr"):
+            ctypes.memmove(t.data_ptr(), bits, 4)
+        else:
+            # Plain numpy carrier — overwrite in place.
+            import numpy as np
+
+            t[...] = np.frombuffer(bits, dtype=np.int32 if t.dtype == np.int32 else np.uint32)[0]
+        return
+    from quark.runtime.cuda import CudaRuntime
+
+    CudaRuntime.instance().memset_d32(t.data_ptr(), int(value) & 0xFFFFFFFF, 1, stream=0)
+
+
+def _pad_rows(x, target_M: int):
+    """Pad ``x`` from ``M`` to ``target_M`` rows with zeros.
+
+    Backend-agnostic: numpy on Metal (only when ``x`` is a host
+    ndarray), ``QuarkTensor`` on CUDA. For Metal QuarkTensor inputs
+    (the hot path — outputs of a previous kernel, possibly mid-lazy-
+    queue), a Metal-side row-pad kernel is queued so the pad runs
+    *after* the producer kernel without forcing an eval-queue flush.
+    Earlier the helper called ``x.to_numpy()`` mid-forward, which
+    flushed the entire pending lazy queue (~5 ms of GPU stall per
+    call). Profile showed 40 calls per forward = 200 ms of pure
+    stall.
+    """
+    M = int(x.shape[0])
+    if target_M <= M:
+        return x, M
+    if _IS_METAL:
+        import numpy as np
+
+        qd = _quark_dtype(x)
+        # Path A — caller passed a host numpy array. Cheap concat,
+        # no GPU flush. (Used by ControllerInputEmbedding for the
+        # always-host ctrl_input.)
+        if not hasattr(x, "metal_handle"):
+            carrier_dt = {
+                "bf16": np.uint16,
+                "f16": np.float16,
+                "f32": np.float32,
+                "s32": np.int32,
+                "u8": np.uint8,
+                "s8": np.int8,
+                "e4m3": np.uint8,
+                "e5m2": np.uint8,
+                "u16": np.uint16,
+            }.get(qd, np.uint16)
+            x_np = np.asarray(x)
+            pad = np.zeros((target_M - M, int(x.shape[1])), dtype=carrier_dt)
+            out = np.concatenate([x_np, pad], axis=0)
+            return _tag_carrier(out, qd), M
+        # Path B — QuarkTensor from a prior kernel. Queue a
+        # Metal-side pad-and-copy that runs in the lazy queue.
+        return _metal_pad_rows(x, target_M, qd), M
+    from quark.runtime.tensor import QuarkTensor
+
+    pad = QuarkTensor.zeros(target_M - M, int(x.shape[1]), dtype=_quark_dtype(x))
+    out = QuarkTensor.cat([x, pad], dim=0)
+    return out, M
+
+
+def _metal_pad_rows(x, target_M: int, qd: str):
+    """Queue a Metal kernel that pads ``x`` (M, K) → (target_M, K) with
+    zero rows, runs after ``x``'s producer in the lazy queue.
+
+    Allocates a fresh pool buffer for the output. The kernel writes
+    M valid rows + (target_M - M) zero rows. Caller never blocks on
+    ``x``'s data.
+    """
+    import numpy as np
+
+    from quark.drivers import _metal_dispatch as _md
+    from quark.runtime.tensor import QuarkTensor, _contiguous_strides, _MetalStorage
+
+    M = int(x.shape[0])
+    K = int(x.shape[1])
+    elem_size = {
+        "bf16": 2,
+        "f16": 2,
+        "f32": 4,
+        "s32": 4,
+        "u8": 1,
+        "s8": 1,
+        "e4m3": 1,
+        "e5m2": 1,
+    }.get(qd, 2)
+
+    # Compile the kernel once per elem_size, cache it.
+    cache = _metal_pad_rows._cache  # type: ignore[attr-defined]
+    pipeline = cache.get(elem_size)
+    if pipeline is None:
+        type_map = {1: "uchar", 2: "ushort", 4: "uint"}
+        t = type_map[elem_size]
+        name = f"pad_rows_{elem_size}"
+        src = (
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            f"kernel void {name}(\n"
+            f"    device const {t}* src   [[buffer(0)]],\n"
+            f"    device {t}*       dst   [[buffer(1)]],\n"
+            "    constant int* meta [[buffer(2)]],\n"
+            "    uint tid [[thread_position_in_grid]])\n"
+            "{\n"
+            "    int M = meta[0];\n"
+            "    int K = meta[1];\n"
+            "    int target = meta[2];\n"
+            "    int total = target * K;\n"
+            "    if ((int)tid >= total) return;\n"
+            "    int row = (int)tid / K;\n"
+            "    int col = (int)tid % K;\n"
+            f"    dst[tid] = (row < M) ? src[row * K + col] : ({t})0;\n"
+            "}\n"
+        )
+        pipeline = _md.compile(src, name, 196610)
+        cache[elem_size] = pipeline
+
+    # Pack metadata. Keep the array alive until eval_queue runs.
+    meta = np.array([M, K, target_M], dtype=np.int32)
+    from quark.functional._dispatch import _copy_strided_meta
+
+    _copy_strided_meta.append(meta)
+
+    out_nbytes = target_M * K * elem_size
+    plan = [(0, 0, 0), (1, 0, 1), (0, 1, 2)]
+    total_threads = target_M * K
+    tg_size = min(256, total_threads)
+    grid = (total_threads, 1, 1)
+
+    src_handle = int(x.metal_handle)
+    out_handle, out_ptr = _md.queue_launch(
+        pipeline,
+        [src_handle, -1],  # input handles (src lazy + meta eager)
+        [0, int(meta.ctypes.data)],  # input ptrs
+        [0, int(meta.nbytes)],  # input nbytes
+        out_nbytes,
+        plan,
+        grid,
+        (tg_size, 1, 1),
+        0,  # smem
+    )
+
+    storage = _MetalStorage(out_handle, out_ptr, out_nbytes)
+    out_shape = (target_M, K)
+    qt = QuarkTensor(storage, out_shape, _contiguous_strides(out_shape), 0, qd)
+    # ``QuarkTensor`` doesn't carry the quark_dtype string in the same
+    # attribute spot as numpy carriers, but its ``.dtype`` already returns
+    # the short string "bf16" / etc., so callers' ``_quark_dtype`` resolves.
+    return qt
+
+
+_metal_pad_rows._cache = {}  # type: ignore[attr-defined]
 
 
 def _cached_out_buf(module, shape, dtype):
@@ -26,6 +242,7 @@ def _cached_out_buf(module, shape, dtype):
     Linear uses in ``_out_buf``). Cache key is ``(shape, dtype)``: each
     distinct shape (e.g. attn x vs mlp x) gets its own buffer. Kernel
     writes every element, so we don't zero — ``empty`` is enough.
+
     """
     cache = getattr(module, "_out_buf_cache", None)
     if cache is None:
@@ -96,14 +313,14 @@ class Linear(Module):
     _BM_MIN = 16  # minimum M for GEMM tile
 
     def _out_buf(self, M_eff: int):
-        """Return a cached, pre-zeroed ``[M_eff, out_features]`` buffer.
+        """Return a cached ``[M_eff, out_features]`` buffer.
 
-        Zeroing every call is a ~5 µs device memset that pays for
-        correctness under any split-K winner (atomic-add epilogue
-        accumulates onto existing contents). The real per-call cost
-        we're avoiding here is the ``cuMemAllocAsync`` + free — the
-        cache makes the alloc happen once per M and the zero is just
-        cheap bookkeeping.
+        On CUDA we zero every call to pay for correctness under
+        split-K winners (atomic-add epilogues accumulate onto existing
+        contents). On Metal the NAX gemm fast path doesn't honor
+        ``out=`` and writes to a fresh transient — Linear's cached
+        buffer is unused on the hot path, so skip the per-call CPU
+        memset (~5 µs / call × 96 Linear calls / forward).
         """
         cache = getattr(self, "_out_cache", None)
         if cache is None:
@@ -116,16 +333,20 @@ class Linear(Module):
             out_f = int(self.weight.data.shape[0])
             buf = QuarkTensor.zeros(M_eff, out_f, dtype=self._out_dtype)
             cache[M_eff] = buf
-        else:
-            # Call the tensor method directly. ``PT.zero_`` routes
-            # through ``PT._is_mx(x)`` which does ``import mlx.core``
-            # every call — on CUDA (no mlx installed) the ImportError
-            # raise + catch is ~140 µs per call. Tensor.zero_() is
-            # the raw ``cuMemsetD8Async`` in ~4 µs.
+        elif not _IS_METAL:
             buf.zero_()
         return buf
 
-    def forward(self, x, *, activation: str | None = None, bias=None):
+    def forward(
+        self,
+        x,
+        *,
+        activation: str | None = None,
+        bias=None,
+        gate=None,
+        residual=None,
+        gate_groups: int = 1,
+    ):
         """``y = activation(x @ weight.T + bias?)``.
 
         ``activation``: optional fused activation passed through to the
@@ -139,21 +360,33 @@ class Linear(Module):
         into the GEMM epilogue (e.g. ``MLPFusion`` adding ``cond @ Wc.T``
         into ``x @ Wx.T`` for free). Mutually exclusive with the
         constructor's ``bias=True`` path.
+
+        ``gate`` + ``residual`` (both required together): fold an
+        AdaGate-residual epilogue into the GEMM —
+        ``y = residual + gate_bcast * (x @ weight.T)``. Mutually
+        exclusive with ``bias`` (the GEMM kernel only fuses one
+        epilogue at a time today). Skips the cached output buffer
+        because the kernel writes the post-combine result directly,
+        and skips the M-padding shortcut since the residual would
+        also have to be padded — kernels using gate/residual fusion
+        always have M ≥ the kernel's BM_MIN in the wired layers
+        (Waypoint's tpf=128). NAX-only on Metal; the non-NAX
+        ``store_acc`` epilogue handles other shapes.
         """
         import quark.functional as pcf
 
-        b_dtype = (
-            self.weight.data.dtype
-            if isinstance(self.weight.data.dtype, str)
-            else str(self.weight.data.dtype)
-        )
+        fused_gate = gate is not None and residual is not None
+        if fused_gate and bias is not None:
+            raise ValueError("Linear.forward: gate/residual fusion is incompatible with bias")
+
+        b_dtype = _quark_dtype(self.weight.data)
 
         # Activation dtype must already match the compute requirements —
         # silent casts used to live here but masked model-wiring bugs,
         # so we raise instead. The caller is responsible for feeding
         # Linear the dtype that matches its weight (or f16/bf16 for fp8
         # weights, which do the narrow-cast inside the MMA itself).
-        a_dtype = x.dtype if isinstance(x.dtype, str) else str(x.dtype)
+        a_dtype = _quark_dtype(x)
         is_fp8_weight = b_dtype in ("e4m3", "e5m2")
 
         # Linear accepts any half / fp8 activation. When a_dtype != b_dtype
@@ -181,10 +414,7 @@ class Linear(Module):
         M = int(x.shape[0])
         needs_pad = M < self._BM_MIN
         if needs_pad:
-            from quark.runtime.tensor import QuarkTensor
-
-            pad = QuarkTensor.zeros(self._BM_MIN - M, int(x.shape[1]), dtype=x.dtype)
-            x = QuarkTensor.cat([x, pad], dim=0)
+            x, _ = _pad_rows(x, self._BM_MIN)
         M_eff = int(x.shape[0])
 
         kw = {
@@ -195,6 +425,26 @@ class Linear(Module):
             kw["activation"] = activation
         if is_fp8_weight or a_dtype != b_dtype:
             kw["compute_dtype"] = b_dtype
+
+        if fused_gate:
+            # The fused-gate-residual epilogue writes the final post-
+            # combine output, not the bare GEMM result, so we skip the
+            # cached out=. M-padding is also skipped (residual must
+            # match the unpadded M).
+            if needs_pad:
+                raise NotImplementedError(
+                    "Linear.forward: gate/residual fusion does not yet "
+                    "support M-padding (M < BM_MIN). Hits in production "
+                    "would need a pad-aware residual layout."
+                )
+            return pcf.gemm(
+                x,
+                self.weight.data,
+                gate=gate,
+                residual=residual,
+                gate_groups=gate_groups,
+                **kw,
+            )
 
         out = self._out_buf(M_eff)
         if self._has_bias and bias is not None:
@@ -329,6 +579,33 @@ class Unpatchify(Module):
         )
 
 
+def _maybe_cached_out(module, shape, dtype):
+    """Return a cached output buffer on every backend.
+
+    Earlier this function returned ``None`` on Metal so the leaf
+    modules (AdaRMSNorm / AdaGateResidual / RMSNorm / SiLU) would
+    skip ``out=`` and let ``pcf.*`` route through ``queue_launch_ir``.
+    That path was a measured ~3× speedup but produces token-uniform
+    output for at least the AdaRMSNorm and AdaGateResidual fast
+    paths in the current kernel + dispatcher combo on M5 Max
+    (every spatial position converges to the same per-channel
+    value). Bisected by selectively forcing classes back onto the
+    cached-out path: forcing *either* AdaRMSNorm or AdaGateResidual
+    alone is enough to restore correct output, which points at a
+    shared queue_launch_ir bug rather than a per-kernel issue.
+
+    Until that's tracked down, prefer correctness over throughput
+    and use the cached-out / ``call_with_bindings`` path on every
+    backend. ``QUARK_FORCE_FASTPATH=1`` re-enables the (broken)
+    Metal fast path for benchmark experiments.
+    """
+    import os
+
+    if _IS_METAL and os.environ.get("QUARK_FORCE_FASTPATH") == "1":
+        return None
+    return _cached_out_buf(module, shape, dtype)
+
+
 class AdaRMSNorm(Module):
     """Stateless — no learnable params. Scale/bias are passed as arguments.
 
@@ -338,7 +615,7 @@ class AdaRMSNorm(Module):
     def forward(self, x, scale, bias, *, activation=None):
         import quark.functional as pcf
 
-        out = _cached_out_buf(self, tuple(x.shape), x.dtype)
+        out = _maybe_cached_out(self, tuple(x.shape), x.dtype)
         return pcf.ada_rmsnorm(x, scale, bias, activation=activation, out=out)
 
 
@@ -348,7 +625,7 @@ class AdaGateResidual(Module):
     def forward(self, x, y, gate):
         import quark.functional as pcf
 
-        out = _cached_out_buf(self, tuple(x.shape), x.dtype)
+        out = _maybe_cached_out(self, tuple(x.shape), x.dtype)
         return pcf.ada_gate_residual(x, y, gate, out=out)
 
 
@@ -361,7 +638,7 @@ class HeadRMSNorm(Module):
     def forward(self, qkv):
         import quark.functional as pcf
 
-        out = _cached_out_buf(self, tuple(qkv.shape), qkv.dtype)
+        out = _maybe_cached_out(self, tuple(qkv.shape), qkv.dtype)
         return pcf.head_rmsnorm(qkv, n_q_heads=self._nq, n_kv_heads=self._Hk, Dh=self._Dh, out=out)
 
 
@@ -371,7 +648,7 @@ class RMSNorm(Module):
     def forward(self, x):
         import quark.functional as pcf
 
-        out = _cached_out_buf(self, tuple(x.shape), x.dtype)
+        out = _maybe_cached_out(self, tuple(x.shape), x.dtype)
         return pcf.rmsnorm(x, out=out)
 
 
@@ -388,7 +665,7 @@ class Add(Module):
     def forward(self, x, y):
         from quark.runtime.kernels import elemwise_binary
 
-        out = _cached_out_buf(self, tuple(x.shape), x.dtype)
+        out = _maybe_cached_out(self, tuple(x.shape), x.dtype)
         return elemwise_binary("add", x, y, out=out)
 
 
@@ -403,7 +680,7 @@ class SiLU(Module):
     def forward(self, x):
         import quark.functional as pcf
 
-        out = _cached_out_buf(self, tuple(x.shape), x.dtype)
+        out = _maybe_cached_out(self, tuple(x.shape), x.dtype)
         return pcf.silu(x, out=out)
 
 
@@ -416,19 +693,19 @@ class EulerStep(Module):
     def forward(self, x, v, dsig):
         import quark.functional as pcf
 
-        out = _cached_out_buf(self, tuple(x.shape), x.dtype)
+        out = _maybe_cached_out(self, tuple(x.shape), x.dtype)
         return pcf.euler_step(x, v, dsig, out=out)
 
 
 class MLP(Module):
     """Two-layer MLP: ``fc2(silu(fc1(x)))``.
 
-    SiLU runs as a separate ``pcf.silu`` call rather than fused into
-    fc1's GEMM epilogue. The custom kernel's fused-silu epilogue rules
-    out cuBLAS (cublasLtMatmul has no silu fusion) and cuBLAS beats
-    the custom GEMM on every shape we care about — the extra silu
-    launch is a rounding error vs. the GEMM gap. If perf ever pushes
-    us the other way, revive fusion behind a flag.
+    Metal: silu fused into fc1's NAX-GEMM epilogue (in-register on the
+    F32 accumulators before the bf16 store). Saves one kernel launch
+    plus the bf16-read/bf16-write of the standalone silu kernel
+    (~256 KB per layer for the 128×8192 hidden activation). Other
+    backends keep the unfused fc1 → silu → fc2 chain because
+    cublasLtMatmul has no silu epilogue.
 
     ``hidden_out_dtype``: optional override for fc1's output dtype.
     Default tracks ``out_dtype``. fc2's output dtype is always
@@ -447,10 +724,37 @@ class MLP(Module):
         mid_dt = hidden_out_dtype if hidden_out_dtype is not None else out_dtype
         self.fc1 = Linear(d_in, d_mid, out_dtype=mid_dt)
         self.fc2 = Linear(d_mid, d_out, out_dtype=out_dtype)
+        # Kept for the cuBLAS path where Linear can't fuse silu.
         self.silu = SiLU()
 
-    def forward(self, x):
-        return self.fc2(self.silu(self.fc1(x)))
+    def forward(self, x, *, gate=None, residual=None, gate_groups: int = 1):
+        """``y = fc2(silu(fc1(x)))``, optionally folding an
+        AdaGate-residual epilogue into ``fc2``: when ``gate`` and
+        ``residual`` are both provided, returns
+        ``residual + gate_bcast * fc2(silu(fc1(x)))`` in one fc2 dispatch.
+        """
+        if _IS_METAL:
+            return self.fc2(
+                self.fc1(x, activation="silu"),
+                gate=gate,
+                residual=residual,
+                gate_groups=gate_groups,
+            )
+        # Non-Metal: cuBLAS has no silu epilogue so the fc1→silu→fc2
+        # chain stays unfused, but fc2's gate/residual still routes
+        # through Linear → pcf.gemm → GemmKernel.build()'s
+        # ``qk.store_acc(gate=, residual=)`` epilogue, which folds the
+        # AdaGate-residual into the GEMM tail (scalar gmem stores —
+        # the NAX-fused ``StoreMatrixGateResidualOp`` is Metal-only,
+        # but the unfused ``store_acc`` path doesn't need it). Saves
+        # the standalone ``AdaGateResidualKernel`` dispatch + the
+        # bf16 round-trip on the post-MLP residual.
+        return self.fc2(
+            self.silu(self.fc1(x)),
+            gate=gate,
+            residual=residual,
+            gate_groups=gate_groups,
+        )
 
 
 class ControllerInputEmbedding(Module):
@@ -485,21 +789,11 @@ class ControllerInputEmbedding(Module):
 
     def forward(self, ctrl_input):
         """``ctrl_input``: [1, padded_in] tensor."""
-        from quark.runtime.tensor import QuarkTensor
-
         # Pad M to BM_MIN to avoid the fc1 Linear padding path.
-        M = int(ctrl_input.shape[0])
-        BM_MIN = Linear._BM_MIN
-        if M < BM_MIN:
-            pad = QuarkTensor.zeros(BM_MIN - M, int(ctrl_input.shape[1]), dtype=ctrl_input.dtype)
-            x = QuarkTensor.cat([ctrl_input, pad], dim=0)
-        else:
-            x = ctrl_input
-
+        x, M = _pad_rows(ctrl_input, Linear._BM_MIN)
         h = self.silu(self.fc1(x))
         out = self.fc2(h)
-
-        if M < BM_MIN:
+        if M < Linear._BM_MIN:
             return out[:M]
         return out
 
@@ -609,23 +903,22 @@ class KVCacheUpdate(Module):
         ft = frame_t if frame_t is not None else self.frame_t
 
         # Set frozen flag on device tensor.
-        if frozen:
-            from quark.runtime.cuda import CudaRuntime
+        _set_s32(self.frozen, 1 if frozen else 0)
+        frozen_buf = self.frozen
 
-            CudaRuntime.instance().memset_d32(self.frozen.data_ptr(), 1, 1, stream=0)
-        else:
-            from quark.runtime.cuda import CudaRuntime
-
-            CudaRuntime.instance().memset_d32(self.frozen.data_ptr(), 0, 1, stream=0)
-
-        # On CUDA the kernel mutates buffers in-place. Don't reassign
-        # from the return values — they may be stale copies if
-        # prepare_launch_tensors created intermediates.
+        # In-place RMW. On Metal the launcher routes role="out" tensors
+        # back to the caller's pinned QuarkTensor handle when they appear
+        # in ``provided`` (see ``persistent_outs`` in
+        # ``functional._dispatch.call_with_bindings`` →
+        # ``Launcher._launch_metal``), so the kernel's writes land on the
+        # same buffer self.K_cache / self.Vt_cache / self.segments /
+        # self.n_segments hold. No reassignment needed; the in-place
+        # contract here mirrors CUDA's.
         pcf.kv_cache_update(
             qkv,
             qkv,
             ft,
-            self.frozen,
+            frozen_buf,
             self.Vt_cache,
             self.segments,
             self.n_segments,
@@ -642,6 +935,19 @@ class KVCacheUpdate(Module):
         from quark.runtime.tensor import QuarkTensor
 
         if isinstance(self.frame_t, QuarkTensor):
+            if _IS_METAL:
+                # Metal pool buffer is host-shared; serialize with any
+                # pending kernel writes, then memmove the s32 pattern.
+                # ``CudaRuntime`` is unavailable on macOS — routing
+                # through it would raise CudaError(LIBRARY_NOT_FOUND).
+                import ctypes
+
+                from quark.runtime.sync import synchronize
+
+                synchronize()
+                bits = (int(value) & 0xFFFFFFFF).to_bytes(4, "little")
+                ctypes.memmove(self.frame_t.data_ptr(), bits, 4)
+                return
             from quark.runtime.cuda import CudaRuntime
 
             CudaRuntime.instance().memset_d32(
@@ -652,8 +958,15 @@ class KVCacheUpdate(Module):
 
     def reset(self, stream: int = 0) -> None:
         """Zero the ring buffers and rewind frame_t. Async on ``stream``."""
-        self.K_cache.zero_()
-        self.Vt_cache.zero_()
+        for buf in (self.K_cache, self.Vt_cache):
+            if hasattr(buf, "zero_"):
+                # CUDA QuarkTensor — async device-side memset.
+                buf.zero_()
+            else:
+                # Metal numpy carrier (tagged ndarray). Fill in place
+                # via numpy; the kernel-dispatch path picks it up on
+                # the next forward without a buffer-cache invalidation.
+                buf.fill(0)
         self.set_frame_t(0, stream=stream)
 
 

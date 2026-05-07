@@ -2,9 +2,9 @@
     uint _pc_u32_1 = 16u;
     uint _pc_u32_2 = 1u;
     float _pc_f32_0 = as_type<float>(0x00000000u);
-    float _pc_f32_1 = as_type<float>(0x3f800000u);
-    float _pc_f32_2 = _pc_f32_0;
+    float _pc_f32_1 = _pc_f32_0;
     for (uint _pc_u32_3 = _pc_u32_0; _pc_u32_3 < _pc_u32_1; _pc_u32_3 += _pc_u32_2) {
-        float _pc_f32_3 = _pc_f32_2 + _pc_f32_1;
-        _pc_f32_2 = _pc_f32_3;
+        float _pc_f32_2 = as_type<float>(0x3f800000u);
+        float _pc_f32_3 = _pc_f32_1 + _pc_f32_2;
+        _pc_f32_1 = _pc_f32_3;
     }

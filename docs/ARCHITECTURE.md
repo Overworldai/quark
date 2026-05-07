@@ -198,17 +198,19 @@ from quark.runtime.tensor import QuarkTensor
 A = QuarkTensor.randn(M, K, dtype="bf16")
 C = pcf.gemm(A, B)                     # QuarkTensor in, QuarkTensor out
 
-# Baseline / reference (test / autotune correctness gate)
-from quark.backend import PT
-A_ref = PT.randn(M, K, dtype=PT.bfloat16)
-C_ref = PT.matmul(A_ref, PT.transpose(B_ref))
+# Reference (test / autotune correctness gate) — pure numpy
+import numpy as np
+
+A_ref = np.random.randn(M, K).astype(np.float32)
+C_ref = A_ref @ B_ref.T
 ```
 
-On Metal the two collapse to a single `mx.array` path — MLX is the
-only half-precision device tensor available. See
-[BACKEND.md](BACKEND.md) for the full `PT` surface and
-[WEIGHTS.md](WEIGHTS.md) for how parameters reach device via the
-`QuarkTensor` path.
+On Metal the same `QuarkTensor` runtime path applies — the legacy
+`mx.array` interop was removed when the native metal-cpp + nanobind
+driver landed. References are plain numpy (the per-kernel
+`reference.py` files use `quark.runtime.npconv.to_f32_numpy` to
+upcast device tensors); see [WEIGHTS.md](WEIGHTS.md) for how
+parameters reach device via the `QuarkTensor` path.
 
 ## Autotune
 

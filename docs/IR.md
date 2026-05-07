@@ -397,4 +397,4 @@ Perf warnings are off by default; enable with `QUARK_ENABLE_PERF_WARNINGS=1`.
 ## See also
 
 - [BLOCKS.md](BLOCKS.md) — higher-level composition (L0 / L1 / L2)
-- [BACKEND.md](BACKEND.md) — PT polymorphic tensor API
+- [ARCHITECTURE.md](ARCHITECTURE.md) — pipeline, runtime tensor types, dispatch

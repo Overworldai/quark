@@ -303,21 +303,25 @@ def _max_value_id(fn: Any) -> int:
     """Return the largest ``Value.id`` reachable from the function's
     op graph, or ``-1`` if there are no ops / no Values.
 
-    Walks each op's operands and results at the top-level region.
-    Param Values are picked up implicitly — real code references
-    them via some op's operand tuple (a function with orphan
-    params has no Values the rewriter could collide with, so
-    seeding from ``-1 + 1 == 0`` is still safe).
-
-    Nested regions (if / for-loop bodies) are skipped for now
-    because no legalization rewrite today emits ops into nested
-    regions. When one does, this walk gets a recursive variant."""
+    Recurses into nested regions (if / for-loop bodies). The MoE
+    kernels wrap their whole body in a sentinel-skip ``IfRegionOp``,
+    so every ConstOp / AsyncCopy lives one region down — a top-level
+    walk would return ``-1`` and a subsequent ``_legalize_async``
+    rewrite would mint VecLoad Values starting at id 0, colliding
+    with the existing nested ids."""
     max_id = -1
-    for op in fn.body.ops:
-        for v in op.results:
-            if v.id > max_id:
-                max_id = v.id
-        for v in op.operands:
-            if v.id > max_id:
-                max_id = v.id
+
+    def walk(ops: list[Op]) -> None:
+        nonlocal max_id
+        for op in ops:
+            for v in op.results:
+                if v.id > max_id:
+                    max_id = v.id
+            for v in op.operands:
+                if v.id > max_id:
+                    max_id = v.id
+            for region in op.regions:
+                walk(region.ops)
+
+    walk(fn.body.ops)
     return max_id

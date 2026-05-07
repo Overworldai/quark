@@ -13,6 +13,13 @@ Architecture:
   - ``MmaBody(acc=, BK=)`` is callable as ``mma(ictx)`` for
     the K consume loop.
   - ``qk.store_acc`` epilogue, dtype-generic.
+
+EXEMPT FROM 500-LINE RULE: the GEMM kernel ties together its IR-emit
+``build_metal``/``build_ptx``, the autotune ``tune_space`` /
+``alt_configs`` / ``force_alt_config`` triplet, and the cuBLAS-vs-PTX
+``dispatch_alt_config`` hook. All four reach into the shared GemmSpec
++ GemmConfig dataclasses; splitting them would mean exporting that
+state across module boundaries.
 """
 
 from __future__ import annotations
@@ -64,6 +71,19 @@ class GemmKernel(Kernel):
             dtype=lambda s, c: s.out_dtype,
             shape=lambda s, c: (s.N,) if s.has_bias else (1,),
         ),
+        # Gate / Residual: only meaningful when has_gate_residual=True;
+        # collapse to (1,) when off so the kernel doesn't pay the metadata
+        # cost on the bias-only / plain-GEMM path. Mirrors the Bias slot.
+        TensorDecl(
+            "Gate",
+            dtype=lambda s, c: s.out_dtype,
+            shape=lambda s, c: (s.G, s.N) if s.has_gate_residual else (1,),
+        ),
+        TensorDecl(
+            "Residual",
+            dtype=lambda s, c: s.out_dtype,
+            shape=lambda s, c: (s.M, s.N) if s.has_gate_residual else (1,),
+        ),
         TensorDecl(
             "Out", dtype=lambda s, c: s.out_dtype, shape=lambda s, c: (s.M, s.N), role="out"
         ),
@@ -89,6 +109,55 @@ class GemmKernel(Kernel):
             mma = self._mma_cfg()
         except KeyError:
             return False
+        # NAX path: validates only the NAX-shaped tile constraints. The
+        # default ``_validate_gemm_tile`` enforces simdgroup_matrix's
+        # per-warp N-partition (``(BN//shape.n) % n_warps == 0``) which
+        # doesn't match NAX's 2D warp layout (WM × WN). The NAX
+        # ``build_metal`` only handles the explicit (n_warps, BM, BN, BK)
+        # combos below; reject anything else.
+        if mma.shape.name in ("m16n32k16_nax_bf16", "m32n32k16_nax_bf16"):
+            if s.has_bias or c.split_k > 1:
+                return False
+            if s.activation is not None and s.activation != "silu":
+                return False
+            compute = s.compute_dtype_resolved
+            if mma.shape.a_dtype is not compute or mma.shape.b_dtype is not compute:
+                return False
+            if c.n_warps not in (1, 8, 16):
+                return False
+            # Compute SM/SN for the chosen warp layout; the picked
+            # main_shape must evenly tile into the per-simdgroup tile.
+            n_sg = c.n_warps
+            if n_sg == 16:
+                WM, WN = 4, 4
+            elif n_sg == 8:
+                WM, WN = 2, 4
+            elif n_sg == 1:
+                WM, WN = 1, 1
+            else:
+                WM, WN = 1, n_sg
+            if c.BM % WM != 0 or c.BN % WN != 0:
+                return False
+            SM = c.BM // WM
+            SN = c.BN // WN
+            M_frag = int(mma.shape.m)
+            N_frag = int(mma.shape.n)
+            if SM % M_frag != 0 or SN % N_frag != 0:
+                return False
+            if c.n_warps == 1:
+                # Single-simdgroup path is wired only for the m=16 shape;
+                # m=32 single-warp could be added but the multi-warp path
+                # is the realistic 720p use case.
+                if mma.shape.name != "m16n32k16_nax_bf16":
+                    return False
+                return (c.BM, c.BN, c.BK) == (16, 32, 16)
+            # Multi-warp. BK ≤ 64 (tested up to 256 with
+            # BaseNAXFrag::load — still degrades; Apple's runtime
+            # compile of large bodies can't match MLX's pre-compiled
+            # metallib at BK ≥ 128).
+            if c.BM not in (64, 128) or c.BN not in (128, 256):
+                return False
+            return c.BK in (16, 32, 64) and s.K % c.BK == 0
         # The kernel's build() casts A/B on load to ``compute_dtype_resolved``
         # and lays out smem as that dtype. The MMA fragment loads then
         # read smem with the layout of ``mma_cfg.shape``. If the config
@@ -133,7 +202,7 @@ class GemmKernel(Kernel):
             # silu is nonlinear). Reject the combo; the full-precision
             # fused path is only correct at split_k=1. A post-split
             # epilogue kernel would re-enable it but isn't wired up.
-            if s.has_bias or s.activation is not None:
+            if s.has_bias or s.activation is not None or s.has_gate_residual:
                 return False
         return True
 
@@ -159,6 +228,16 @@ class GemmKernel(Kernel):
             bias_np = astype_numpy(rng.standard_normal(spec.N).astype(np.float32), spec.out_dtype)
         else:
             bias_np = zeros_for_dtype((1,), spec.out_dtype)
+        if spec.has_gate_residual:
+            gate_np = astype_numpy(
+                rng.standard_normal((spec.G, spec.N)).astype(np.float32), spec.out_dtype
+            )
+            residual_np = astype_numpy(
+                rng.standard_normal((spec.M, spec.N)).astype(np.float32), spec.out_dtype
+            )
+        else:
+            gate_np = zeros_for_dtype((1,), spec.out_dtype)
+            residual_np = zeros_for_dtype((1,), spec.out_dtype)
         return {
             "A": astype_numpy(
                 rng.standard_normal((spec.M, spec.K)).astype(np.float32), spec.a_dtype
@@ -167,6 +246,8 @@ class GemmKernel(Kernel):
                 rng.standard_normal((spec.N, spec.K)).astype(np.float32), spec.b_dtype
             ),
             "Bias": bias_np,
+            "Gate": gate_np,
+            "Residual": residual_np,
             "Out": zeros_for_dtype((spec.M, spec.N), spec.out_dtype),
         }
 
@@ -194,8 +275,8 @@ class GemmKernel(Kernel):
         N, K_b = int(B.shape[0]), int(B.shape[1])
         if not b_shuffled and K_b != K:
             raise ValueError(f"pcf.gemm: A.shape[1] ({K}) != B.shape[1] ({K_b})")
-        a_dt_str = DType.from_backend(A.dtype)
-        b_dt_str = DType.from_backend(B.dtype)
+        a_dt_str = DType.from_backend(A)
+        b_dt_str = DType.from_backend(B)
         return GemmSpec(
             M=M,
             N=N,
@@ -412,6 +493,341 @@ class GemmKernel(Kernel):
 
     # ── build() ──
 
+    def build_metal(self) -> None:
+        """Metal NAX path — used when caps support NAX and the autotuner
+        picks the ``m16n32k16_nax_bf16`` shape.
+
+        Minimum-viable single-warp tile (BM=16, BN=32, BK=16): each
+        block produces one 16×32 output tile via a runtime K-outer
+        loop with a carried width-16 F32 accumulator. One NAX MMA
+        per K-tile. Direct device loads + stores via the IR's NAX
+        LoadMatrixOp / StoreMatrixOp paths.
+
+        Falls through to the simdgroup_matrix ``build()`` for any
+        spec/config combination this path doesn't cover (bias,
+        activation, split-K, non-NAX shape).
+        """
+        s, c = self.spec, self.config
+        try:
+            mma = self._mma_cfg()
+        except KeyError:
+            self.build()
+            return
+        if mma.shape.name not in ("m16n32k16_nax_bf16", "m32n32k16_nax_bf16"):
+            self.build()
+            return
+        # NAX path doesn't yet wire bias / split-K.
+        if s.has_bias or c.split_k > 1:
+            self.build()
+            return
+        if s.activation is not None and s.activation != "silu":
+            self.build()
+            return
+
+        # NAX tile shapes wired:
+        #   single-warp 16×32×16 (m=16 only) — one MMA per K-tile, simple.
+        #   multi-warp  64×128×16+ — 8 simdgroups (WM=2 × WN=4); each
+        #     simdgroup tiles its (SM, SN) sub-block with the picked
+        #     per-fragment NAX shape (m16 default, m32 wider-M variant).
+        #     m=32 halves the MMA dispatch count per K-iter at the cost
+        #     of a wider cooperative_tensor (32 elems/lane vs 16).
+        if (
+            c.n_warps == 1
+            and (c.BM, c.BN, c.BK) == (16, 32, 16)
+            and mma.shape.name == "m16n32k16_nax_bf16"
+        ):
+            self._build_metal_nax_single_warp()
+            return
+        if (
+            c.n_warps in (8, 16)
+            and c.BM in (64, 128)
+            and c.BN in (128, 256)
+            and c.BK in (16, 32, 64)
+        ):
+            self._build_metal_nax_multi_warp()
+            return
+        self.build()
+
+    def _build_metal_nax_single_warp(self) -> None:
+        """Single-simdgroup NAX path: BM=16, BN=32, BK=16. One MMA per
+        K-tile. One width-16 F32 accumulator. Used for small tiles where
+        the multi-warp version's setup cost isn't worth it."""
+        s, c, g = self.spec, self.config, self.g
+        bctx = self.bctx
+        bld = self.bld
+        m_base, n_base = self.m_base, self.n_base
+
+        zero_f = bctx.c(0.0, dtype=DType.F32)
+        init_acc = bld.vec_build([zero_f] * 16)
+
+        K_outer = s.K // c.BK
+        BK_c = bctx.c(c.BK, dtype=DType.U32)
+
+        with qk.for_range(0, K_outer, 1, iv_name="ki", carried=(init_acc,)) as (
+            ki,
+            (acc_carried,),
+        ):
+            k_col = ki * BK_c
+            a_frag = bld.load_matrix(g.A, "m16n32k16_nax_bf16", "a", m_base, k_col)
+            b_frag = bld.load_matrix(g.B, "m16n32k16_nax_bf16", "b", n_base, k_col)
+            new_acc = bld.mma("m16n32k16_nax_bf16", a_frag, b_frag, acc_carried)
+            qk.yield_(new_acc)
+
+        final_acc = bld.last_results[0]
+        if s.activation == "silu":
+            final_acc = qk.silu([final_acc])[0]
+        if s.has_gate_residual:
+            bld.store_matrix_gate_residual(
+                g.Out,
+                g.Residual,
+                g.Gate,
+                final_acc,
+                "m16n32k16_nax_bf16",
+                m_base,
+                n_base,
+                m_per_group=s.M // s.G,
+            )
+        else:
+            bld.store_matrix(g.Out, final_acc, "m16n32k16_nax_bf16", "d", m_base, n_base)
+
+    def _build_metal_nax_multi_warp(self) -> None:
+        """Multi-simdgroup NAX gemm.
+
+        8 simdgroups laid out as WM=2 × WN=4 cover the BM × BN output
+        tile, each carrying TM × TN width-16 F32 accumulators (one per
+        NAX 16×32 destination sub-tile). Direct gmem loads — Apple's
+        L2 cache provides the data-reuse benefit and the NAX
+        BaseNAXFrag lane→fragment coordinate map produces cache-friendly
+        access patterns. Mirrors MLX's ``steel/gemm/gemm_nax.h``.
+
+        K-loop: runtime loop over ``K / BK`` iterations, each
+        Python-unrolling ``BK / 16`` inner K-tiles. BK=64 produces
+        4 unrolled K-tiles per iter (sweet spot: tested BK={16..256},
+        SK-style runtime inner loop, and kk=1 per-iter — BK=64
+        Python-unroll consistently wins for the largest shapes).
+        """
+        s, c, g = self.spec, self.config, self.g
+        bctx = self.bctx
+        bld = self.bld
+
+        # Per-fragment dims come from the picked main_shape — m=16 stays
+        # the legacy default, m=32 is the wider-fragment NAX shape that
+        # halves the per-K-iter MMA dispatch count (1 m32 MMA ≡ 2 stacked
+        # m16 MMAs in the M direction).
+        mma = self._mma_cfg()
+        shape_id = mma.shape.name
+        M_FRAG = int(mma.shape.m)
+        N_FRAG = int(mma.shape.n)
+        K_FRAG = int(mma.shape.k)
+        c_regs = int(mma.shape.c_regs)
+
+        # Warp layout: prefer square (WM=WN) for balanced SM occupancy.
+        # n_warps=8 → WM=2 WN=4; n_warps=16 → WM=4 WN=4.
+        n_sg = c.n_warps
+        if n_sg == 16:
+            WM, WN = 4, 4
+        elif n_sg == 8:
+            WM, WN = 2, 4
+        elif n_sg == 4:
+            WM, WN = 2, 2
+        else:
+            WM, WN = 1, n_sg
+
+        SM = c.BM // WM  # rows per simdgroup
+        SN = c.BN // WN  # cols per simdgroup
+        TM = SM // M_FRAG  # M-fragments per simdgroup
+        TN = SN // N_FRAG  # N-fragments per simdgroup
+        kk_per_iter = c.BK // K_FRAG
+        assert c.BK % K_FRAG == 0
+
+        K_iters = s.K // c.BK  # runtime loop count
+        c_row_b, c_col_b, sg_row, sg_col = self._nax_block_origins(WN, SM, SN)
+        am_offsets, tn_offsets, kk_offsets = self._nax_offset_consts(
+            TM, TN, kk_per_iter, K_FRAG, N_FRAG, M_FRAG
+        )
+        zero_f = bctx.c(0.0, dtype=DType.F32)
+        init_accs = tuple(bld.vec_build([zero_f] * c_regs) for _ in range(TM * TN))
+        BK_c = bctx.c(c.BK, dtype=DType.U32)
+
+        with qk.for_range(0, K_iters, 1, iv_name="ki", carried=init_accs) as (
+            ki,
+            carried_accs,
+        ):
+            k_col_base = ki * BK_c
+            new_accs = self._nax_inner_mma(
+                list(carried_accs),
+                g.A,
+                g.B,
+                row_a=sg_row,
+                col_a_base=k_col_base,
+                row_b=sg_col,
+                col_b_base=k_col_base,
+                am_offsets=am_offsets,
+                tn_offsets=tn_offsets,
+                kk_offsets=kk_offsets,
+                kk_per_iter=kk_per_iter,
+                TM=TM,
+                TN=TN,
+                shape_id=shape_id,
+            )
+            qk.yield_(*new_accs)
+
+        self._nax_store_accs(
+            bld.last_results, sg_row, sg_col, am_offsets, tn_offsets, TM, TN, shape_id=shape_id
+        )
+
+    # ── NAX multi-warp helpers ──
+
+    def _nax_block_origins(self, WN, SM, SN):
+        """Return (c_row_b, c_col_b, sg_row, sg_col) — global block- and
+        simdgroup-level origins. ``sg_row`` / ``sg_col`` are global
+        (block_origin + simdgroup_offset)."""
+        bctx = self.bctx
+        c = self.config
+        c_row_b = qk.block_idx("y") * bctx.c(c.BM, dtype=DType.U32)
+        c_col_b = qk.block_idx("x") * bctx.c(c.BN, dtype=DType.U32)
+        WN_c = bctx.c(WN, dtype=DType.U32)
+        sg_m = bctx.warp_id // WN_c
+        sg_n = bctx.warp_id % WN_c
+        sg_row = c_row_b + sg_m * bctx.c(SM, dtype=DType.U32)
+        sg_col = c_col_b + sg_n * bctx.c(SN, dtype=DType.U32)
+        return c_row_b, c_col_b, sg_row, sg_col
+
+    def _nax_offset_consts(self, TM, TN, kk_per_iter, K_FRAG, N_FRAG, M_FRAG=16):
+        """Pre-build the small per-fragment offset constants used inside
+        the inner MMA emission. Hoisted so each ``for_range`` body
+        doesn't re-emit them. ``M_FRAG`` defaults to 16 for the legacy
+        m=16 main_shape; m=32 callers pass M_FRAG=32."""
+        bctx = self.bctx
+        am_offsets = [bctx.c(am * M_FRAG, dtype=DType.U32) for am in range(TM)]
+        tn_offsets = [bctx.c(tn * N_FRAG, dtype=DType.U32) for tn in range(TN)]
+        kk_offsets = [bctx.c(kk * K_FRAG, dtype=DType.U32) for kk in range(kk_per_iter)]
+        return am_offsets, tn_offsets, kk_offsets
+
+    def _nax_inner_mma(
+        self,
+        accs,
+        A_tensor,
+        B_tensor,
+        *,
+        row_a,
+        col_a_base,
+        row_b,
+        col_b_base,
+        am_offsets,
+        tn_offsets,
+        kk_offsets,
+        kk_per_iter,
+        TM,
+        TN,
+        shape_id="m16n32k16_nax_bf16",
+    ):
+        """Emit ``kk_per_iter`` inner K-tile steps, each issuing all TN B
+        frags + all TM A frags up front and then all TM × TN MMAs.
+        Loads are issued before any MMA so Apple's scheduler can hoist
+        them and overlap gmem latency with the MMA-compute phase.
+
+        ``shape_id`` selects the per-fragment NAX shape — m16n32k16
+        (legacy default, 1 MMA per (am, tn) cell) or m32n32k16 (wider M
+        fragment, 1 MMA covers 32 rows so TM is half what it would be at
+        m=16 for the same SM).
+        """
+        bld = self.bld
+        for kk in range(kk_per_iter):
+            k_col_a = col_a_base + kk_offsets[kk]
+            k_col_b = col_b_base + kk_offsets[kk]
+            b_frags = [
+                bld.load_matrix(
+                    B_tensor,
+                    shape_id,
+                    "b",
+                    row_b + tn_offsets[tn],
+                    k_col_b,
+                )
+                for tn in range(TN)
+            ]
+            a_frags = [
+                bld.load_matrix(
+                    A_tensor,
+                    shape_id,
+                    "a",
+                    row_a + am_offsets[am],
+                    k_col_a,
+                )
+                for am in range(TM)
+            ]
+            for am in range(TM):
+                for tn in range(TN):
+                    slot = am * TN + tn
+                    accs[slot] = bld.mma(
+                        shape_id,
+                        a_frags[am],
+                        b_frags[tn],
+                        accs[slot],
+                    )
+        return accs
+
+    def _nax_store_accs(
+        self,
+        accs,
+        sg_row,
+        sg_col,
+        am_offsets,
+        tn_offsets,
+        TM,
+        TN,
+        *,
+        shape_id="m16n32k16_nax_bf16",
+    ):
+        """Write the TM × TN destination sub-tiles to global Out.
+
+        When ``self.spec.activation == "silu"``, fuse silu in-register
+        on the F32 accumulators before each store — saves the downstream
+        silu kernel + bf16 read/write roundtrip on the MLP fc1 path.
+
+        When ``self.spec.has_gate_residual``, route each tile through
+        ``store_matrix_gate_residual`` instead — emits a per-lane fused
+        store that reads residual + gate from gmem (bf16), combines in
+        F32, and writes the bf16 output. Saves the standalone
+        ``AdaGateResidualKernel`` dispatch + the bf16 read/write of the
+        accumulator on the post-attn / post-MLP residual.
+
+        ``shape_id`` selects the per-fragment NAX shape (m=16 or m=32);
+        the store machinery in the lowerer reads ``shape.m / .n`` for
+        the per-fragment offsets, so the same call works for both.
+        """
+        bld = self.bld
+        g = self.g
+        s = self.spec
+        if s.activation == "silu":
+            accs = qk.silu(accs)
+        m_per_group = (s.M // s.G) if s.has_gate_residual else 1
+        for am in range(TM):
+            a_row = sg_row + am_offsets[am]
+            for tn in range(TN):
+                slot = am * TN + tn
+                a_col = sg_col + tn_offsets[tn]
+                if s.has_gate_residual:
+                    bld.store_matrix_gate_residual(
+                        g.Out,
+                        g.Residual,
+                        g.Gate,
+                        accs[slot],
+                        shape_id,
+                        a_row,
+                        a_col,
+                        m_per_group=m_per_group,
+                    )
+                else:
+                    bld.store_matrix(
+                        g.Out,
+                        accs[slot],
+                        shape_id,
+                        "d",
+                        a_row,
+                        a_col,
+                    )
+
     def build(self) -> None:
         s, c, g = self.spec, self.config, self.g
         bctx, m_base, n_base = self.bctx, self.m_base, self.n_base
@@ -472,5 +888,8 @@ class GemmKernel(Kernel):
             cast=s.out_dtype,
             activation=s.activation,
             bias=g.Bias if s.has_bias else None,
+            gate=g.Gate if s.has_gate_residual else None,
+            residual=g.Residual if s.has_gate_residual else None,
+            gate_groups=s.G if s.has_gate_residual else 1,
             atomic=split_k > 1,
         )

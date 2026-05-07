@@ -4,11 +4,13 @@
 
 - 500-line soft target, 800 hard cap.
 - Exempt with `EXEMPT FROM 500-LINE RULE` in the module docstring +
-  a one-sentence reason (see `backend.py`, `ir/tensor.py`,
-  `ir/validator.py`, `owl_attn/kernel.py`, `lower/msl/mma.py`,
-  `weight_shuffle.py`, `lang/__init__.py`, `lang/epilogue.py`). The
-  pre-commit hook blocks commits that exceed the soft cap without
-  the exemption.
+  a one-sentence reason (see `ir/tensor.py`, `ir/validator.py`,
+  `kernels/owl_attn/kernel.py`, `lower/msl/mma.py`,
+  `lang/__init__.py`, `lang/epilogue.py`, …). Files allowed to grow
+  by architectural cohesion (op catalogs, IR builder, lowerers) are
+  on the explicit allowlist in `tools/ci/file_size.py`. The CI gate
+  runs `tools/ci/file_size.py` and blocks PRs that exceed the soft
+  cap without an exemption.
 - `blocks/dsl/` is a package split across concern-specific submodules
   (context, tensors, accumulators, carry, smem_tile, block_context,
   kernel_context) — kernel authors import from `quark.blocks`, not
@@ -31,13 +33,13 @@
 | L0 emit functions | `emit_*` |
 | Block classes | CamelCase: `MmaBody`, `SmemPlan`, `PipelineBody`, `Accumulators`, `Stage`, `Carry` |
 | `qk.*` helpers | snake_case: `qk.store_acc`, `qk.work_list_load`, `qk.index_cache`, `qk.q_register_load`, `qk.silu`, `qk.cast` |
-| Dtype | `DType` enum (str + IR + backend bridge). `spec.a_dtype.backend` → torch/mlx dtype; `DType("bf16") is DType.BF16`. |
+| Dtype | `DType` enum (str + IR bridge); `DType("bf16") is DType.BF16`. |
 
 ## Imports
 
-Order: stdlib → `torch` (only in baselines/ci-only code; otherwise
-route through `PT`) → `quark.lang` → `quark.ir` → `quark.backend`
-→ `quark.blocks` → `quark.kernels.*`.
+Order: stdlib → third-party (`numpy`, optionally `torch` only in
+opt-in `baselines.py` files) → `quark.lang` → `quark.ir` →
+`quark.runtime` → `quark.blocks` → `quark.kernels.*`.
 
 ```python
 from __future__ import annotations
@@ -45,8 +47,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
+import numpy as np
+
 import quark.lang as qk
-from quark.backend import PT
 from quark.blocks import (
     Accumulators, IterCtx, MmaBody, PipelineBody, SmemPlan, SmemTile, Stage, TensorDecl,
 )
@@ -54,6 +57,7 @@ from quark.ir import Builder, DType, Module
 from quark.ir.mma_registry import ALL_SHAPES, lookup_mma
 from quark.kernels.base import Kernel, MmaSite
 from quark.kernels.decorator import kernel
+from quark.runtime.tensor import QuarkTensor
 ```
 
 ## Type hints
@@ -92,7 +96,7 @@ from quark.kernels.decorator import kernel
 | Star imports | explicit names |
 | Mutable default values on dataclass fields | `field(default_factory=...)` |
 | `TODO` with no context | `TODO(issue #N): …` |
-| Raw `torch.*` / `mlx.*` in references / make_tensors | `quark.backend.PT` |
+| Raw `torch.*` / `mlx.*` in references / `make_tensors` | `numpy` + `quark.runtime.npconv` (references are pure numpy in the post-MLX-removal architecture) |
 | `getattr(cls, "CORRECTNESS_THRESHOLD", None)` | `cls.correctness_threshold(out_dtype)` |
 | `spec_from_tensors` | retired; don't add new callers |
 | `global_tensors() -> []` stubs | omit; base default is fine |

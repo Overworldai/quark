@@ -91,7 +91,7 @@ class IncrementKernel(Kernel):
 
     @classmethod
     def spec_from_tensors(cls, T) -> IncrementSpec:
-        return IncrementSpec(dtype=DType.from_backend(T.dtype))
+        return IncrementSpec(dtype=DType.from_backend(T))
 
     def build(self) -> None:
         g = self.g

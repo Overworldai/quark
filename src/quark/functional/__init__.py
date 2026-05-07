@@ -1,16 +1,16 @@
-"""``quark.functional`` — torch/MLX-native callables over quark kernels.
+"""``quark.functional`` — torch/Metal-native callables over quark kernels.
 
     import quark.functional as pcf
 
     C = pcf.gemm(A, B)
     y = pcf.attention(Q, K, V_t, B=..., n_kv_heads=..., ...)
 
-Each entry accepts framework-native tensors (``torch.Tensor`` or
-``mx.array``) and returns the same type. On torch, every op is also
-registered via ``torch.library.custom_op`` so ``torch.compile`` can
-trace through it — use the ``torch.ops.quark.<name>`` form inside
-compiled regions or rely on the public ``pcf.<name>`` wrapper which
-dispatches on input type.
+Each entry accepts ``QuarkTensor`` (or ``torch.Tensor`` on CUDA) and
+returns the same type.
+On torch, every op is also registered via ``torch.library.custom_op``
+so ``torch.compile`` can trace through it — use the
+``torch.ops.quark.<name>`` form inside compiled regions or rely on the
+public ``pcf.<name>`` wrapper which dispatches on input type.
 
 """
 
@@ -26,6 +26,7 @@ from quark.functional.head_rmsnorm import head_rmsnorm
 from quark.functional.kv_cache_update import kv_cache_update
 from quark.functional.moe_inproj import moe_inproj
 from quark.functional.moe_outproj import moe_outproj
+from quark.functional.moe_reduce import moe_reduce
 from quark.functional.moe_router import moe_router
 from quark.functional.moe_router_correct import moe_router_correct
 from quark.functional.moe_router_shared import moe_router_shared
@@ -56,6 +57,7 @@ __all__ = [
     "kv_cache_update",
     "moe_inproj",
     "moe_outproj",
+    "moe_reduce",
     "moe_router",
     "moe_router_correct",
     "moe_router_shared",

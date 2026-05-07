@@ -1,14 +1,16 @@
-"""End-to-end Metal launch test: IR → MSL → MLX compile → launch → verify.
+"""End-to-end Metal launch test: IR -> MSL -> compile -> launch -> verify.
 
-Requires a Metal device (mx.metal.is_available()). Skips on CUDA-only.
+Requires a Metal device. Skips on CUDA-only or non-Darwin.
+Works with both MLX and PyObjC drivers (QUARK_METAL_DRIVER env var).
 """
 
+import numpy as np
 import pytest
 
 try:
-    import mlx.core as mx
+    from quark.drivers.metal import is_available
 
-    HAS_METAL = mx.metal.is_available()
+    HAS_METAL = is_available()
 except ImportError:
     HAS_METAL = False
 
@@ -17,15 +19,14 @@ pytestmark = pytest.mark.skipif(not HAS_METAL, reason="no Metal device")
 
 def test_vecadd_end_to_end():
     """Build a 256-element vec-add kernel via the IR, lower to MSL,
-    compile via MLX, launch, and verify correctness."""
+    compile via the active Metal driver, launch, and verify correctness."""
     from quark.device import DeviceFamily, current_device
-    from quark.ir import BufferType, Builder, DType, ParamAttrs
+    from quark.ir import BufferType, Builder, DType, GlobalTensor, ParamAttrs
 
     device = current_device()
     if device.family is not DeviceFamily.METAL:
         pytest.skip("not a Metal device")
 
-    # Build IR for: C[tid] = A[tid] + B[tid]
     N = 256
     b = Builder("vecadd")
     b.begin_function("vecadd_kernel")
@@ -33,28 +34,14 @@ def test_vecadd_end_to_end():
     b.param("B", BufferType(DType.F32), attrs=ParamAttrs(readonly=True))
     b.param("C", BufferType(DType.F32))
 
-    from quark.ir import GlobalTensor
-
     g_a = GlobalTensor(
-        dtype=DType.F32,
-        shape=(N,),
-        stride=(1,),
-        name="A",
-        param=b.function.params[0],
+        dtype=DType.F32, shape=(N,), stride=(1,), name="A", param=b.function.params[0]
     )
     g_b = GlobalTensor(
-        dtype=DType.F32,
-        shape=(N,),
-        stride=(1,),
-        name="B",
-        param=b.function.params[1],
+        dtype=DType.F32, shape=(N,), stride=(1,), name="B", param=b.function.params[1]
     )
     g_c = GlobalTensor(
-        dtype=DType.F32,
-        shape=(N,),
-        stride=(1,),
-        name="C",
-        param=b.function.params[2],
+        dtype=DType.F32, shape=(N,), stride=(1,), name="C", param=b.function.params[2]
     )
 
     tid = b.thread_idx("x")
@@ -64,7 +51,6 @@ def test_vecadd_end_to_end():
     b.store(g_c, c_val, tid)
     b.end_function()
 
-    # Lower to MSL
     from quark.lower.msl import MslLowerer
 
     lowered = MslLowerer(device.caps).lower_module(b.module)
@@ -72,40 +58,38 @@ def test_vecadd_end_to_end():
     assert lowered.input_names == ["A", "B"]
     assert lowered.output_names == ["C"]
 
-    # Compile via MLX driver
-    from quark.drivers.mlx import MlxDriver
+    # Compile via the active driver (respects QUARK_METAL_DRIVER).
+    from quark.launcher.launcher import Launcher
 
-    driver = MlxDriver(device=device)
+    driver = Launcher(device=device).driver
     compiled = driver.compile(lowered, entry_name="vecadd_kernel", smem_bytes=0)
 
-    # Launch
-    A = mx.random.normal(shape=(N,)).astype(mx.float32)
-    B = mx.random.normal(shape=(N,)).astype(mx.float32)
-    mx.eval(A, B)
+    rng = np.random.default_rng(42)
+    A = rng.standard_normal(N).astype(np.float32)
+    B = rng.standard_normal(N).astype(np.float32)
 
-    outputs = driver.launch_mlx(
+    outputs = driver.launch_metal(
         compiled,
         grid=(N, 1, 1),
         block=(N, 1, 1),
         input_arrays=[A, B],
         output_shapes=[(N,)],
-        output_dtypes=[mx.float32],
+        output_dtypes=[np.float32],
     )
-    C = outputs[0]
+    driver.sync(None)
+    # launch_metal returns list of (handle, ptr, nbytes) — wrap as numpy.
+    import ctypes
 
-    # Verify
+    _h, ptr, nbytes = outputs[0]
+    C = np.frombuffer((ctypes.c_char * nbytes).from_address(ptr), dtype=np.float32).reshape(N)
     expected = A + B
-    mx.eval(expected)
-    diff = mx.abs(C - expected)
-    mx.eval(diff)
-    max_err = float(mx.max(diff))
-    assert max_err < 1e-5, f"max error {max_err} too large"
+    np.testing.assert_allclose(C, expected, atol=1e-5)
 
 
 def test_vecadd_via_launcher():
-    """Same vec-add but through the full Launcher → CompiledKernel path."""
+    """Same vec-add but through the full Launcher -> CompiledKernel path."""
     from quark.device import DeviceFamily, current_device
-    from quark.ir import BufferType, Builder, DType, ParamAttrs
+    from quark.ir import BufferType, Builder, DType, GlobalTensor, ParamAttrs
     from quark.launcher.launcher import CompiledKernel, Launcher
     from quark.launcher.param_spec import ParamSpec, ProgramFootprint
 
@@ -114,36 +98,20 @@ def test_vecadd_via_launcher():
         pytest.skip("not a Metal device")
 
     N = 128
-
-    # Build the IR module
     b = Builder("vecadd")
     b.begin_function("vecadd_kernel")
     b.param("A", BufferType(DType.F32), attrs=ParamAttrs(readonly=True))
     b.param("B", BufferType(DType.F32), attrs=ParamAttrs(readonly=True))
     b.param("C", BufferType(DType.F32))
 
-    from quark.ir import GlobalTensor
-
     g_a = GlobalTensor(
-        dtype=DType.F32,
-        shape=(N,),
-        stride=(1,),
-        name="A",
-        param=b.function.params[0],
+        dtype=DType.F32, shape=(N,), stride=(1,), name="A", param=b.function.params[0]
     )
     g_b = GlobalTensor(
-        dtype=DType.F32,
-        shape=(N,),
-        stride=(1,),
-        name="B",
-        param=b.function.params[1],
+        dtype=DType.F32, shape=(N,), stride=(1,), name="B", param=b.function.params[1]
     )
     g_c = GlobalTensor(
-        dtype=DType.F32,
-        shape=(N,),
-        stride=(1,),
-        name="C",
-        param=b.function.params[2],
+        dtype=DType.F32, shape=(N,), stride=(1,), name="C", param=b.function.params[2]
     )
     tid = b.thread_idx("x")
     a_val = b.load(g_a, tid)
@@ -152,11 +120,11 @@ def test_vecadd_via_launcher():
     b.store(g_c, c_val, tid)
     b.end_function()
 
-    # Lower + compile through the launcher's internal path
     from quark.lower.msl import MslLowerer
 
     lowered = MslLowerer(device.caps).lower_module(b.module)
-    driver = Launcher(device=device).driver
+    launcher = Launcher(device=device)
+    driver = launcher.driver
     compiled_mod = driver.compile(lowered, entry_name="vecadd_kernel", smem_bytes=0)
 
     param_spec = ParamSpec.from_function(b.module.functions[0])
@@ -170,19 +138,16 @@ def test_vecadd_via_launcher():
         footprint=ProgramFootprint(smem_bytes=0),
     )
 
-    # Launch via CompiledKernel.launch()
-    A = mx.random.normal(shape=(N,)).astype(mx.float32)
-    B = mx.random.normal(shape=(N,)).astype(mx.float32)
-    C = mx.zeros((N,), dtype=mx.float32)
-    mx.eval(A, B, C)
+    rng = np.random.default_rng(42)
+    A = rng.standard_normal(N).astype(np.float32)
+    B = rng.standard_normal(N).astype(np.float32)
+    C = np.zeros(N, dtype=np.float32)
 
     result = ck.launch(buffers=[A, B, C])
-    assert result is not None, "Metal launch should return output arrays"
-    out = result[0]
+    assert result is not None
+    import ctypes
 
+    _h, ptr, nbytes = result[0]
+    out = np.frombuffer((ctypes.c_char * nbytes).from_address(ptr), dtype=np.float32).reshape(N)
     expected = A + B
-    mx.eval(expected)
-    diff = mx.abs(out - expected)
-    mx.eval(diff)
-    max_err = float(mx.max(diff))
-    assert max_err < 1e-5, f"max error {max_err} too large"
+    np.testing.assert_allclose(out, expected, atol=1e-5)

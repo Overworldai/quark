@@ -52,6 +52,7 @@ from quark.ir import (
     FragConvertOp,
     FragForEachOp,
     FragReduceOp,
+    FragSliceOp,
     Function,
     GlobalTensor,
     GridDimOp,
@@ -709,6 +710,28 @@ class PtxLowerer:
                 ctx.emit(f"mov.b32 {dst}, {{{lo_r}, {hi_r}}};")
                 packed.append(dst)
             ctx.regs._components[out.id] = tuple(packed)
+        elif pack_factor == 4:
+            # 4 byte-wide scalars (U8 / E4M3 / E5M2) → 1 B32. PTX's
+            # ``mov.b32 dst, {lo, hi}`` only packs 16-bit halves, so we
+            # widen each byte to b32 (zero-extend), shift to its lane,
+            # and OR into the chunk accumulator. Inverse of the
+            # pack_factor=4 branch in ``_visit_vec_extract``.
+            packed = []
+            for i in range(0, n_logical, 4):
+                (src0,) = ctx.regs.components(op.operands[i])
+                accum = ctx.regs.declare(reg_class(reg_dt))
+                ctx.emit(f"cvt.u32.u8 {accum}, {src0};")
+                for j in range(1, 4):
+                    (src_j,) = ctx.regs.components(op.operands[i + j])
+                    widened = ctx.regs.declare(reg_class(reg_dt))
+                    ctx.emit(f"cvt.u32.u8 {widened}, {src_j};")
+                    shifted = ctx.regs.declare(reg_class(reg_dt))
+                    ctx.emit(f"shl.b32 {shifted}, {widened}, {j * 8};")
+                    next_accum = ctx.regs.declare(reg_class(reg_dt))
+                    ctx.emit(f"or.b32 {next_accum}, {accum}, {shifted};")
+                    accum = next_accum
+                packed.append(accum)
+            ctx.regs._components[out.id] = tuple(packed)
         else:
             raise NotImplementedError(f"VecBuildOp: pack_factor={pack_factor} not yet supported")
 
@@ -761,7 +784,10 @@ class PtxLowerer:
             ctx.emit(f"cvt.u16.u32 {out_r}, {tmp};")
             ctx.regs.bind(out, (out_r,))
         else:
-            raise NotImplementedError(f"VecExtractOp: pack_factor={pack_factor} not supported")
+            raise NotImplementedError(
+                f"VecExtractOp: pack_factor={pack_factor} not supported "
+                f"[src.width={n_logical} dtype={src.dtype} n_phys={n_phys} idx={idx}]"
+            )
 
     def _visit_split_b32(self, op: SplitB32Op, ctx: _FnCtx) -> None:
         """b32 → (lo_b16, hi_b16) via `mov.b32 {lo, hi}, src;`."""
@@ -1463,6 +1489,19 @@ class PtxLowerer:
                     break
                 self._visit(bop, ctx)
 
+    def _visit_frag_slice(self, op: FragSliceOp, ctx: _FnCtx) -> None:
+        """Bind the result Value to a register slice of the source.
+
+        Pure component-rebinding — no PTX emitted. The sliced fragment
+        shares register storage with its source.
+        """
+        (src,) = op.operands
+        (out,) = op.results
+        start = int(op.attrs["start"])
+        length = int(op.attrs["length"])
+        src_comps = ctx.regs.components(src)
+        ctx.regs.bind(out, tuple(src_comps[start : start + length]))
+
     def _visit_frag_reduce(self, op: FragReduceOp, ctx: _FnCtx) -> None:
         """Lower FragReduceOp to per-class local scalar reduce + butterfly
         shuffle.
@@ -1522,11 +1561,25 @@ class PtxLowerer:
         The fragment Values are width-N b32 vecs (see Builder.load_matrix
         / Builder.mma); `name_for` returns the braced `{%b0, %b1, ...}`
         form directly.
+
+        ``transpose_b`` is a NAX-only knob; PTX ``mma.sync`` has its
+        layout fixed by the shape's mnemonic (``.row.col`` etc.), so
+        we reject explicit ``transpose_b=False`` here.
         """
         from quark.device import DeviceFamily
         from quark.ir.mma_registry import payload_for
 
         shape_id = op.attrs["shape_id"]
+        if op.attrs.get("transpose_b", True) is False:
+            raise NotImplementedError(
+                f"MmaOp: transpose_b=False is NAX-only — PTX mma.sync's "
+                f"layout is fixed by the shape mnemonic. shape={shape_id!r}"
+            )
+        if op.attrs.get("accumulate", True) is False:
+            raise NotImplementedError(
+                f"MmaOp: accumulate=False is NAX-only — PTX mma.sync "
+                f"always accumulates into D from C. shape={shape_id!r}"
+            )
         module = ctx.module
         if module is None or shape_id not in module.kernel_shapes:
             raise RuntimeError(f"MmaOp: shape {shape_id!r} not in module.kernel_shapes")
@@ -1912,6 +1965,7 @@ _DISPATCH: dict[type, Any] = {
     FragConvertOp: PtxLowerer._visit_frag_convert,
     FragForEachOp: PtxLowerer._visit_frag_for_each,
     FragReduceOp: PtxLowerer._visit_frag_reduce,
+    FragSliceOp: PtxLowerer._visit_frag_slice,
     LoadMatrixOp: PtxLowerer._visit_load_matrix,
     StoreMatrixOp: PtxLowerer._visit_store_matrix,
 }

@@ -11,13 +11,14 @@
 ---
 
 **Zero hardware-specific runtime deps.** `libcuda` is driven directly
-via ctypes (`runtime/cuda.py`); no torch, no cupy, no pycuda, no triton
-in the inference path. Device tensors live in `QuarkTensor`
-(`runtime/tensor.py`), weights load from `.safetensors` without numpy
-or torch. Kernels are written once and lower to both PTX (NVIDIA) and
-MSL (Apple) — on Metal the driver goes through MLX's
-`mx.fast.metal_kernel`. Torch is an optional dev dep used by reference
-implementations and the autotune correctness gate only.
+via ctypes (`runtime/cuda.py`); on Metal a metal-cpp + nanobind
+shim (`drivers/_metal_dispatch`) drives the GPU directly — no torch,
+no cupy, no pycuda, no triton, no MLX in the inference path. Device
+tensors live in `QuarkTensor` (`runtime/tensor.py`) on both backends,
+weights load from `.safetensors` without numpy or torch. Kernels are
+written once and lower to both PTX (NVIDIA) and MSL (Apple). Torch
+is an optional dev dep used by reference implementations and the
+autotune correctness gate only.
 
 ## Install
 
@@ -82,12 +83,14 @@ from quark.runtime.tensor import QuarkTensor
 
 A = QuarkTensor.randn(M, K, dtype="bf16")
 B = QuarkTensor.randn(N, K, dtype="bf16")
-C = pcf.gemm(A, B)                      # QuarkTensor on CUDA, mx.array on Metal
+C = pcf.gemm(A, B)
 y = pcf.attention(Q, K, V_t, B=..., n_kv_heads=..., gqa_ratio=..., seq_len=..., kv_len=...)
 ```
 
-Input type decides the backend: `QuarkTensor` routes through the
-ctypes CUDA driver, `mx.array` through MLX. Full surface in
+`QuarkTensor` is the unified device-tensor type across both backends;
+the active backend is decided by the device the tensor lives on
+(CUDA via the ctypes driver on Linux/Windows, Metal via metal-cpp +
+nanobind on Apple Silicon). Full surface in
 [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md).
 
 ## Build a model
@@ -139,7 +142,7 @@ each building on the previous:
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Pipeline, IR, lowerers, registry, launcher |
 | [docs/ADDING_A_KERNEL.md](docs/ADDING_A_KERNEL.md) | New kernel walkthrough with templates |
-| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `quark.functional` call surface (QuarkTensor / MLX) |
+| [docs/FUNCTIONAL.md](docs/FUNCTIONAL.md) | `quark.functional` call surface (QuarkTensor) |
 | [docs/WEIGHTS.md](docs/WEIGHTS.md) | Safetensors loader, HF Hub path, `nn.Module` state dicts |
 | [docs/WAYPOINT_15.md](docs/WAYPOINT_15.md) | Waypoint-1.5 reference model + 5090 / 4090 benchmarks |
 | [docs/IR.md](docs/IR.md) | Builder API, tensor types, fragment primitives, RegisterTile |

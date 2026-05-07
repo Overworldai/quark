@@ -119,7 +119,7 @@ class ValueResidualPackedKernel(Kernel):
     def spec_from_tensors(cls, QKV_curr, QKV_first, lamb, *, v_col_offset: int, v_width: int):
         M = int(QKV_curr.shape[0])
         D_full = int(QKV_curr.shape[1])
-        dt = DType.from_backend(QKV_curr.dtype)
+        dt = DType.from_backend(QKV_curr)
         return ValueResidualPackedSpec(
             M=M, D_full=D_full, v_col_offset=v_col_offset, v_width=v_width, dtype=dt
         )

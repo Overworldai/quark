@@ -22,8 +22,9 @@ def moe_router_correct_reference_numpy(
     counts=None,
     work_list=None,
     offsets=None,
+    token_slot_table=None,
 ):
-    del token_ids, slot_weights, counts, work_list, offsets
+    del token_ids, slot_weights, counts, work_list, offsets, token_slot_table
     M = spec.M
     E = spec.E
     K = spec.top_k
@@ -69,6 +70,7 @@ def moe_router_correct_reference_numpy(
     # match the kernel's atomic-add allocation order (within an expert).
     out_token_ids = np.zeros(total_slots, dtype=np.int32)
     out_slot_weights = np.zeros(total_slots, dtype=np.float32)
+    out_token_slot_table = np.zeros((M, K), dtype=np.int32)
     cursors = np.zeros(E, dtype=np.int32)
     for t in range(M):
         for k in range(K):
@@ -78,6 +80,7 @@ def moe_router_correct_reference_numpy(
             final = int(out_offsets[e]) + slot_in_e
             out_token_ids[final] = t
             out_slot_weights[final] = weights[t, k]
+            out_token_slot_table[t, k] = final
 
     # Build work_list. One (grp_start, expert) per BM-chunk. Chunks past
     # total_active get expert = -1 (sentinel).
@@ -101,4 +104,5 @@ def moe_router_correct_reference_numpy(
         "counts": out_counts,
         "work_list": out_work_list,
         "offsets": out_offsets,
+        "token_slot_table": out_token_slot_table,
     }

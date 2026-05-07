@@ -1,13 +1,19 @@
 """MSL lowerer for the quark IR.
 
-Walks a `Module` and emits an MSL kernel body suitable for
-`mx.fast.metal_kernel`. The output is a **body string** (not a full
-function) — MLX wraps it with the `[[kernel]]` signature, parameter
-declarations, and built-in bindings.
+Walks a ``Module`` and emits an MSL kernel body. The output is a
+**body string** (not a full function) — the harness
+(``drivers/metal_harness.py``) wraps it with the ``[[kernel]]``
+signature, parameter declarations, and built-in bindings.
 
-The visitor methods and dispatch table live in `visitors.py` to keep
-this file under the 800-line cap. See visitors.py for the per-op
-codegen.
+The visitor methods and dispatch table live in ``visitors.py`` to keep
+this file under the 800-line cap.
+
+EXEMPT FROM 500-LINE RULE: this file owns the MSL lowering driver —
+LowerCtx state, NameMap, smem layout planning, the recursive
+``_emit_*`` helpers for control flow, and the public ``lower_module``
+/ ``LoweredMslKernel`` API. Splitting further would fragment the
+ctx/dispatch coupling; the visitor catalog already lives in
+``visitors.py``.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from quark.ir import (
+    AtomicRmwOp,
     DType,
     Function,
     GlobalTensor,
@@ -40,10 +47,10 @@ from .types import msl_type
 
 @dataclass(frozen=True)
 class LoweredMslKernel:
-    """MSL kernel body + metadata for MLX's metal_kernel API.
+    """MSL kernel body + metadata for the Metal driver.
 
-    `source` is the kernel body (not a full function). MLX wraps it
-    with the `[[kernel]] void` prefix and parameter bindings.
+    `source` is the kernel body (not a full function). The harness
+    wraps it with the ``[[kernel]] void`` prefix and parameter bindings.
     """
 
     source: str
@@ -53,8 +60,24 @@ class LoweredMslKernel:
     input_names: list[str]
     output_names: list[str]
     scalar_names: list[str]
+    # True if any AtomicRmwOp was emitted. Kept for backwards-compat;
+    # callers picking the per-output qualifier should consult
+    # ``atomic_output_names`` instead so kernels with a mix of atomic and
+    # plain-store outputs (e.g. moe_router_correct) only flag the
+    # buffers actually targeted by atomics.
     atomic_outputs: bool
     template_args: list[tuple[str, Any]]
+    # Per-param MSL dtype strings (e.g. "float", "half", "bfloat").
+    # Parallel to input_names / output_names / scalar_names respectively.
+    # Used by the metal driver's harness to emit typed pointer params
+    # (``device float*`` vs ``device half*``).
+    input_dtypes: list[str] = field(default_factory=list)
+    output_dtypes: list[str] = field(default_factory=list)
+    scalar_dtypes: list[str] = field(default_factory=list)
+    # Subset of ``output_names`` that an AtomicRmwOp targets. The metal
+    # harness uses this set (not ``atomic_outputs``) to decide which
+    # outputs get the ``device atomic<T>*`` qualifier.
+    atomic_output_names: frozenset[str] = field(default_factory=frozenset)
 
     def __str__(self) -> str:
         return self.source
@@ -80,8 +103,30 @@ class _MslCtx:
     input_names: list[str] = field(default_factory=list)
     output_names: list[str] = field(default_factory=list)
     scalar_names: list[str] = field(default_factory=list)
+    input_dtypes: list[str] = field(default_factory=list)
+    output_dtypes: list[str] = field(default_factory=list)
+    scalar_dtypes: list[str] = field(default_factory=list)
     uses_atomics: bool = False
+    # Per-output-name set of buffers targeted by an AtomicRmwOp. Drives
+    # which outputs get the ``device atomic<T>*`` vs ``device T*``
+    # parameter qualifier in the harness. A kernel-wide flag would taint
+    # every output (e.g. moe_router_correct: ``counts`` is atomic but
+    # ``token_ids`` / ``slot_weights`` / ``offsets`` get plain stores —
+    # tagging them all atomic breaks the plain-store paths).
+    atomic_output_names: set[str] = field(default_factory=set)
     uses_simdgroup_matrix: bool = False
+    # Set when any MmaOp this kernel emits resolves to a NAX (MPP
+    # matmul2d) payload. Drives the ``#include
+    # <MetalPerformancePrimitives/...>`` injection and forces MSL 4.0
+    # at compile time. ``uses_simdgroup_matrix`` and this can both be
+    # true in a single kernel: the simdgroup_matrix path still owns
+    # m8n8k8/m16n8 shapes that NAX doesn't replace.
+    uses_nax: bool = False
+    # Per-kernel-function flag tracking whether the NAX preamble
+    # (Coord struct, descriptor, gemm_op handle) has been emitted
+    # yet. The visit_mma_nax visitor emits the preamble lazily on
+    # the first NAX MmaOp it sees within a function body.
+    nax_preamble_emitted: bool = False
     # Control-flow stack (for yield resolution)
     op_stack: list[Op] = field(default_factory=list)
     # Fragment tracking: Value.id → (array_name, acc_dtype_str, m_frags, n_frags).
@@ -89,6 +134,24 @@ class _MslCtx:
     # (MmaOp, FragApply/Reduce/Convert/ForEachOp) look up the source
     # array name here instead of re-deriving from the Value's reg names.
     frag_values: dict[int, tuple[str, str, int, int]] = field(default_factory=dict)
+    # Discriminator set: Value.id of fragments whose MSL storage is the
+    # NAX per-lane vec<T, 8>[n_frags] form (rather than the default
+    # simdgroup_matrix<T, 8, 8>[mf*nf] form). Frag* visitors check this
+    # set to dispatch to NAX-specific emission. Populated by
+    # ``_visit_mma_nax`` and the NAX LoadMatrix / FragConvert visitors.
+    nax_frag_ids: set[int] = field(default_factory=set)
+    # NAX fragment Value.id → ``(array_name, n_frags)`` lookup. Tells
+    # the MMA helper-emission path which array to pass by reference
+    # when invoking the inlined ``nax_mma_*`` helper. Populated by
+    # ``_emit_nax_frag_decl`` and similar array-bind sites.
+    nax_frag_arrays: dict[int, tuple[str, int]] = field(default_factory=dict)
+    # NAX MMA helper variants used by the kernel (one definition per
+    # unique ``(shape_id, transpose_b, accumulate, cast_a)`` tuple).
+    # Definitions are emitted in the kernel header so each is declared
+    # exactly once even if the helper is called many times. The set
+    # tracks which we've seen; the list tracks emission order.
+    nax_mma_helpers: set[tuple] = field(default_factory=set)
+    nax_mma_helper_defs: list[str] = field(default_factory=list)
     # Cache of b32-packed-fragment → simdgroup_matrix-array conversions.
     # Value.id → array name. Lets a single packed source feed multiple
     # MmaOps without re-emitting the unpack / simdgroup_load sequence.
@@ -137,7 +200,7 @@ class _MslCtx:
         _bpe = {
             "float": 4,
             "half": 2,
-            "bfloat16_t": 2,
+            "bfloat": 2,
             "int": 4,
             "uint": 4,
             "short": 2,
@@ -194,11 +257,13 @@ _MATH_FN: dict[str, str] = {
     "rcp": "1.0f /",
     "rsqrt": "metal::rsqrt",
     "sqrt": "metal::sqrt",
+    "exp": "metal::exp",
     "exp2": "metal::exp2",
     "log2": "metal::log2",
     "sin": "metal::sin",
     "cos": "metal::cos",
     "tanh": "metal::tanh",
+    "exp_approx": "metal::fast::exp",
     "ex2_approx": "metal::fast::exp2",
     "rcp_approx": "metal::fast::divide",
     "rsqrt_approx": "metal::fast::rsqrt",
@@ -257,7 +322,7 @@ def _format_literal(dtype: DType, value: Any) -> str:
     if dtype is DType.F16:
         return f"static_cast<half>({float(value)}f)"
     if dtype is DType.BF16:
-        return f"static_cast<bfloat16_t>({float(value)}f)"
+        return f"static_cast<bfloat>({float(value)}f)"
     if dtype.is_int or dtype.is_bit:
         suffix = "u" if not dtype.is_signed_int else ""
         return f"{int(value)}{suffix}"
@@ -349,15 +414,24 @@ class MslLowerer:
         ctx = _MslCtx(module=module)
         # Pre-detect MMA usage so for-loop result declarations can
         # allocate simdgroup_matrix arrays for accumulator carries.
+        # NAX shapes (payload starting with ``nax:``) use cooperative
+        # tensors and per-lane scalar carries, NOT simdgroup_matrix —
+        # don't flip the flag for them.
         if module and module.kernel_shapes:
             from quark.device import DeviceFamily
             from quark.ir.mma_registry import payload_for
 
             for shape in module.kernel_shapes.values():
-                if payload_for(shape.name, DeviceFamily.METAL) is not None:
+                payload = payload_for(shape.name, DeviceFamily.METAL)
+                if payload is None:
+                    continue
+                if payload.startswith("nax:"):
+                    ctx.uses_nax = True
+                else:
                     ctx.uses_simdgroup_matrix = True
                     break
         self._classify_params(fn, ctx)
+        self._prescan_atomic_targets(fn, ctx)
         self._emit_smem_allocs(fn, ctx)
         # Freeze the "top of function body" line index now that every
         # kernel-declared smem alloc has landed. Subsequent
@@ -366,6 +440,15 @@ class MslLowerer:
         # threadgroup decl at kernel-entry scope — can't sit inside
         # a for-loop body or conditional).
         ctx._smem_decl_insert_idx = len(ctx.lines)
+        # Hoist NAX preamble (Coord setup + descriptor + op handle) to
+        # function-entry scope when the kernel will use NAX. Emitting
+        # lazily at the first MmaOp/LoadMatrixOp would trap ``_nax_fm``
+        # / ``_nax_fn`` inside a for-loop body and they'd be out of
+        # scope at any post-loop StoreMatrixOp.
+        if ctx.uses_nax:
+            from .mma import _emit_nax_preamble
+
+            _emit_nax_preamble(ctx)
         # Hoist all ConstOps to the top of the function so their
         # declarations aren't trapped inside for-loop scopes. CSE in
         # the IR builder means a const created inside a loop body may
@@ -385,18 +468,51 @@ class MslLowerer:
             scalar_names=ctx.scalar_names,
             atomic_outputs=ctx.uses_atomics,
             template_args=[],
+            input_dtypes=ctx.input_dtypes,
+            output_dtypes=ctx.output_dtypes,
+            scalar_dtypes=ctx.scalar_dtypes,
+            atomic_output_names=frozenset(ctx.atomic_output_names),
         )
 
     def _classify_params(self, fn: Function, ctx: _MslCtx) -> None:
         for p in fn.params:
             if isinstance(p.type, BufferType):
+                dt = msl_type(p.type.dtype)
                 if p.attrs.readonly:
                     ctx.input_names.append(p.name)
+                    ctx.input_dtypes.append(dt)
                 else:
                     ctx.output_names.append(p.name)
+                    ctx.output_dtypes.append(dt)
             elif isinstance(p.type, ScalarType):
+                dt = msl_type(p.type.dtype)
                 ctx.scalar_names.append(p.name)
+                ctx.scalar_dtypes.append(dt)
                 ctx.input_names.append(p.name)
+                ctx.input_dtypes.append(dt)
+
+    def _prescan_atomic_targets(self, fn: Function, ctx: _MslCtx) -> None:
+        """Walk the op graph once and record every buffer name targeted
+        by an ``AtomicRmwOp``.
+
+        Has to run before the main visitor walk: kernels with init →
+        atomic → finalize phases (moe_router_correct: ``counts`` is
+        ``qk.store``-zeroed in phase 0 and ``atomic_rmw``-added in phase
+        1) emit the plain store *first*, so populating the set lazily
+        from inside ``_visit_atomic_rmw`` would miss the earlier
+        ``_visit_store`` and emit a non-atomic ``buf[i] = v`` against
+        an ``atomic<T>*`` parameter.
+        """
+
+        def walk(ops: list[Op]) -> None:
+            for op in ops:
+                if isinstance(op, AtomicRmwOp):
+                    tensor = op.attrs["tensor"]
+                    ctx.atomic_output_names.add(_tensor_buf_name(tensor, ctx))
+                for region in op.regions:
+                    walk(region.ops)
+
+        walk(fn.body.ops)
 
     def _emit_smem_allocs(self, fn: Function, ctx: _MslCtx) -> None:
         """Emit every IR-level SmemAllocOp via the layout plan.
@@ -452,34 +568,84 @@ class MslLowerer:
                 ctx.names.bind(backing, (var_name,))
 
     def _hoist_consts(self, ops: list[Op], ctx: _MslCtx) -> None:
-        """Pre-emit all ConstOps at function scope to avoid C scoping issues.
+        """Pre-emit ConstOps at function scope ONLY when they're referenced
+        outside their declaring region.
 
-        The IR builder's CSE creates consts inside loop bodies that may be
-        referenced in the epilogue. On PTX (flat register scope) this is
-        fine; on MSL the for-loop's C braces hide them. We solve it by
-        emitting every const declaration at the top, then _visit_const
-        becomes a no-op for already-declared values.
+        The IR builder's CSE keeps consts within their declaring region's
+        frame, but Python-level Value handles can carry a const out of
+        the loop body to be used in an epilogue or sibling region. On
+        MSL the for-loop's C braces hide locals, so we hoist the
+        cross-region ones to function scope.
+
+        Region-local consts (only used within their declaring region or
+        nested children) STAY LOCAL — Apple's compiler then sees a
+        narrower live range and can reuse the register slot once the
+        loop body exits. For a kernel with N loop-local zero-init consts
+        × M loop iterations, this saves N register slots persisting at
+        function scope. Material on register-pressure-bound kernels;
+        free on others.
         """
         from quark.ir import ConstOp as _ConstOp
 
-        for op in ops:
-            if isinstance(op, _ConstOp):
-                # Emit at current (function-level) indent.
-                from .visitors import _visit_const
+        # First pass: find every ConstOp + its declaring region, plus
+        # every reference (operand) site keyed by the operand's id.
+        const_ops: dict[int, tuple[_ConstOp, int]] = {}  # value.id → (op, region_id)
+        ref_regions: dict[int, set[int]] = {}  # value.id → {region_ids}
 
+        def walk(region_ops: list[Op], region_id: int) -> None:
+            for op in region_ops:
+                if isinstance(op, _ConstOp):
+                    for r in op.results:
+                        const_ops[r.id] = (op, region_id)
+                for operand in op.operands:
+                    ref_regions.setdefault(operand.id, set()).add(region_id)
+                for region in op.regions:
+                    walk(region.ops, id(region))
+
+        # Treat the top-level (function body) as region_id = 0.
+        walk(ops, 0)
+
+        # Hoist ConstOps whose only uses are in their declaring region.
+        # Cross-region uses (or no uses at all — could be unused, but
+        # hoist anyway for safety) get hoisted to function scope.
+        from .visitors import _visit_const
+
+        for vid, (op, decl_region) in const_ops.items():
+            uses = ref_regions.get(vid, set())
+            cross_region = any(rid != decl_region for rid in uses)
+            if cross_region or not uses:
                 _visit_const(self, op, ctx)
-            # Recurse into sub-regions (for-loop body, if arms, etc.)
-            for region in op.regions:
-                self._hoist_consts(region.ops, ctx)
+        # Region-local consts will be emitted naturally when the
+        # walker visits their region — _visit_const checks if the
+        # binding already exists and is a no-op for hoisted ones.
 
     def _build_header(self, ctx: _MslCtx) -> str:
-        parts: list[str] = []
+        # ``metal_stdlib`` declares the simd_* lane ops, fast-math
+        # builtins, and the typedef pulling ``namespace metal::`` symbols
+        # into scope. Without ``using namespace metal;`` the generated
+        # body would have to qualify every ``simd_sum``/``half2`` etc.
+        # with ``metal::``; cheaper to just import the namespace once.
+        parts: list[str] = [
+            "#include <metal_stdlib>",
+            "using namespace metal;",
+        ]
         if ctx.uses_simdgroup_matrix:
             parts.append("#include <metal_simdgroup>")
             parts.append("#include <metal_simdgroup_matrix>")
-        if parts:
-            return "\n".join(parts) + "\n"
-        return ""
+        if ctx.uses_nax:
+            # MPP matmul2d (NAX hardware accelerator). Requires Metal 4
+            # language version at compile time — the driver picks the
+            # right ``MTLLanguageVersion`` based on
+            # ``DeviceCaps.supports_metal4``.
+            parts.append("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>")
+        # NAX MMA helper functions emitted at the kernel-source level
+        # so multiple MmaOp call sites share one definition. Inlined
+        # by the Apple compiler at each call but the explicit helper
+        # scope gives cleaner cooperative_tensor live-range tracking.
+        if ctx.nax_mma_helper_defs:
+            parts.append("")
+            parts.extend(ctx.nax_mma_helper_defs)
+        return "\n".join(parts) + "\n"
 
     def _walk_region(self, ops: list[Op], ctx: _MslCtx) -> None:
         for op in ops:

@@ -32,7 +32,7 @@ def unpatchify(
         ph=ph,
         pw=pw,
         d_model=d_model,
-        dtype=DType.from_backend(X.dtype),
+        dtype=DType.from_backend(X),
         has_bias=has_bias,
     )
     provided = {"X": X, "W": weight, "Bias": bias} if has_bias else {"X": X, "W": weight}

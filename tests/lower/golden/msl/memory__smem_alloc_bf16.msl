@@ -1,1 +1,1 @@
-    threadgroup bfloat16_t smem_0[256];
+    threadgroup bfloat smem_0[256];

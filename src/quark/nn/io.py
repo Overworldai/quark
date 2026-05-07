@@ -168,7 +168,16 @@ def load_safetensors(
     path_str = str(path)
     header, data_offset = _parse_header(path_str)
     allow = set(names) if names is not None else None
-    rt = CudaRuntime.instance()
+    # CUDA-only pooled fast path: pinned-memory ring + cuMemcpyHtoDAsync.
+    # On Metal there's no equivalent (no MTL pinned-memory API exposed
+    # through metal-cpp here); we route every tensor through the convert
+    # path below, which uses QuarkTensor.from_bytes and works on both
+    # backends. ``rt`` stays None on non-CUDA — guarded at every use.
+    rt = None
+    try:
+        rt = CudaRuntime.instance()
+    except Exception:
+        rt = None
     t0 = _tick("parse_header", t0)
 
     # Triage every requested tensor into pooled vs. per-tensor convert.
@@ -196,7 +205,10 @@ def load_safetensors(
         shape = tuple(info["shape"])
         start, end = info["data_offsets"]
         needs_dtype_change = dtype is not None and pc_dtype != dtype
-        if sf_dtype in _CONVERT_DTYPES or needs_dtype_change:
+        # On non-CUDA backends (rt is None), every tensor goes through
+        # the convert path — the pooled fast path uses CUDA-only APIs
+        # (memhost_alloc, cuMemcpyHtoDAsync, stream events).
+        if rt is None or sf_dtype in _CONVERT_DTYPES or needs_dtype_change:
             # Final pc_dtype after host-side conversion is the caller's
             # target when one is set, else the natural pc_dtype.
             target_pc = dtype if needs_dtype_change else pc_dtype
@@ -314,8 +326,16 @@ def load_safetensors(
         # Build tensor views from aligned pool offsets.
         for name, pc_dtype, shape, _file_start, nbytes, pool_off in pool_entries:
             slice_storage = _PooledSliceStorage(pool_storage, pool_off, nbytes)
+            # _PooledSliceStorage shares the same ptr/retain/release shape as
+            # _CudaStorage; QuarkTensor's storage union doesn't list it
+            # explicitly because adding it would pull this module's import
+            # into runtime/tensor.py.
             tensors[name] = QuarkTensor(
-                slice_storage, shape, _contiguous_strides(shape), 0, pc_dtype
+                slice_storage,  # ty: ignore[invalid-argument-type]
+                shape,
+                _contiguous_strides(shape),
+                0,
+                pc_dtype,
             )
 
         # Hand our "creation" refcount on pool_storage over to the

@@ -131,18 +131,18 @@ def chip_gen_from_cuda_cc(major: int, minor: int) -> ChipGeneration:
 
 
 def chip_gen_from_metal_info(info: dict) -> ChipGeneration:
-    """Map MLX's ``mx.device_info()`` output to ``ChipGeneration``.
+    """Map Metal device info to ``ChipGeneration``.
 
-    MLX exposes ``architecture`` as a family string (e.g. ``"applegpu_g15d"``
-    for M3 Ultra). We map known families; unknowns default to METAL_M3
-    (the current quark baseline — bf16 MMA via simdgroup_matrix).
+    ``info`` is a dict with ``architecture`` (e.g. ``"applegpu_g17s"``)
+    and ``device_name`` (e.g. ``"Apple M5 Max"``). We map known
+    families; unknowns default to METAL_M3 (bf16 MMA baseline).
     """
     arch = str(info.get("architecture", "")).lower()
     name = str(info.get("device_name", "")).lower()
     hay = f"{arch} {name}"
-    # M5+ placeholder: once Apple ships the tensor-core intrinsic the
-    # architecture string will change; reserved for detection.
-    if "m5" in hay or "applegpu_g16" in hay:
+    # M5 family: applegpu_g17{s,d,g} (s=Max, d=Ultra, g=base/Pro).
+    # Also match "m5" in the device_name string as a fallback.
+    if "m5" in hay or "applegpu_g17" in hay:
         return ChipGeneration.METAL_M5
     # M3 family and onwards through M4 — all share the bf16-MMA simdgroup
     # surface until M5 adds the new primitive.
@@ -247,6 +247,16 @@ class DeviceCaps:
     # tuple-membership checks. Populated by the driver probe.
     has_atomic_add_bf16x2: bool = False
 
+    # Metal 4 API family support (macOS 26+). Gates MSL 4.0 language
+    # version at compile time (required for MetalPerformancePrimitives
+    # includes). Non-Metal backends: False.
+    supports_metal4: bool = False
+
+    # Neural Accelerator (NAX) hardware available — Apple GPU gen >= 17
+    # (Mac) or >= 18 (iPhone). Gates MPP matmul2d emission in the
+    # lowerer. Implies supports_metal4. Non-Metal backends: False.
+    supports_nax: bool = False
+
     # Native single-op subgroup reduction (``simd_sum`` / ``simd_max`` on
     # Metal; ``OpGroupNonUniformAdd`` on SPIR-V). CUDA's only primitive
     # is ``shfl.sync.bfly.b32``, so the PTX lowerer expands
@@ -328,7 +338,7 @@ def _detect_family() -> DeviceFamily:
 
     Detection order (first match wins):
       1. CUDA   (libcuda probe finds a device)
-      2. Metal  (MLX metal available)
+      2. Metal  (metal-cpp driver detects a device)
       3. CPU    (always available as a fallback)
 
     ROCm / OpenCL aren't auto-detected; force via ``QUARK_FORCE_BACKEND``
@@ -346,11 +356,11 @@ def _detect_family() -> DeviceFamily:
     except Exception:
         pass
     try:
-        import mlx.core as mx
+        from quark.drivers.metal import is_available
 
-        if mx.metal.is_available():
+        if is_available():
             return DeviceFamily.METAL
-    except ImportError:
+    except Exception:
         pass
     return DeviceFamily.CPU
 
@@ -372,7 +382,7 @@ def current_device() -> Device:
     if family is DeviceFamily.CUDA:
         return _probe_cuda_via_libcuda(index=0)
     if family is DeviceFamily.METAL:
-        return _probe_metal_via_mlx(index=0)
+        return _probe_metal(index=0)
     raise NotImplementedError(
         f"current_device(): family {family.value!r} not yet implemented. "
         f"Set {_FORCE_BACKEND_ENV}=cuda or {_FORCE_BACKEND_ENV}=metal."
@@ -500,11 +510,11 @@ def _default_atomic_add_dtypes_for(family: DeviceFamily, arch_tag: str) -> froze
     return frozenset({DType.F32, DType.S32, DType.U32})
 
 
-def _probe_metal_via_mlx(index: int) -> Device:
-    """Metal probe via MLX's device_info()."""
-    from quark.drivers.mlx import MlxDriver
+def _probe_metal(index: int) -> Device:
+    """Metal probe via the native metal-cpp + nanobind driver."""
+    from quark.drivers.metal import MetalDriver
 
-    caps = MlxDriver().probe(index)
+    caps = MetalDriver().probe(index)
     return Device(family=DeviceFamily.METAL, index=index, caps=caps)
 
 

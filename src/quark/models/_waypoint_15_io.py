@@ -15,54 +15,31 @@ _IS_METAL = sys.platform == "darwin"
 
 
 # ---------------------------------------------------------------
-# Backend-dispatch helpers (CUDA QuarkTensor vs Metal mx.array)
+# Tensor helpers (QuarkTensor only — MLX dropped with the rest of
+# the world_engine integration; both backends share the unified
+# QuarkTensor type now).
 # ---------------------------------------------------------------
 
 
 def _reshape(x, *shape):
-    if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.reshape(x, shape)
     return x.reshape(*shape)
 
 
 def _permute(x, dims):
-    if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.transpose(x, dims)
     return x.permute(*dims)
 
 
 def _cat(tensors, dim=0):
-    if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.concatenate(tensors, axis=dim)
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.cat(tensors, dim=dim)
 
 
 def _astype(x, dtype: str):
-    if _IS_METAL:
-        import mlx.core as mx
-
-        _dt = {"bf16": mx.bfloat16, "f16": mx.float16, "f32": mx.float32, "s32": mx.int32}
-        return x.astype(_dt.get(dtype, mx.bfloat16))
     return x.astype(dtype)
 
 
 def _from_numpy(arr, dtype: str = "bf16"):
-    if _IS_METAL:
-        import mlx.core as mx
-        import numpy as _np
-
-        if dtype == "bf16" and arr.dtype == _np.float32:
-            u16 = (arr.view(_np.uint32) >> 16).astype(_np.uint16)
-            return mx.array(u16).view(mx.bfloat16)
-        return mx.array(arr)
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.from_numpy(arr, dtype=dtype)
@@ -72,10 +49,6 @@ def _tile_b_to_patched(b, C: int, ph: int, pw: int):
     """Tile ``[C]`` bias into ``[C * ph * pw]`` by repeating each
     element ``ph*pw`` times. Used by the unpatchify bias remap.
     """
-    if _IS_METAL:
-        import mlx.core as mx
-
-        return mx.tile(b[:, None, None], (1, ph, pw)).reshape(-1)
     import struct as _struct
 
     from quark.runtime.tensor import QuarkTensor
@@ -100,8 +73,9 @@ def remap_state_dict(raw_sd: dict, cfg) -> dict:
     per-block ``attn_cond`` / ``mlp_cond`` heads, flattened patch /
     unpatch weights, tiled unpatchify bias, padded ctrl-emb fc1, …).
 
-    Accepts ``QuarkTensor`` (CUDA) or ``mx.array`` (Metal) in the
-    input dict — both paths share the dispatch helpers above.
+    Accepts ``QuarkTensor`` from either backend — MLX support was
+    dropped along with the rest of the world_engine integration; the
+    helpers above all dispatch through QuarkTensor methods.
 
     Caller feeds the result directly into
     ``model.load_state_dict(..., strict=False)``.
@@ -225,13 +199,15 @@ def remap_state_dict(raw_sd: dict, cfg) -> dict:
         raw_k = int(fc1_w.shape[1])
         padded_k = ((raw_k + 15) // 16) * 16
         if padded_k > raw_k:
+            # Per the new ``QuantConfig`` API the residual stream is
+            # bf16 throughout — the ``cfg.use_f16`` boolean it
+            # superseded was dropped in the standalone-Engine PR. The
+            # MLX branch (``mlx.core``) is gone with the rest of the
+            # MLX deps on this branch; ``.to_numpy()`` covers both
+            # CUDA and Metal callers (the underlying tensor is a
+            # quark tensor either way).
             half_dt = "bf16"
-            if _IS_METAL:
-                import mlx.core as mx
-
-                w_np = _np.array(fc1_w.astype(mx.float32))
-            else:
-                w_np = (fc1_w.astype("f32") if fc1_w.dtype != "f32" else fc1_w).to_numpy()
+            w_np = (fc1_w.astype("f32") if fc1_w.dtype != "f32" else fc1_w).to_numpy()
             padded = _np.zeros((w_np.shape[0], padded_k), dtype=_np.float32)
             padded[:, :raw_k] = w_np
             fc1_w = _from_numpy(padded, dtype=half_dt)
@@ -262,15 +238,49 @@ def build_ctrl_buffer(model):
     dtype = model.ctrl_input_dtype()
     n_buttons = model.cfg.n_buttons
 
-    if _IS_METAL:
-        import mlx.core as mx
+    from quark.runtime.tensor import QuarkTensor
 
-        mx_dt = mx.bfloat16 if dtype == "bf16" else mx.float16
-        dev = mx.zeros(shape, dtype=mx_dt)
-        host = _np.zeros(shape, dtype=_np.float32)
+    dev = QuarkTensor.zeros(*shape, dtype=dtype)
+    host = _np.zeros(shape, dtype=_np.float32)
+    # Pre-allocate the packed-bits staging buffer once; per-call is an
+    # in-place f32→target cast + a single host→device write into the
+    # stable device pointer.
+    if dtype == "bf16":
+        staged = _np.zeros(shape, dtype=_np.uint16)
+    else:  # f16
+        staged = _np.zeros(shape, dtype=_np.float16)
+
+    # CUDA path: pin a CudaRuntime handle once and use ``memcpy_htod``
+    # so the per-frame fill is graph-safe (no fresh alloc per call).
+    # Metal path: fall back to ``QuarkTensor.from_bytes`` rebinding,
+    # which round-trips host bytes through ``_md.pin_buffer`` — the
+    # control input is one tiny tensor per frame, so the extra alloc
+    # is negligible.
+    if not _IS_METAL:
+        from quark.runtime.cuda import CudaRuntime
+
+        rt = CudaRuntime.instance()
+    else:
+        rt = None
+
+    # Metal path: write into a STABLE pool buffer via ctypes.memmove,
+    # not a fresh ``from_numpy`` per call. Earlier code re-pinned a
+    # new pool slot every frame ("rebinding" through ``QuarkTensor.from_numpy``).
+    # Even though the old slot's refcount drops, ``g_lazy_buffers``
+    # never shrinks — and on long-running consumers (Biome's hot loop,
+    # 2000+ frames per session) the pool fragments + the Metal driver
+    # eventually wedges silently. ``ctypes.memmove`` into the stable
+    # ``dev.data_ptr()`` keeps the buffer count bounded.
+    if _IS_METAL:
+        import ctypes as _ctypes
+
+        from quark.runtime.sync import synchronize
+
+        dev_ptr = dev.data_ptr()
+        staged_addr = staged.ctypes.data
+        staged_nbytes = staged.nbytes
 
         def fill(ctrl):
-            nonlocal dev
             host.fill(0.0)
             host[0, 0] = float(ctrl.mouse[0])
             host[0, 1] = float(ctrl.mouse[1])
@@ -279,28 +289,19 @@ def build_ctrl_buffer(model):
                     host[0, 2 + b] = 1.0
             host[0, 2 + n_buttons] = float(ctrl.scroll_wheel)
             if dtype == "bf16":
-                u16 = (host.view(_np.uint32) >> 16).astype(_np.uint16)
-                dev = mx.array(u16).view(mx.bfloat16).reshape(*shape)
+                staged[:] = (host.view(_np.uint32) >> 16).astype(_np.uint16)
             else:
-                dev = mx.array(host.astype(_np.float16))
+                staged[:] = host.astype(_np.float16)
+            # Drain pending kernels that read the previous frame's
+            # ctrl tensor, then memmove the new bytes in place.
+            synchronize()
+            _ctypes.memmove(dev_ptr, staged_addr, staged_nbytes)
             return dev
 
         return dev, fill
 
-    from quark.runtime.cuda import CudaRuntime
-    from quark.runtime.tensor import QuarkTensor
-
-    dev = QuarkTensor.zeros(*shape, dtype=dtype)
-    host = _np.zeros(shape, dtype=_np.float32)
-    # Pre-allocate the packed-bits staging buffer once; per-call is an
-    # in-place f32→target cast + a single memcpy_htod into the stable
-    # device pointer (graph-safe).
-    if dtype == "bf16":
-        staged = _np.zeros(shape, dtype=_np.uint16)
-    else:  # f16
-        staged = _np.zeros(shape, dtype=_np.float16)
-    rt = CudaRuntime.instance()
-
+    # CUDA path: pinned device pointer + ``memcpy_htod`` on the
+    # capture stream so the per-frame fill is graph-safe.
     def fill(ctrl):
         host.fill(0.0)
         host[0, 0] = float(ctrl.mouse[0])
@@ -325,29 +326,57 @@ def build_ctrl_buffer(model):
 
 
 def _to_f32_np(t):
-    """Pull a backend-native tensor down to a numpy f32 array."""
+    """Pull a backend-native tensor down to a numpy f32 array.
+
+    Three input shapes:
+      * ``QuarkTensor`` — has ``to_numpy``; cast to f32 then materialise.
+      * Tagged numpy carrier (Metal weight): a numpy array that may have
+        a ``quark_dtype`` attribute. bf16 is stored as ``uint16`` with
+        the top half of an f32; widen by left-shift. f16 / f32 cast
+        directly.
+      * Plain numpy array: cast to f32.
+    """
     import numpy as _np
 
     if hasattr(t, "to_numpy"):
         return t.astype("f32").to_numpy()
-    if _IS_METAL:
-        import mlx.core as mx
-
-        return _np.array(t.astype(mx.float32)) if hasattr(t, "astype") else _np.array(t)
-    return _np.array(t, dtype=_np.float32)
+    arr = _np.asarray(t)
+    qd = getattr(t, "quark_dtype", None)
+    if qd == "bf16" or arr.dtype == _np.uint16:
+        return (arr.astype(_np.uint32) << 16).view(_np.float32).reshape(arr.shape)
+    if qd == "f16" or arr.dtype == _np.float16:
+        return arr.astype(_np.float32)
+    return arr.astype(_np.float32)
 
 
 def _np_to_device(arr_f32, dt: str):
-    """Move an f32 numpy array to the active backend at ``dt``."""
+    """Move an f32 numpy array to the active backend at ``dt``.
+
+    On Metal returns a tagged numpy carrier so ``DType.from_backend``
+    resolves it correctly on the dispatch side (a bare ``uint16``
+    carrier without the ``quark_dtype`` tag would resolve to
+    ``DType.U16`` and fail the kernel dtype checks). On CUDA returns
+    a ``QuarkTensor``.
+    """
     import numpy as _np
 
     if _IS_METAL:
-        import mlx.core as mx
-
         if dt == "bf16":
-            u16 = (arr_f32.view(_np.uint32) >> 16).astype(_np.uint16)
-            return mx.array(u16).view(mx.bfloat16)
-        return mx.array(arr_f32.astype(_np.float16 if dt == "f16" else _np.float32))
+            raw = (arr_f32.view(_np.uint32) >> 16).astype(_np.uint16)
+        elif dt == "f16":
+            raw = arr_f32.astype(_np.float16)
+        else:
+            raw = arr_f32.astype(_np.float32)
+
+        class _Tagged(_np.ndarray):
+            def __array_finalize__(self, obj):
+                if obj is None:
+                    return
+                self.quark_dtype = getattr(obj, "quark_dtype", None)
+
+        tagged = raw.view(_Tagged)
+        tagged.quark_dtype = dt
+        return tagged
     from quark.runtime.tensor import QuarkTensor
 
     return QuarkTensor.from_numpy(arr_f32, dtype=dt)

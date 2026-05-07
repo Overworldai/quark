@@ -46,7 +46,7 @@ class TestValueShape:
         assert s.width == w
         assert s.bytes == 4 * w
 
-    @pytest.mark.parametrize("bad", [0, 5, 6, 7, 9, 32, -1])
+    @pytest.mark.parametrize("bad", [0, 5, 6, 7, 9, 24, -1])
     def test_invalid_widths(self, bad: int):
         with pytest.raises(ValueError, match="width must be one of"):
             ValueShape(DType.F32, width=bad)

@@ -125,10 +125,7 @@ def capture_graph(stream: int = 0, *, quiet: bool = False):
     hundreds of those lines per autotune run.
     """
     if _IS_METAL:
-        raise NotImplementedError(
-            "capture_graph: Metal graph capture not yet implemented. "
-            "See proposals/MLX_FFI_MIGRATION.md Stage 2."
-        )
+        raise NotImplementedError("capture_graph: Metal graph capture not yet implemented.")
 
     from quark.runtime.cuda import CudaRuntime
 

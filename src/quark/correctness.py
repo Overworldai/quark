@@ -1,9 +1,9 @@
 """Correctness metric for quark kernels — cosine similarity, numpy-only.
 
-Per the numpy-refs migration: zero torch / mlx dependency at the
-autotune correctness gate. Inputs are normalized to f32 numpy via
+Per the numpy-refs migration: zero torch dependency at the autotune
+correctness gate. Inputs are normalized to f32 numpy via
 ``quark.runtime.npconv.to_f32_numpy`` regardless of whether they
-arrive as ``QuarkTensor``, ``mx.array``, or raw numpy arrays.
+arrive as ``QuarkTensor`` or raw numpy arrays.
 
 Why cosine similarity:
 
@@ -84,10 +84,10 @@ class CorrectnessResult:
 
 
 def _dtype_hint(x: Any, fallback: DType | None) -> str | None:
-    """Best-effort dtype hint for ``to_f32_numpy``. QuarkTensor and
-    mx.array self-describe their dtype; raw numpy u16/u8 arrays can't,
-    so we fall back to the kernel's declared ``out_dtype`` when the
-    caller passed a raw numpy carrier."""
+    """Best-effort dtype hint for ``to_f32_numpy``. ``QuarkTensor``
+    self-describes its dtype; raw numpy u16/u8 arrays can't, so we fall
+    back to the kernel's declared ``out_dtype`` when the caller passed
+    a raw numpy carrier."""
     if isinstance(x, np.ndarray) and x.dtype in (np.uint16, np.uint8):
         if fallback is None:
             return None
@@ -128,8 +128,7 @@ def check_correctness(
     """Compare ``out`` against ``ref`` via cosine similarity.
 
     Both arguments are normalized to f32 numpy internally — accepts
-    ``QuarkTensor`` (CUDA runtime), ``mx.array`` (Metal), or raw
-    numpy arrays. ``out_dtype`` serves double duty: it picks the
+    ``QuarkTensor`` or raw numpy arrays. ``out_dtype`` serves double duty: it picks the
     default threshold *and* disambiguates numpy carrier dtypes (e.g.
     a raw ``uint16`` array could be bf16 or a genuine u16 index
     buffer — the declared kernel ``out_dtype`` decides).

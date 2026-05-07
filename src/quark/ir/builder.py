@@ -439,6 +439,13 @@ class Builder:
     def sqrt(self, v: Value, name: str = "") -> Value:
         return self._math("sqrt", v, name)
 
+    def exp(self, v: Value, name: str = "") -> Value:
+        return self._math("exp", v, name)
+
+    def exp_approx(self, v: Value, name: str = "") -> Value:
+        """Fast exp (``metal::fast::exp`` on MSL, ``ex2.approx`` + mul on PTX)."""
+        return self._math("exp_approx", v, name)
+
     def exp2(self, v: Value, name: str = "") -> Value:
         return self._math("exp2", v, name)
 
@@ -1123,14 +1130,74 @@ class Builder:
             )
         )
 
+    def store_matrix_gate_residual(
+        self,
+        dst: Tensor,
+        residual: Tensor,
+        gate: Tensor,
+        frag: Value,
+        shape_id: str,
+        row: Value | int = 0,
+        col: Value | int = 0,
+        m_per_group: int = 1,
+    ) -> None:
+        """Emit a fragment store fused with the AdaGate-residual epilogue.
+
+        Writes ``dst[r, c] = residual[r, c] + gate[r // m_per_group, c]
+        * frag[r, c]``. NAX-only (Metal M5+); the frag must be the
+        destination of a NAX MmaOp (width-16 F32). See
+        ``StoreMatrixGateResidualOp`` for the full contract.
+
+        ``m_per_group`` is ``M / G`` from the GemmSpec — the row-stride
+        between gate rows. ``m_per_group >= M`` (the spec ``G == 1``
+        case) gives the constant-row-0 broadcast.
+        """
+        if shape_id not in self.module.kernel_shapes:
+            raise KeyError(f"store_matrix_gate_residual: shape_id {shape_id!r} not registered")
+        row_v = row if not isinstance(row, int) else self.const(DType.U32, row)
+        col_v = col if not isinstance(col, int) else self.const(DType.U32, col)
+        attrs: dict = {
+            "dst_tensor": dst,
+            "residual_tensor": residual,
+            "gate_tensor": gate,
+            "shape_id": shape_id,
+            "which": "d",
+            "m_per_group": int(m_per_group),
+        }
+        self._emit(
+            _op.StoreMatrixGateResidualOp(
+                operands=(frag, row_v, col_v),
+                attrs=attrs,
+            )
+        )
+
     def mma(
         self,
         shape_id: str,
         a: Value,
         b: Value,
         c: Value,
+        *,
+        transpose_b: bool = True,
+        accumulate: bool = True,
         name: str = "",
     ) -> Value:
+        """Emit an MMA: ``d = a * (b^T if transpose_b else b) [+ c]``.
+
+        ``transpose_b`` is only meaningful for backends whose MMA
+        primitive exposes the choice — NAX ``matmul2d_descriptor`` does;
+        PTX ``mma.sync`` doesn't (the layout is fixed by the shape's
+        mnemonic). Default ``True`` matches every existing call site
+        and the registered NAX shape's current ``transpose_b=true``
+        emission. PTX visitor asserts this is ``True``; NAX visitor
+        reads it. Used by attention's GEMM2 (``S @ V`` with V loaded
+        K-contiguous → no transpose).
+
+        ``accumulate=False`` selects matmul2d's ``multiply`` mode (D =
+        A*B; C is ignored). The first MMA in a K-loop chain can use
+        this to skip both reading C and the upstream zero-init that
+        would have produced it. NAX-only; PTX asserts True.
+        """
         shape = self.module.kernel_shapes.get(shape_id)
         if shape is None:
             raise KeyError(f"mma: shape_id {shape_id!r} not registered")
@@ -1140,11 +1207,18 @@ class Builder:
         reg_count = shape.c_regs if shape.c_regs > 0 else 1
         carrier_dtype = _frag_carrier_dtype(shape, "d")
         out = self._fresh(ValueShape(carrier_dtype, width=reg_count), name or "mma_d")
+        attrs: dict = {"shape_id": shape_id}
+        if not transpose_b:
+            # Only set when non-default to keep IR text concise; visitors
+            # treat the absence of the attr as ``True``.
+            attrs["transpose_b"] = False
+        if not accumulate:
+            attrs["accumulate"] = False
         self._emit(
             _op.MmaOp(
                 results=(out,),
                 operands=(a, b, c),
-                attrs={"shape_id": shape_id},
+                attrs=attrs,
             )
         )
         return out
@@ -1441,6 +1515,37 @@ class Builder:
             if sel_var is not None:
                 sel_var.producer = op
         self._emit(op)
+        return out
+
+    def frag_slice(
+        self,
+        frag: Value,
+        *,
+        start: int,
+        length: int,
+        name: str = "",
+    ) -> Value:
+        """Take a contiguous component slice of a fragment Value.
+
+        Used by NAX attention to split a width-16 GEMM1 accumulator
+        (two 16×16 N-tiles per lane) into two width-8 A operands for
+        GEMM2. Pure component-rebinding at lower time — no MSL emitted,
+        the slice's storage class is inherited from the source.
+        """
+        if start < 0 or length < 1:
+            raise ValueError(f"frag_slice: start={start}, length={length} must be ≥0/≥1")
+        if start + length > frag.width:
+            raise ValueError(
+                f"frag_slice: slice [{start}:{start + length}] exceeds source width {frag.width}"
+            )
+        out = self._fresh(ValueShape(frag.dtype, width=length), name or "frag_slice")
+        self._emit(
+            _op.FragSliceOp(
+                results=(out,),
+                operands=(frag,),
+                attrs={"start": int(start), "length": int(length)},
+            )
+        )
         return out
 
     def frag_reduce(
