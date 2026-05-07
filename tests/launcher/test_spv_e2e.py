@@ -253,6 +253,46 @@ class TestExistingKernelsCompile:
         assert ck.module.handle != 0
         assert ck.module.n_buffers == 1  # single ``T`` buffer
 
+    def test_euler_step_kernel_compiles(self, spv_device):
+        """``EulerStepKernel`` (in-tree, the diffusion-scheduler euler
+        step that runs every denoise iter) lowers cleanly. Exercises
+        the multi-buffer + multi-axis (block_idx 'y' / 'x') visitor
+        surface."""
+        from quark.kernels.euler_step.kernel import (
+            EulerStepConfig,
+            EulerStepKernel,
+            EulerStepSpec,
+        )
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            EulerStepKernel,
+            EulerStepSpec(N=128, dtype=DType.F32),
+            EulerStepConfig(n_warps=2, elems_per_block=128),
+        )
+        assert ck.module.handle != 0
+
+    def test_copy_strided_kernel_compiles(self, spv_device):
+        """``CopyStridedKernel`` (in-tree) lowers cleanly with a
+        small enough config to fit Battlemage's 1024-thread
+        workgroup ceiling. ``CopyStridedConfig`` defaults exceed
+        the ceiling — the test pins a fitted config."""
+        from quark.kernels.copy_strided.kernel import (
+            CopyStridedConfig,
+            CopyStridedKernel,
+            CopyStridedSpec,
+        )
+        from quark.launcher import Launcher
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            CopyStridedKernel,
+            CopyStridedSpec(N=64, dtype=DType.F32),
+            CopyStridedConfig(n_warps=1, elems_per_block=32),
+        )
+        assert ck.module.handle != 0
+
     def test_silu_kernel_compiles(self, spv_device):
         """``SiLUKernel`` (in-tree, the elementwise activation that
         sits in the MLP fc1 epilogue) lowers cleanly through the

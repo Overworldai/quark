@@ -47,13 +47,18 @@ from quark.ir.op import (
     CmpOp,
     ConstOp,
     ConvertOp,
+    GroupIdOp,
     IfRegionOp,
+    LaneIdOp,
     LoadOp,
     MathOp,
     SelectOp,
     SmemAllocOp,
     StoreOp,
+    SubgroupIdOp,
     SubgroupReduceOp,
+    ShuffleOp,
+    ThreadIdInGroupOp,
     ThreadIdxOp,
     VecBuildOp,
     VecExtractOp,
@@ -334,102 +339,210 @@ _ARITH_KIND_TO_SPV: dict[tuple[str, DType], str] = {
 }
 
 
-def _ensure_local_invocation_id(ctx: _SpvCtx) -> str:
-    """Return the SSA id of LocalInvocationId.x, declaring the
-    builtin variable + a u32 load if not already present."""
-    if ctx.local_inv_id_x_loaded:
-        return ctx.local_inv_id_x_loaded
-    if not ctx.local_inv_id_var:
+_DIM_TO_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+def _ensure_builtin_vec3_component(
+    ctx: _SpvCtx,
+    *,
+    var_attr: str,
+    cache_attr_prefix: str,
+    builtin_name: str,
+    dim: str,
+) -> str:
+    """Generic helper for builtin ``BuiltIn`` vec3 inputs:
+    ``LocalInvocationId``, ``WorkgroupId``, etc.
+
+    Lazily declares the ``OpVariable Input`` for the builtin (one per
+    builtin per kernel), loads its vec3 once, then extracts the
+    requested component. Component extracts are also cached so a
+    kernel that reads ``thread_idx("x")`` twice doesn't emit two
+    ``OpCompositeExtract`` ops.
+    """
+    if dim not in _DIM_TO_INDEX:
+        raise ValueError(f"_ensure_builtin: bad dim={dim!r}")
+
+    cached_attr = f"{cache_attr_prefix}_{dim}_loaded"
+    cached = getattr(ctx, cached_attr, "")
+    if cached:
+        return cached
+
+    var_id = getattr(ctx, var_attr, "")
+    if not var_id:
         u32 = ctx.text.type_int(32, signed=False)
         v3u = ctx.text.type_vec(u32, 3)
         ptr = ctx.text.type_pointer("Input", v3u)
-        var_id = ctx.text.alloc_id("LocalInvocationId")
+        var_id = ctx.text.alloc_id(builtin_name)
         ctx.text.add_type_line(f"{var_id} = OpVariable {ptr} Input")
-        ctx.text.add_decoration(f"OpDecorate {var_id} BuiltIn LocalInvocationId")
-        ctx.local_inv_id_var = var_id
-    # Load the full vec3, then extract .x.
+        ctx.text.add_decoration(f"OpDecorate {var_id} BuiltIn {builtin_name}")
+        setattr(ctx, var_attr, var_id)
+
     u32 = ctx.text.type_int(32, signed=False)
     v3u = ctx.text.type_vec(u32, 3)
-    loaded = ctx.text.alloc_id("liid_vec")
-    ctx.text.emit_function(f"{loaded} = OpLoad {v3u} {ctx.local_inv_id_var}")
-    x_id = ctx.text.alloc_id("liid_x")
-    ctx.text.emit_function(f"{x_id} = OpCompositeExtract {u32} {loaded} 0")
-    ctx.local_inv_id_x_loaded = x_id
-    return x_id
+    # Load the vec3 once per (kernel, dim-extract) pair. Cache the
+    # vec on the ctx by stashing it under the ``_x_loaded`` slot when
+    # dim==x is the first read; subsequent dims need a fresh load
+    # only when neither ``y`` nor ``z`` was previously cached. Simple
+    # path: each dim has its own cache slot, so emit one ``OpLoad``
+    # per dim accessed (cheap — Apple/Intel's compiler folds them).
+    loaded = ctx.text.alloc_id(f"{builtin_name}_{dim}_vec")
+    ctx.text.emit_function(f"{loaded} = OpLoad {v3u} {var_id}")
+    res_id = ctx.text.alloc_id(f"{builtin_name}_{dim}")
+    ctx.text.emit_function(
+        f"{res_id} = OpCompositeExtract {u32} {loaded} {_DIM_TO_INDEX[dim]}"
+    )
+    setattr(ctx, cached_attr, res_id)
+    return res_id
+
+
+def _ensure_local_invocation_id(ctx: _SpvCtx, dim: str = "x") -> str:
+    return _ensure_builtin_vec3_component(
+        ctx,
+        var_attr="local_inv_id_var",
+        cache_attr_prefix="local_inv_id",
+        builtin_name="LocalInvocationId",
+        dim=dim,
+    )
 
 
 def _visit_thread_idx(op: ThreadIdxOp, ctx: _SpvCtx) -> None:
-    """Today only handles the .x component (the only one vec_add
-    needs). .y / .z extend trivially; defer until a kernel demands
-    them."""
+    """``thread_idx(dim)`` → ``LocalInvocationId.<dim>``."""
     (out,) = op.results
     dim = op.attrs.get("dim", "x")
-    if dim != "x":
-        raise NotImplementedError(
-            f"_visit_thread_idx: dim={dim!r} not yet wired (only 'x'). "
-            "See PORTABILITY_PLAN §3.2."
-        )
-    x_id = _ensure_local_invocation_id(ctx)
-    ctx.val_to_id[out.id] = x_id
+    ctx.val_to_id[out.id] = _ensure_local_invocation_id(ctx, dim)
 
 
-def _ensure_workgroup_id(ctx: _SpvCtx) -> str:
-    """Return the SSA id of WorkgroupId.x. Mirror of
-    ``_ensure_local_invocation_id`` but for the multi-workgroup
-    dispatch axis."""
-    if ctx.workgroup_id_x_loaded:
-        return ctx.workgroup_id_x_loaded
-    if not ctx.workgroup_id_var:
-        u32 = ctx.text.type_int(32, signed=False)
-        v3u = ctx.text.type_vec(u32, 3)
-        ptr = ctx.text.type_pointer("Input", v3u)
-        var_id = ctx.text.alloc_id("WorkgroupId")
-        ctx.text.add_type_line(f"{var_id} = OpVariable {ptr} Input")
-        ctx.text.add_decoration(f"OpDecorate {var_id} BuiltIn WorkgroupId")
-        ctx.workgroup_id_var = var_id
-    u32 = ctx.text.type_int(32, signed=False)
-    v3u = ctx.text.type_vec(u32, 3)
-    loaded = ctx.text.alloc_id("wgid_vec")
-    ctx.text.emit_function(f"{loaded} = OpLoad {v3u} {ctx.workgroup_id_var}")
-    x_id = ctx.text.alloc_id("wgid_x")
-    ctx.text.emit_function(f"{x_id} = OpCompositeExtract {u32} {loaded} 0")
-    ctx.workgroup_id_x_loaded = x_id
-    return x_id
+def _ensure_workgroup_id(ctx: _SpvCtx, dim: str = "x") -> str:
+    return _ensure_builtin_vec3_component(
+        ctx,
+        var_attr="workgroup_id_var",
+        cache_attr_prefix="workgroup_id",
+        builtin_name="WorkgroupId",
+        dim=dim,
+    )
 
 
 def _visit_block_idx(op: BlockIdxOp, ctx: _SpvCtx) -> None:
-    """``block_idx("x")`` → WorkgroupId.x.
-
-    SPIR-V's ``WorkgroupId`` is a vec3 of u32; the kernel's per-axis
-    block index is its component access. Like ``ThreadIdxOp``, only
-    ``"x"`` is wired in this first cut — y/z extend trivially when
-    a kernel demands them.
-    """
+    """``block_idx(dim)`` → ``WorkgroupId.<dim>``."""
     (out,) = op.results
     dim = op.attrs.get("dim", "x")
-    if dim != "x":
-        raise NotImplementedError(
-            f"_visit_block_idx: dim={dim!r} not yet wired (only 'x'). "
-            "See PORTABILITY_PLAN §3.2."
-        )
-    x_id = _ensure_workgroup_id(ctx)
-    ctx.val_to_id[out.id] = x_id
+    ctx.val_to_id[out.id] = _ensure_workgroup_id(ctx, dim)
+
+
+def _ensure_scalar_builtin(
+    ctx: _SpvCtx,
+    *,
+    var_attr: str,
+    cache_attr: str,
+    builtin_name: str,
+) -> str:
+    """Lazily declare a scalar ``BuiltIn`` u32 input variable + load
+    it. Used for ``SubgroupLocalInvocationId`` (lane id within
+    subgroup) and ``SubgroupId`` (subgroup id within workgroup) —
+    each is a single u32 the kernel reads directly, no vec3 dance.
+    """
+    cached = getattr(ctx, cache_attr, "")
+    if cached:
+        return cached
+    var_id = getattr(ctx, var_attr, "")
+    if not var_id:
+        u32 = ctx.text.type_int(32, signed=False)
+        ptr = ctx.text.type_pointer("Input", u32)
+        var_id = ctx.text.alloc_id(builtin_name)
+        ctx.text.add_type_line(f"{var_id} = OpVariable {ptr} Input")
+        ctx.text.add_decoration(f"OpDecorate {var_id} BuiltIn {builtin_name}")
+        setattr(ctx, var_attr, var_id)
+    u32 = ctx.text.type_int(32, signed=False)
+    res_id = ctx.text.alloc_id(builtin_name + "_v")
+    ctx.text.emit_function(f"{res_id} = OpLoad {u32} {var_id}")
+    setattr(ctx, cache_attr, res_id)
+    return res_id
+
+
+def _visit_lane_id(op: LaneIdOp, ctx: _SpvCtx) -> None:
+    """``lane_id()`` → ``SubgroupLocalInvocationId``.
+
+    SPIR-V's ``SubgroupLocalInvocationId`` is a u32 giving the
+    invocation's index within its subgroup (0..subgroup_size-1).
+    Adds the ``GroupNonUniform`` capability on first use — required
+    for ``OpGroupNonUniform*`` and for the builtin to be readable.
+    """
+    (out,) = op.results
+    ctx.text.add_capability("GroupNonUniform")
+    ctx.val_to_id[out.id] = _ensure_scalar_builtin(
+        ctx,
+        var_attr="lane_id_var",
+        cache_attr="lane_id_loaded",
+        builtin_name="SubgroupLocalInvocationId",
+    )
+
+
+def _visit_subgroup_id(op: SubgroupIdOp, ctx: _SpvCtx) -> None:
+    """``subgroup_id()`` → ``SubgroupId``.
+
+    The index of this invocation's subgroup within the workgroup
+    (0..n_subgroups_per_workgroup-1). Needed by the ``GroupId =
+    laneid >> 2`` PTX fragment formula's quark-IR analogue."""
+    (out,) = op.results
+    ctx.text.add_capability("GroupNonUniform")
+    ctx.val_to_id[out.id] = _ensure_scalar_builtin(
+        ctx,
+        var_attr="subgroup_id_var",
+        cache_attr="subgroup_id_loaded",
+        builtin_name="SubgroupId",
+    )
+
+
+def _visit_group_id(op: GroupIdOp, ctx: _SpvCtx) -> None:
+    """``group_id()`` = ``laneid >> 2`` (PTX MMA fragment formula).
+
+    Materialises a synthetic op rather than emitting raw shifts at
+    every call site — the IR exposes it as a first-class builtin.
+    SPIR-V has no equivalent builtin, so we lower as the explicit
+    shift on ``SubgroupLocalInvocationId``.
+    """
+    (out,) = op.results
+    lane = _ensure_scalar_builtin(
+        ctx,
+        var_attr="lane_id_var",
+        cache_attr="lane_id_loaded",
+        builtin_name="SubgroupLocalInvocationId",
+    )
+    ctx.text.add_capability("GroupNonUniform")
+    u32 = ctx.text.type_int(32, signed=False)
+    two = ctx.text.const_uint(2)
+    res_id = ctx.text.alloc_id("group_id")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(f"{res_id} = OpShiftRightLogical {u32} {lane} {two}")
+
+
+def _visit_thread_id_in_group(op: ThreadIdInGroupOp, ctx: _SpvCtx) -> None:
+    """``thread_id_in_group()`` = ``laneid & 3``. Companion to
+    ``group_id`` in the PTX MMA formula. Lowers as an explicit AND
+    against the lane id."""
+    (out,) = op.results
+    lane = _ensure_scalar_builtin(
+        ctx,
+        var_attr="lane_id_var",
+        cache_attr="lane_id_loaded",
+        builtin_name="SubgroupLocalInvocationId",
+    )
+    ctx.text.add_capability("GroupNonUniform")
+    u32 = ctx.text.type_int(32, signed=False)
+    three = ctx.text.const_uint(3)
+    res_id = ctx.text.alloc_id("tid_in_group")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(f"{res_id} = OpBitwiseAnd {u32} {lane} {three}")
 
 
 def _visit_block_dim(op: BlockDimOp, ctx: _SpvCtx) -> None:
-    """``block_dim("x")`` → constant from the kernel's ``LocalSize``.
-
-    SPIR-V doesn't expose WorkgroupSize as a runtime read like CUDA's
-    ``blockDim.x``; the value is fixed at compile time via
-    ``OpExecutionMode LocalSize``. The lowerer emits an
-    ``OpConstant uint`` with the value the entry point already
-    declared. This is correct so long as no kernel changes its
-    LocalSize after compile (none does — it's part of the kernel
-    spec).
-    """
+    """``block_dim(dim)`` → ``OpConstant uint`` from the kernel's
+    pinned ``LocalSize``. SPIR-V's ``OpExecutionMode LocalSize``
+    bakes the workgroup size at compile time; the constant the
+    visitor emits matches what the entry point declared."""
     (out,) = op.results
     dim = op.attrs.get("dim", "x")
-    axis = {"x": 0, "y": 1, "z": 2}.get(dim)
+    axis = _DIM_TO_INDEX.get(dim)
     if axis is None:
         raise ValueError(f"_visit_block_dim: bad dim={dim!r}")
     cid = ctx.text.const_uint(int(ctx.local_size[axis]))
@@ -964,6 +1077,56 @@ _SUBGROUP_REDUCE_TO_SPV: dict[tuple[str, str], str] = {
 }
 
 
+def _visit_shuffle(op: ShuffleOp, ctx: _SpvCtx) -> None:
+    """Cross-lane shuffle within a subgroup.
+
+    Maps the IR's shuffle ``kind`` to the SPIR-V op:
+      * ``"bfly"`` / ``"xor"`` → ``OpGroupNonUniformShuffleXor`` —
+        butterfly reduction's per-step communication, lane i talks to
+        lane (i ^ param).
+      * ``"up"`` → ``OpGroupNonUniformShuffleUp`` — receive from
+        lane (i - param), wrapping around to 0 for low-lane callers.
+      * ``"down"`` → ``OpGroupNonUniformShuffleDown`` — receive from
+        lane (i + param).
+      * ``"idx"`` → ``OpGroupNonUniformShuffle`` — receive from
+        lane = param (broadcast / pick a specific lane).
+
+    Capability: ``GroupNonUniformShuffle``. Subgroup scope (3) for
+    every kind — these ops are subgroup-local by definition.
+    """
+    (out,) = op.results
+    kind = op.attrs["kind"]
+    param = op.attrs["param"]
+    src_id = ctx.val_to_id[op.operands[0].id]
+    dst_t = _emit_dtype(ctx.text, out.dtype, ctx)
+
+    spv_op = {
+        "bfly": "OpGroupNonUniformShuffleXor",
+        "xor": "OpGroupNonUniformShuffleXor",
+        "up": "OpGroupNonUniformShuffleUp",
+        "down": "OpGroupNonUniformShuffleDown",
+        "idx": "OpGroupNonUniformShuffle",
+    }.get(kind)
+    if spv_op is None:
+        raise NotImplementedError(f"_visit_shuffle: kind={kind!r}")
+    ctx.text.add_capability("GroupNonUniformShuffle")
+
+    sg_scope = ctx.text.const_uint(3)  # Subgroup scope
+    # ``param`` may be a Python int (constant lane offset / xor mask)
+    # or a runtime IR Value (computed shuffle target). Both forms
+    # need a SPIR-V Value reference at the SPIR-V site.
+    from quark.ir.value import Value as _Value
+    if isinstance(param, _Value):
+        param_id = ctx.val_to_id[param.id]
+    else:
+        param_id = ctx.text.const_uint(int(param))
+    res_id = ctx.text.alloc_id(f"shuffle_{kind}")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = {spv_op} {dst_t} {sg_scope} {src_id} {param_id}"
+    )
+
+
 def _visit_subgroup_reduce(op: SubgroupReduceOp, ctx: _SpvCtx) -> None:
     """Cross-lane reduction within a subgroup.
 
@@ -1168,6 +1331,10 @@ _DISPATCH: dict[type, Any] = {
     ThreadIdxOp: _visit_thread_idx,
     BlockIdxOp: _visit_block_idx,
     BlockDimOp: _visit_block_dim,
+    LaneIdOp: _visit_lane_id,
+    SubgroupIdOp: _visit_subgroup_id,
+    GroupIdOp: _visit_group_id,
+    ThreadIdInGroupOp: _visit_thread_id_in_group,
     LoadOp: _visit_load,
     StoreOp: _visit_store,
     VecLoadOp: _visit_vec_load,
@@ -1179,6 +1346,7 @@ _DISPATCH: dict[type, Any] = {
     SmemAllocOp: _visit_smem_alloc,
     BarrierOp: _visit_barrier,
     SubgroupReduceOp: _visit_subgroup_reduce,
+    ShuffleOp: _visit_shuffle,
 }
 
 
