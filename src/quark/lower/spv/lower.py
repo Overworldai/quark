@@ -1185,6 +1185,21 @@ def _flatten_global_index(
             )
             flat = new_flat
     assert flat is not None
+    # Scalar ``dyn_offset`` (set by ``view(dyn_offset=…)`` /
+    # ``warp_lane_view``) is a flat offset added to the final
+    # address — used by per-warp staging smem in
+    # ``store_acc(per_warp=True)``. Drop = silent miscompile (each
+    # warp writes the same staging smem range and overwrites the
+    # others). Same class as the warp_dyn_offset coopmat fix
+    # (commit f0ade34) — different code path.
+    scalar_dyn = getattr(tensor, "dyn_offset", None)
+    if scalar_dyn is not None:
+        d_id = ctx.val_to_id[scalar_dyn.id]
+        new_flat = ctx.text.alloc_id("gflat_dyn")
+        ctx.text.emit_function(
+            f"{new_flat} = OpIAdd {u32} {flat} {d_id}"
+        )
+        flat = new_flat
     return flat
 
 
