@@ -2756,12 +2756,16 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
 
 
 def _ensure_lane_id(ctx: _SpvCtx) -> str:
-    """Return the SSA id for ``SubgroupLocalInvocationId``, declaring
-    the input variable + load lazily (mirrors the lane_id_x_loaded
-    cache the LaneIdOp visitor uses)."""
-    cached = getattr(ctx, "lane_id_x_loaded", "")
-    if cached:
-        return cached
+    """Return a freshly-loaded SSA id for ``SubgroupLocalInvocation
+    Id``, declaring the input variable lazily.
+
+    Mirrors ``_ensure_scalar_builtin`` — re-emits the OpLoad on every
+    call site (no SSA caching) so the load lives in the calling
+    block's scope, avoiding the cross-block dominance violation that
+    cached scalar builtins suffer when first emitted inside a region
+    (e.g. an if_'s then arm) and later referenced from a different
+    region (post-loop epilogue).
+    """
     var_id = getattr(ctx, "lane_id_var", "")
     if not var_id:
         u32 = ctx.text.type_int(32, signed=False)
@@ -2775,7 +2779,6 @@ def _ensure_lane_id(ctx: _SpvCtx) -> str:
     u32 = ctx.text.type_int(32, signed=False)
     loaded = ctx.text.alloc_id("SubgroupLocalInvocationId_v")
     ctx.text.emit_function(f"{loaded} = OpLoad {u32} {var_id}")
-    ctx.lane_id_x_loaded = loaded
     return loaded
 
 
