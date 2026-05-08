@@ -17,6 +17,7 @@ launcher = Launcher(device=device)
 _DTYPE_KEYS = (
     "dtype", "in_dtype", "kv_dtype", "compute_dtype",
     "src_dtype", "out_dtype", "partials_dtype",
+    "a_dtype", "b_dtype",
 )
 _OK = {DType.F32, DType.U32, DType.S32, DType.BF16}
 
