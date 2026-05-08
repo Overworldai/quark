@@ -564,6 +564,43 @@ class CompiledKernel:
         )
         return None
 
+    def launch_spv_fast(
+        self,
+        buffer_handles: list[int],
+        *,
+        push_bytes: bytes = b"",
+        sync: bool = True,
+    ) -> None:
+        """SPV fast path: skip the per-launch buffer-list dispatch and
+        scalar-pack work that ``launch()`` does. Caller provides the
+        already-resolved buffer-handle list (typically from
+        ``SpvDriver.allocate_buffer``) and the already-packed push-byte
+        payload — same arguments the C-side ``_sd.launch`` consumes.
+
+        Bench on Battlemage shows ``launch()`` (with its buffer-iter +
+        scalar-pack + grid_fn round-trip) costs ~70μs/call beyond the
+        ~24μs ``_sd.launch`` floor in the steady-state cmd_buf-cache
+        hit. Hot-path callers (functional wrappers, autotune-cache
+        warm loops) that already hold buffer handles can skip the
+        wrapper and land at the same overhead floor as the bench.
+
+        ``sync=False`` parallels ``launch()``'s knob — caller takes
+        responsibility for ``driver.sync()`` before reading outputs.
+
+        Returns ``None`` (output buffers are written in place via the
+        provided handle list, mirroring the CUDA path).
+        """
+        from quark.drivers import _spv_dispatch as _sd
+
+        _sd.launch(
+            self.module.handle,
+            self.grid_fn(*self.grid_args),
+            list(buffer_handles),
+            push_bytes,
+            sync=sync,
+        )
+        return None
+
     def launch_metal_fast(
         self,
         input_arrays: list,

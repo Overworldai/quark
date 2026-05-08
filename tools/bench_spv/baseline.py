@@ -138,22 +138,22 @@ for kcls in all_kernels():
     # loop, so compute it up-front and call the driver directly.
     grid = compiled.grid_fn(*compiled.grid_args)
     try:
-        us_sync = time_callable(
-            lambda: _sd.launch(
-                compiled.module.handle, grid, handles, b"", sync=True,
-            ),
+        us_eager = time_callable(
+            lambda: compiled.launch(buffers=handles),
+        )
+        us_fast = time_callable(
+            lambda: compiled.launch_spv_fast(handles),
         )
         us_async = time_callable(
-            lambda: _sd.launch(
-                compiled.module.handle, grid, handles, b"", sync=False,
-            ),
+            lambda: compiled.launch_spv_fast(handles, sync=False),
             sync_each=False,
         )
     except Exception as e:
         print(f"{name:20s}  bench failed: {e}")
         continue
-    
-    gbs_sync = bytes_total / (us_sync * 1e-6) / 1e9 if us_sync > 0 else 0
+
+    gbs_eager = bytes_total / (us_eager * 1e-6) / 1e9 if us_eager > 0 else 0
+    gbs_fast = bytes_total / (us_fast * 1e-6) / 1e9 if us_fast > 0 else 0
     gbs_async = bytes_total / (us_async * 1e-6) / 1e9 if us_async > 0 else 0
     spec_dt = next(
         (str(getattr(kernel.spec, k).value) for k in _DTYPE_KEYS
@@ -161,5 +161,5 @@ for kcls in all_kernels():
         "—",
     )
     print(f"{name:22s} {p.name:22s} {spec_dt:5s} "
-          f"sync {us_sync:8.2f}μs {gbs_sync:5.1f}GB/s | "
-          f"async {us_async:8.2f}μs {gbs_async:5.1f}GB/s")
+          f"eager {us_eager:7.1f}μs | fast {us_fast:7.1f}μs | "
+          f"async {us_async:7.1f}μs ({gbs_async:5.1f}GB/s)")
