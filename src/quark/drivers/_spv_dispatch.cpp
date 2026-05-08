@@ -778,7 +778,8 @@ void launch_internal(
     uint64_t pipeline_handle,
     uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
     const std::vector<uint64_t>& buffer_handles,
-    const void* push_bytes, uint32_t push_nbytes
+    const void* push_bytes, uint32_t push_nbytes,
+    bool sync = true
 ) {
     Globals& g = globals();
     CompiledPipeline& p = resolve_pipeline(pipeline_handle);
@@ -899,14 +900,28 @@ void launch_internal(
             static_cast<const uint8_t*>(push_bytes) + push_nbytes);
     }
 
+    // Async path: skip the per-launch fence wait. The caller takes
+    // responsibility for issuing ``sync()`` before reading any
+    // output buffer. We still consume + signal a fence so a
+    // subsequent ``sync()`` knows what to wait on, but we don't
+    // block here. With this set, the per-call wall time drops to
+    // pure submit cost — useful for benchmarks and any pipeline
+    // that batches many dispatches before the consumer reads.
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &p.cached_cmd_buf;
-    check(vkResetFences(g.device, 1, &g.fence), "vkResetFences");
-    check(vkQueueSubmit(g.queue, 1, &si, g.fence), "vkQueueSubmit");
-    check(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX),
-          "vkWaitForFences");
+    if (sync) {
+        check(vkResetFences(g.device, 1, &g.fence), "vkResetFences");
+        check(vkQueueSubmit(g.queue, 1, &si, g.fence), "vkQueueSubmit");
+        check(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX),
+              "vkWaitForFences");
+    } else {
+        // No fence — let the queue accumulate. ``sync()`` calls
+        // ``vkDeviceWaitIdle`` which drains everything in flight.
+        check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE),
+              "vkQueueSubmit");
+    }
 
     // The descriptor set + cmd_buf stay cached on the pipeline for
     // the next ``launch_internal`` to reuse. They're freed when the
@@ -1004,7 +1019,8 @@ NB_MODULE(_spv_dispatch, m) {
     m.def("launch", [](uint64_t pipeline,
                        nb::tuple grid,
                        std::vector<uint64_t> buffers,
-                       nb::bytes push_bytes) {
+                       nb::bytes push_bytes,
+                       bool sync) {
         if (grid.size() != 3) {
             throw std::runtime_error("launch: grid must be (x, y, z)");
         }
@@ -1013,16 +1029,21 @@ NB_MODULE(_spv_dispatch, m) {
         uint32_t gz = nb::cast<uint32_t>(grid[2]);
         launch_internal(pipeline, gx, gy, gz, buffers,
                         push_bytes.c_str(),
-                        static_cast<uint32_t>(push_bytes.size()));
+                        static_cast<uint32_t>(push_bytes.size()),
+                        sync);
     },
     nb::arg("pipeline"),
     nb::arg("grid"),
     nb::arg("buffers"),
     nb::arg("push_bytes") = nb::bytes(""),
-    "Record + submit + wait on one vkCmdDispatch. ``grid`` is "
-    "``(x, y, z)`` workgroup count. ``buffers`` is a list of buffer "
-    "handles in binding-slot order. ``push_bytes`` is the raw push-"
-    "constant payload (empty if push_constants_size was 0).");
+    nb::arg("sync") = true,
+    "Record + submit + (optionally) wait on one vkCmdDispatch. "
+    "``grid`` is ``(x, y, z)`` workgroup count. ``buffers`` is a "
+    "list of buffer handles in binding-slot order. ``push_bytes`` "
+    "is the raw push-constant payload (empty if push_constants_"
+    "size was 0). ``sync=False`` skips the per-launch fence wait — "
+    "caller must call ``sync()`` before reading output buffers. "
+    "Useful for batching dispatches in a tight loop.");
 
     m.def("sync", []() {
         Globals& g = globals();

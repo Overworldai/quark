@@ -402,15 +402,19 @@ class SpvDriver:
         grid: tuple[int, int, int],
         buffer_handles: list[int],
         push_bytes: bytes = b"",
+        *,
+        sync: bool = True,
     ) -> None:
-        """Record + submit + wait on one ``vkCmdDispatch`` of
-        ``compiled`` over ``buffer_handles`` at workgroup grid
+        """Record + submit + (optionally) wait on one ``vkCmdDispatch``
+        of ``compiled`` over ``buffer_handles`` at workgroup grid
         ``grid``.
 
-        Eager-submit shape today (every launch waits inline). The
-        accumulating-command-buffer optim — matching
-        ``_metal_dispatch``'s MTLCommandBuffer batching — lands once
-        a perf number from §3.7 v1 demands it.
+        ``sync=True`` (default) is the eager-submit shape — every
+        launch waits inline on the fence before returning. ``sync=
+        False`` skips the per-launch wait so callers can batch
+        dispatches before fencing once via :meth:`SpvDriver.sync`.
+        Useful for tight benchmark loops or framework-level pipeline
+        accumulation.
         """
         if len(buffer_handles) != compiled.n_buffers:
             raise ValueError(
@@ -427,6 +431,7 @@ class SpvDriver:
             grid,
             list(buffer_handles),
             push_bytes=push_bytes,
+            sync=sync,
         )
 
     def allocate_buffer(self, nbytes: int) -> tuple[int, int]:
