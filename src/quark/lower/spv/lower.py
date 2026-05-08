@@ -902,17 +902,59 @@ def _visit_for_loop(op: ForLoopOp, ctx: _SpvCtx) -> None:
     # next id (yielded value, materialised by YieldOp visitor), and the
     # element type id.
     carry_phi_ids: list[str] = []
+    # Pre-scan the body's terminator to detect when a carry's yielded
+    # value is the result of a coopmat-typed op (``MmaOp`` /
+    # ``LoadMatrixOp``). Those carries need an opaque
+    # ``OpTypeCooperativeMatrixKHR`` for the OpPhi at the loop
+    # header — a plain vec / array type would cause an OpPhi-vs-
+    # MMA-result type mismatch (the GEMM accumulator pattern).
+    body_term = op.body.terminator
+    yielded_vals = list(body_term.operands) if body_term is not None else []
+
+    def _coopmat_type_for_carry_yield(v):
+        if v is None:
+            return None
+        prod = v.producer
+        # Producer is an ``MmaOp`` or ``LoadMatrixOp``: the result is
+        # a coopmat. Resolve its coopmat type id from the registry.
+        if not isinstance(prod, (MmaOp, LoadMatrixOp)):
+            return None
+        from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+        cfg = _BY_SHAPE_ID.get(prod.attrs.get("shape_id"))
+        if cfg is None:
+            return None
+        which = "c" if isinstance(prod, MmaOp) else prod.attrs.get("which", "c")
+        rows, cols, dtype = _coop_dims_for(cfg.shape, which)
+        elem_t = _emit_dtype(ctx.text, dtype, ctx)
+        if dtype is DType.BF16:
+            ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+        use = _COOPMAT_USE[which]
+        _ensure_coopmat_caps(ctx)
+        return ctx.text.type_coop_matrix(
+            elem_t, scope=3, rows=rows, cols=cols, use=use,
+        )
+
     carry_next_ids: list[str] = []
     carry_type_ids: list[str] = []
+    carry_is_coopmat: list[bool] = []
     for i, body_var in enumerate(op.carried_body_vars):
-        # Carry value type — element dtype lifted to a vector when
-        # the carry's shape is wider than 1 (the accumulator pattern
-        # GEMM uses: the carry is a width-N f32 vec).
-        elem_t = _emit_dtype(ctx.text, body_var.dtype, ctx)
-        if body_var.width > 1:
-            c_type = ctx.text.type_vec(elem_t, body_var.width)
+        # Coopmat-yielding carry: the OpPhi must use the coopmat
+        # type, and the init value (typically a vec_build zero pattern)
+        # is splat-converted to a coopmat in the preheader below.
+        coop_t = (
+            _coopmat_type_for_carry_yield(yielded_vals[i])
+            if i < len(yielded_vals) else None
+        )
+        if coop_t is not None:
+            c_type = coop_t
+            carry_is_coopmat.append(True)
         else:
-            c_type = elem_t
+            elem_t = _emit_dtype(ctx.text, body_var.dtype, ctx)
+            if body_var.width > 1:
+                c_type = ctx.text.type_vec(elem_t, body_var.width)
+            else:
+                c_type = elem_t
+            carry_is_coopmat.append(False)
         phi_id = ctx.text.alloc_id(f"carry{i}")
         next_id = ctx.text.alloc_id(f"carry{i}_next")
         carry_phi_ids.append(phi_id)
@@ -930,6 +972,42 @@ def _visit_for_loop(op: ForLoopOp, ctx: _SpvCtx) -> None:
     # ── Branch from current block into preheader, then header ────────
     ctx.text.emit_function(f"OpBranch {preheader}")
     ctx.text.emit_function(f"{preheader} = OpLabel")
+
+    # Coopmat-typed carries need their (vec/array) init splat-
+    # converted to a coopmat of the matching type. ``OpComposite
+    # Construct`` on a CoopMat type with a single scalar component
+    # is the SPV_KHR_cooperative_matrix idiom for "fill the matrix
+    # with this scalar". For the GEMM accumulator pattern the init
+    # is a vec_build of zeros — we extract one element (which is
+    # also zero) and splat it into a zero coopmat. Only handles
+    # the all-same-element init case; non-uniform init would need
+    # a smem load detour.
+    for i, (init_id, type_id, is_coop) in enumerate(zip(
+        carried_init_ids, carry_type_ids, carry_is_coopmat,
+        strict=False,
+    )):
+        if not is_coop:
+            continue
+        body_var = op.carried_body_vars[i]
+        elem_dt = body_var.dtype
+        elem_t = _emit_dtype(ctx.text, elem_dt, ctx)
+        # Pick a scalar from the init's first slot (works when init
+        # is all-same; if not, the splat is an approximation that
+        # downstream MMA iterations will overwrite anyway).
+        if body_var.width > 1:
+            scalar_id = ctx.text.alloc_id(f"coop_init_scalar_{i}")
+            ctx.text.emit_function(
+                f"{scalar_id} = OpCompositeExtract {elem_t} {init_id} 0"
+            )
+        else:
+            scalar_id = init_id
+        new_init_id = ctx.text.alloc_id(f"coop_init_{i}")
+        ctx.text.emit_function(
+            f"{new_init_id} = OpCompositeConstruct {type_id} {scalar_id}"
+        )
+        # Replace the init id used by the OpPhi below.
+        carried_init_ids[i] = new_init_id
+
     ctx.text.emit_function(f"OpBranch {header}")
 
     # ── Header: phi nodes + loop merge + cond branch ────────────────
