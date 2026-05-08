@@ -1006,6 +1006,70 @@ class TestExistingKernelsCompile:
         # cooperative-matrix MulAdd path matches exactly.
         np.testing.assert_array_equal(got, ref.view(np.uint16))
 
+    def test_gemm_multi_k_iter_runs_end_to_end(self, spv_device):
+        """``GemmKernel`` runs E2E with K > BK so the for-loop runs
+        multiple iterations of the produce/consume tile pipeline.
+
+        The bug this regression-tests against: ``_flatten_index`` used
+        ``tensor.shape[-1]`` for the stride and ignored
+        ``GlobalTensor.view`` static_/dyn_ offsets — every K iteration
+        wrote the same gmem slice into smem, so the second iter's
+        accumulator added a duplicate of the first iter's contribution
+        instead of the next K-block. The offset-aware
+        ``_flatten_global_index`` threads the tile's
+        ``(static_row_offset, static_col_offset, dyn_row_offset,
+        dyn_col_offset)`` and the parent's per-axis ``stride`` through
+        the address arithmetic, fixing every gmem→smem produce inside
+        a multi-iter K loop."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.gemm.kernel import GemmKernel
+        from quark.kernels.gemm.spec import GemmSpec
+        from quark.kernels.gemm.config import GemmConfig
+        from quark.kernels.gemm.reference import gemm_reference_numpy
+        from quark.launcher import Launcher
+
+        M, N, K = 8, 16, 32  # K > BK → 2 iters
+        spec = GemmSpec(
+            M=M, N=N, K=K,
+            a_dtype=DType.BF16, b_dtype=DType.BF16,
+            acc_dtype=DType.F32, out_dtype=DType.BF16,
+        )
+        cfg = GemmConfig(
+            BM=8, BN=16, BK=16,
+            n_warps=1, n_stages=2,
+            main_shape="m8n16k16_intel_bf16_f32",
+        )
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(GemmKernel, spec, cfg)
+
+        tensors = GemmKernel.make_tensors_numpy({
+            "M": M, "N": N, "K": K,
+            "a_dtype": DType.BF16, "b_dtype": DType.BF16,
+            "out_dtype": DType.BF16,
+        })
+        ref = gemm_reference_numpy(spec, A=tensors["A"], B=tensors["B"])
+
+        handles: list[int] = []
+        out_ptr = 0
+        for buf in ck.param_spec.buffers:
+            arr = tensors[buf.name]
+            h, ptr = _sd.allocate_buffer(arr.nbytes)
+            if buf.name == "Out":
+                out_ptr = ptr
+            else:
+                ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
+            handles.append(h)
+
+        ck.launch(buffers=handles)
+
+        got = np.empty((M, N), dtype=np.uint16)
+        ctypes.memmove(got.ctypes.data, out_ptr, got.nbytes)
+        np.testing.assert_array_equal(got, ref.view(np.uint16))
+
     def test_value_residual_packed_kernel_compiles(self, spv_device):
         """``ValueResidualPackedKernel`` — packed-QKV variant. First
         kernel through SPV that needs PRED-typed values (boolean SSA

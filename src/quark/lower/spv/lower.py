@@ -1097,12 +1097,99 @@ def _ensure_buffer_var(tensor: GlobalTensor, binding_index: int,
     return var_id, elem_ptr
 
 
+def _flatten_global_index(
+    indices: tuple, tensor: "GlobalTensor", ctx: _SpvCtx,
+) -> str:
+    """Compute a flat element offset into a ``GlobalTensor``, threading
+    its ``view``/``tile`` offsets and the parent's per-axis
+    ``stride`` through the address arithmetic.
+
+    The IR's ``GlobalTensor.view(...)`` returns a sub-tensor whose
+    ``shape`` reflects the carved tile but whose ``stride`` and base
+    offsets are inherited from the parent. The previous helper
+    (``_flatten_index``) computed strides from the tile's ``shape``
+    and ignored the offsets — correct for top-level ``GlobalTensor``
+    but wrong for any tile loaded inside a kernel that does
+    ``g.A.view(row=m_base, col=k_col)``. The gemm cohort hits this
+    on every gmem→smem produce.
+
+    Address shape (for 2-D tensors, the common case):
+
+        flat = (static_row + dyn_row + i_row) * stride[0]
+             + (static_col + dyn_col + i_col) * stride[1]
+
+    1-D tensors use the same formula with axis 0 only and no
+    column offset.
+    """
+    u32 = ctx.text.type_int(32, signed=False)
+    static_offsets = (
+        getattr(tensor, "static_row_offset", 0),
+        getattr(tensor, "static_col_offset", 0),
+    )
+    dyn_offsets = (
+        getattr(tensor, "dyn_row_offset", None),
+        getattr(tensor, "dyn_col_offset", None),
+    )
+    strides = tensor.stride
+
+    flat: str | None = None
+    for axis, idx_v in enumerate(indices):
+        if axis >= len(strides):
+            # Trailing axes without strides — treat as 1-element-wide
+            # (collapse). Should not happen for well-formed tensors.
+            continue
+        stride_val = int(strides[axis])
+        # Compute (static + dyn + idx) for this axis.
+        idx_id = ctx.val_to_id[idx_v.id]
+        # Add static offset (compile-time int) when non-zero.
+        s_off = static_offsets[axis] if axis < len(static_offsets) else 0
+        if s_off:
+            const_id = ctx.text.const_uint(int(s_off))
+            new_id = ctx.text.alloc_id(f"gidx_s{axis}")
+            ctx.text.emit_function(
+                f"{new_id} = OpIAdd {u32} {idx_id} {const_id}"
+            )
+            idx_id = new_id
+        # Add dyn offset (runtime Value) when present.
+        d_off = dyn_offsets[axis] if axis < len(dyn_offsets) else None
+        if d_off is not None:
+            d_id = ctx.val_to_id[d_off.id]
+            new_id = ctx.text.alloc_id(f"gidx_d{axis}")
+            ctx.text.emit_function(
+                f"{new_id} = OpIAdd {u32} {idx_id} {d_id}"
+            )
+            idx_id = new_id
+        # Multiply by axis stride. Stride 1 → no mul.
+        if stride_val == 1:
+            term = idx_id
+        else:
+            stride_const = ctx.text.const_uint(stride_val)
+            term = ctx.text.alloc_id(f"gflat_mul{axis}")
+            ctx.text.emit_function(
+                f"{term} = OpIMul {u32} {idx_id} {stride_const}"
+            )
+        if flat is None:
+            flat = term
+        else:
+            new_flat = ctx.text.alloc_id(f"gflat_add{axis}")
+            ctx.text.emit_function(
+                f"{new_flat} = OpIAdd {u32} {flat} {term}"
+            )
+            flat = new_flat
+    assert flat is not None
+    return flat
+
+
 def _flatten_index(indices: tuple, shape: tuple, ctx: _SpvCtx) -> str:
     """Compute a row-major flat index from N-D indices + shape.
 
     Returns the SSA id of the flat-index ``OpIAdd``. For 1-D this
     is just the single index; for N-D, emits the ``i*S2 + j*S3 +
     k`` chain. ``shape`` is the IR's declared shape (post-pad).
+
+    For ``GlobalTensor`` accesses that need offset/stride awareness
+    (any kernel that uses ``view`` / ``tile`` to carve out
+    sub-tensors), use ``_flatten_global_index`` instead.
     """
     if len(indices) == 1:
         return ctx.val_to_id[indices[0].id]
@@ -1145,7 +1232,7 @@ def _visit_load(op: LoadOp, ctx: _SpvCtx) -> None:
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
         elem_type = ctx.tensor_to_elem_type[id(tensor)]
         zero = ctx.text.const_uint(0)
-        idx_id = _flatten_index(tuple(op.operands), tensor.shape, ctx)
+        idx_id = _flatten_global_index(tuple(op.operands), tensor, ctx)
         chain_id = ctx.text.alloc_id("chain")
         ctx.text.emit_function(
             f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
@@ -1189,7 +1276,7 @@ def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
         value_id = ctx.val_to_id[op.operands[0].id]
         zero = ctx.text.const_uint(0)
-        idx_id = _flatten_index(tuple(op.operands[1:]), tensor.shape, ctx)
+        idx_id = _flatten_global_index(tuple(op.operands[1:]), tensor, ctx)
         chain_id = ctx.text.alloc_id("chain")
         ctx.text.emit_function(
             f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
@@ -1261,7 +1348,7 @@ def _visit_atomic_rmw(op: AtomicRmwOp, ctx: _SpvCtx) -> None:
 
     value_id = ctx.val_to_id[op.operands[0].id]
     zero = ctx.text.const_uint(0)
-    idx_id = _flatten_index(tuple(op.operands[1:]), tensor.shape, ctx)
+    idx_id = _flatten_global_index(tuple(op.operands[1:]), tensor, ctx)
     chain_id = ctx.text.alloc_id("atomic_chain")
     ctx.text.emit_function(
         f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
@@ -1768,7 +1855,10 @@ def _visit_vec_load(op: VecLoadOp, ctx: _SpvCtx) -> None:
         )
 
     # Compute the base flat index, then each lane's index = base + i.
-    base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
+    if isinstance(tensor, GlobalTensor):
+        base_id = _flatten_global_index(tuple(indices), tensor, ctx)
+    else:
+        base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
     u32 = ctx.text.type_int(32, signed=False)
 
     loaded: list[str] = []
@@ -1832,7 +1922,10 @@ def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
             f"_visit_vec_store: tensor type {type(tensor).__name__}"
         )
 
-    base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
+    if isinstance(tensor, GlobalTensor):
+        base_id = _flatten_global_index(tuple(indices), tensor, ctx)
+    else:
+        base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
     vec_id = ctx.val_to_id[vec_v.id]
     u32 = ctx.text.type_int(32, signed=False)
 
