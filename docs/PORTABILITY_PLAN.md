@@ -522,7 +522,7 @@ the lowerer compiles SPIR-V into the void — there is no caller.
 | 3.4 | ``EngineIntel`` subclass — host tensor format, VAE choice, lazy-dispatch idiom | 🟡 stub landed `a585e1e` (constructs + caps); inference paths blocked on 3.2 + OpenVINO TAEHV | 3.2 + VAE backend |
 | 3.5 | Subgroup width policy (``reqd_sub_group_size`` pin vs driver-chosen + per-width variants) | ⏳ | 3.1 (probe data — captured) |
 | 3.6 | NAX-equivalent path for flash-attention (hand-written ``OpCooperativeMatrix*KHR`` outside the framework) | ⏳ | 3.4 + microbench data |
-| 3.7 | Rollout v1 → v3 across kernel cohorts | 🟡 v1 ✅ (14 / 27 kernels smoke-pass on Battlemage); v2/v3 blocked on cooperative-matrix visitors | OpCooperativeMatrix*KHR lowering |
+| 3.7 | Rollout v1 → v3 across kernel cohorts | 🟡 v1 ✅ + v2 GEMM ✅ (cooperative-matrix path lowered + verified end-to-end on Battlemage; GEMM bit-identical to numpy ref at small shapes, 2 TFLOPS at M=N=K=1024 BM=32 BN=64 n_warps=4); v3 attention pending | flash-attention path |
 
 ### §3.0 Scaffolding (landed)
 
@@ -1019,11 +1019,21 @@ gating from §3.6:
   not wired through inference yet.
   Remaining cohort: ``GemmKernel``, ``patchify`` / ``unpatchify``
   (need MMA — see v2).
-* **v2** — full ``GemmKernel`` autotune space lit on Intel
-  hardware, ``KVCacheUpdateKernel``, ``MoE*`` kernels. Real
-  inference still gated on attention. **Blocker:** cooperative-
-  matrix visitors (``LoadMatrixOp`` / ``StoreMatrixOp`` /
-  ``MmaOp``) need ``OpCooperativeMatrix*KHR`` lowering.
+* **v2** — ✅ **GEMM functional on Battlemage.** Cooperative-
+  matrix lowering landed: ``OpCooperativeMatrixLoadKHR`` /
+  ``MulAddKHR`` / ``StoreKHR`` plus ``OpTypeCooperativeMatrixKHR``
+  via ``text.type_coop_matrix``, ``BFloat16CooperativeMatrixKHR``
+  + ``VulkanMemoryModel`` capabilities, smem-roundtrip
+  ``FragForEachOp``, coop-matrix-typed accumulator carry in the
+  ``ForLoopOp`` OpPhi, splat-init via ``OpCompositeConstruct``,
+  tile-offset-aware ``_flatten_global_index``. GEMM bit-identical
+  to numpy ref at small shapes; 2 TFLOPS at M=N=K=1024
+  (``BM=32 BN=64 BK=16 n_warps=4 n_stages=2``,
+  ``main_shape="m8n16k16_intel_bf16_f32"``). Autotune campaign on
+  Battlemage is now the next step. ``KVCacheUpdateKernel`` /
+  ``MoE*`` smoke-passing already (lower + dispatch only — full
+  correctness needs a multi-output harness). **Real inference
+  still gated on attention.**
 * **v3** — flash-attention path (§3.6 option 1 or 2). Real
   inference at the same LFPS thresholds as the Apple/CUDA
   benches.
