@@ -893,6 +893,70 @@ def test_coopmat_mma_assembles(driver):
 
 
 @pytestmark_e2e
+def test_coopmat_mma_runs_end_to_end(driver):
+    """Dispatch the synthetic m8n16k16 MMA on Battlemage and verify
+    ``D == A @ B + C`` against the numpy reference.
+
+    The first SPV kernel that actually exercises ``OpCooperativeMatrix
+    LoadKHR`` / ``MulAddKHR`` / ``StoreKHR`` end-to-end on hardware.
+    Single-workgroup, single-MMA tile — no FragForEach needed (the
+    epilogue path that gemm uses); the lowerer emits the coopmat
+    type once, runs one load per operand, one MulAdd, one store."""
+    from quark.lower.spv import text_to_binary
+
+    rng = np.random.default_rng(0xC00FCAFE & 0xFFFFFFFF)
+    M, N, K = 8, 16, 16
+
+    def to_bf16_bits(arr_f32):
+        # Round-to-nearest-even: add 0x7FFF + (LSB of high half) before
+        # the truncating shift. The numpy reference does the same.
+        u32 = arr_f32.astype("<f4").view("<u4")
+        return ((u32 + 0x7FFF + ((u32 >> 16) & 1)) >> 16).astype("<u2")
+
+    def bf16_to_f32(u16):
+        return (u16.astype("<u4") << 16).view("<f4")
+
+    A_f32 = rng.standard_normal((M, K)).astype(np.float32) * 0.5
+    B_f32 = rng.standard_normal((K, N)).astype(np.float32) * 0.5
+    C_f32 = rng.standard_normal((M, N)).astype(np.float32)
+
+    A_bf16 = to_bf16_bits(A_f32)
+    B_bf16 = to_bf16_bits(B_f32)
+    # Round through bf16 so the GPU sees the same input precision.
+    A_round = bf16_to_f32(A_bf16)
+    B_round = bf16_to_f32(B_bf16)
+    expected = (A_round.astype(np.float32) @ B_round.astype(np.float32)
+                + C_f32).astype(np.float32)
+
+    result = SpirVLowerer(local_size=(32, 1, 1)).lower_module(
+        _build_coopmat_mma_ir()
+    )
+    binary = text_to_binary(result.source)
+
+    a_h, a_p = driver.allocate_buffer(A_bf16.nbytes)
+    b_h, b_p = driver.allocate_buffer(B_bf16.nbytes)
+    c_h, c_p = driver.allocate_buffer(C_f32.nbytes)
+    d_h, d_p = driver.allocate_buffer(M * N * 4)
+    ctypes.memmove(a_p, A_bf16.ctypes.data, A_bf16.nbytes)
+    ctypes.memmove(b_p, B_bf16.ctypes.data, B_bf16.nbytes)
+    ctypes.memmove(c_p, C_f32.ctypes.data, C_f32.nbytes)
+
+    compiled = driver.compile(
+        source=binary, entry=result.entry_name,
+        n_buffers=result.n_buffers,
+        push_constants_size=result.push_constants_size,
+    )
+    driver.launch(compiled, (1, 1, 1), [a_h, b_h, c_h, d_h], push_bytes=b"")
+
+    got = np.empty((M, N), dtype=np.float32)
+    ctypes.memmove(got.ctypes.data, d_p, got.nbytes)
+    # F32 acc with bf16 inputs: bench at moderate atol — the GPU's
+    # mma path matches ``A @ B + C`` to ~bf16-input × f32-acc precision,
+    # which is dominated by the bf16-rounding of the inputs.
+    np.testing.assert_allclose(got, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytestmark_e2e
 def test_for_loop_window_sum_end_to_end(driver):
     """Sliding-window sum exercising both iv-derived loads AND a carry.
     Catches the case where the OpPhi-emitted iv is mis-routed (e.g.
