@@ -171,6 +171,35 @@ class SpvText:
         key = f"vec_{elem_id}_{width}"
         return self._cached_type(key, f"OpTypeVector {elem_id} {width}")
 
+    def type_coop_matrix(
+        self, elem_id: str, scope: int, rows: int, cols: int, use: int,
+    ) -> str:
+        """Emit ``OpTypeCooperativeMatrixKHR`` for a fragment.
+
+        ``scope`` is the SPIR-V execution scope id (typically
+        ``Subgroup`` = 3 for Vulkan compute). ``use`` selects the
+        operand role:
+
+        - 0 = ``MatrixA`` (left input to MulAdd)
+        - 1 = ``MatrixB`` (right input)
+        - 2 = ``MatrixAccumulator`` (C / D)
+
+        ``rows`` / ``cols`` are the matrix tile dimensions in
+        elements; the SPIR-V text format takes them as constant
+        operands (we emit OpConstant uint values at module scope and
+        reference them).
+        """
+        scope_id = self.const_uint(scope)
+        rows_id = self.const_uint(rows)
+        cols_id = self.const_uint(cols)
+        use_id = self.const_uint(use)
+        key = f"coopmat_{elem_id}_{scope}_{rows}_{cols}_{use}"
+        return self._cached_type(
+            key,
+            f"OpTypeCooperativeMatrixKHR {elem_id} {scope_id} "
+            f"{rows_id} {cols_id} {use_id}",
+        )
+
     def type_runtime_array(self, elem_id: str, *, stride_bytes: int) -> str:
         # Runtime arrays must carry an ArrayStride decoration. Re-use
         # the same array id for matching (elem, stride) pairs.

@@ -53,12 +53,15 @@ from quark.ir.op import (
     GroupIdOp,
     IfRegionOp,
     LaneIdOp,
+    LoadMatrixOp,
     LoadOp,
     MathOp,
     MergeB32Op,
+    MmaOp,
     SelectOp,
     SmemAllocOp,
     SplitB32Op,
+    StoreMatrixOp,
     StoreOp,
     SubgroupIdOp,
     SubgroupReduceOp,
@@ -1889,6 +1892,57 @@ def _visit_vec_extract(op: VecExtractOp, ctx: _SpvCtx) -> None:
     )
 
 
+# ─── Cooperative-matrix ops (MMA) — scaffolding for v2 ────────────
+#
+# Each visitor below is a stub that surfaces a clear NotImplementedError
+# pointing at PORTABILITY_PLAN §3.3 (the full coopmat lowering work) so
+# kernels in the gemm / attn cohort fail informatively rather than at
+# the dispatch table miss. The full lowering needs:
+#   - ``OpTypeCooperativeMatrixKHR`` for each (use, dtype, shape) triple
+#     — emit helper landed in ``text.type_coop_matrix``.
+#   - ``OpCooperativeMatrixLoadKHR Pointer MemoryLayout=RowMajor (0)
+#     Stride MemoryOperand=None`` for ``LoadMatrixOp``.
+#   - ``OpCooperativeMatrixStoreKHR`` mirror for ``StoreMatrixOp``.
+#   - ``OpCooperativeMatrixMulAddKHR A B C Operands=AccumulationModeNone (0)``
+#     for ``MmaOp``.
+#   - Shape→(rows, cols, use) mapping from ``MmaShape`` (registry already
+#     carries ``min_intel_gpu_gen=INTEL_XE2`` rows for the four
+#     ``m8n16k16_intel_*`` shapes).
+#   - Capability ``CooperativeMatrixKHR`` + extension
+#     ``SPV_KHR_cooperative_matrix`` (gated on first use, similar to the
+#     bf16 path).
+#   - Scope = ``Subgroup`` (3) — Vulkan compute-shader scope for KHR
+#     coopmat. Subgroup-level fragment storage means each lane holds a
+#     small slice of the matrix; the IR's ``b32`` carrier maps to that
+#     opaque lane-local storage automatically.
+
+
+def _visit_load_matrix(op: LoadMatrixOp, ctx: _SpvCtx) -> None:
+    raise NotImplementedError(
+        "_visit_load_matrix: cooperative-matrix lowering not yet wired "
+        "(SPV §3.3 / v2 of PORTABILITY_PLAN). Battlemage caps already "
+        "advertise the four m8n16k16 shapes; the path needs "
+        "OpTypeCooperativeMatrixKHR + OpCooperativeMatrixLoadKHR with "
+        "Subgroup scope and a buffer-pointer + stride argument."
+    )
+
+
+def _visit_store_matrix(op: StoreMatrixOp, ctx: _SpvCtx) -> None:
+    raise NotImplementedError(
+        "_visit_store_matrix: cooperative-matrix lowering not yet wired "
+        "(SPV §3.3 / v2). Mirror of _visit_load_matrix; emits "
+        "OpCooperativeMatrixStoreKHR."
+    )
+
+
+def _visit_mma(op: MmaOp, ctx: _SpvCtx) -> None:
+    raise NotImplementedError(
+        "_visit_mma: cooperative-matrix MulAdd not yet wired (SPV §3.3 "
+        "/ v2). Emit OpCooperativeMatrixMulAddKHR A B C with operands "
+        "=0 (AccumulationModeNone)."
+    )
+
+
 _DISPATCH: dict[type, Any] = {
     ConstOp: _visit_const,
     ArithOp: _visit_arith,
@@ -1909,6 +1963,9 @@ _DISPATCH: dict[type, Any] = {
     LoadOp: _visit_load,
     StoreOp: _visit_store,
     AtomicRmwOp: _visit_atomic_rmw,
+    LoadMatrixOp: _visit_load_matrix,
+    StoreMatrixOp: _visit_store_matrix,
+    MmaOp: _visit_mma,
     VecLoadOp: _visit_vec_load,
     VecStoreOp: _visit_vec_store,
     VecBuildOp: _visit_vec_build,
