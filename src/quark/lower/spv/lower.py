@@ -2177,6 +2177,23 @@ def _emit_matrix_pointer(
                 "before its SmemAllocOp"
             )
         var_id, _elem_type, elem_ptr, _n = rec
+        # Apply ``warp_dyn_offset`` (the warp-uniform component of
+        # ``warp_lane_view``) if set. Cooperative-matrix
+        # ``OpCooperativeMatrixLoadKHR`` is a subgroup-collective op
+        # — the base pointer must be uniform across the subgroup —
+        # so we use ``warp_dyn_offset`` (= ``warp_id * rows *
+        # row_stride``), NOT ``dyn_offset`` (which also includes the
+        # PTX-style per-lane component used by ldmatrix). Without this
+        # fix every warp loads the same smem position and multi-warp
+        # GEMM produces warp 0's output replicated across rows.
+        warp_off = getattr(tensor, "warp_dyn_offset", None)
+        if warp_off is not None:
+            w_id = ctx.val_to_id[warp_off.id]
+            new_flat = ctx.text.alloc_id("coop_warp_off")
+            ctx.text.emit_function(
+                f"{new_flat} = OpIAdd {u32} {flat} {w_id}"
+            )
+            flat = new_flat
         chain_id = ctx.text.alloc_id("coop_smem_chain")
         ctx.text.emit_function(
             f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {flat}"
