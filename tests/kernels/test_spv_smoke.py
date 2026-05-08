@@ -123,7 +123,7 @@ def _problem_dtypes(problem_params: dict) -> set:
 # backend that should xfail rather than hard-fail in smoke. Today the
 # only entry is ``attn``.
 #
-# Bisect findings (1b73261):
+# Bisect findings (1b73261, 8e870a0, 964905a):
 # * Multi-class FragReduce/FragApply path (3433693) fixes per-row
 #   softmax normalisation — verified.
 # * A separate pre-existing addressing bug zeroes ~50 % of every
@@ -131,22 +131,35 @@ def _problem_dtypes(problem_params: dict) -> set:
 #   are exactly ``[0..3, 8..11, 16..19, 24..27, 32..35, 40..43,
 #   48..51, 56..59]`` — i.e. lanes where ``lane_id & 4 == 0``
 #   (PTX-style ``group_id`` even). Lanes with ``group_id`` odd
-#   (4-7, 12-15, 20-23, …) write zero. The pattern is independent of
-#   row, n_warps, MTiles, and KvTile — every config tested showed it.
-# * Likely a coopmat lane→element layout mismatch: PTX-style
-#   per-lane addressing (group_id-based) silently being applied
-#   somewhere on the consume side of the smem-roundtrip pattern,
-#   when Intel KHR coopmat needs subgroup-uniform pointers (compare
-#   the warp_dyn_offset-vs-dyn_offset distinction the
-#   ``_emit_matrix_pointer`` fix in f0ade34 captured).
-# * GEMM with NT=4 per warp (BM=8 BN=64 nw=1) is bit-identical, so
-#   it's not "multi-n-tile-per-warp" generically — narrows to one
-#   of attn's softmax-specific paths (FragApply / FragReduce /
-#   FragConvert internal smem accesses).
+#   (4-7, 12-15, 20-23, …) write zero. Pattern independent of row,
+#   n_warps, MTiles, KvTile, KvPad — every config tested showed it.
+# * Direct on-hardware probes showed every visitor works in
+#   isolation:
+#     - MMA + FragForEach: all 128 elements correct.
+#     - MMA + FragApply (no selectors) + FragForEach: correct.
+#     - MMA + FragApply (8 selectors, dynamic-row-dispatch) +
+#       FragForEach: correct, all rows scaled by row index.
+#     - MMA + FragReduce (8 row-classes via n_classes_override):
+#       all 8 row sums match.
+#     - MMA → FragConvert → MMA → FragForEach: all 128 correct.
+#   So the bug is NOT in any single op — it manifests only in the
+#   composed attn flow (K-loop carry + multi-class FragApply chain
+#   + multiple iterations). Likely candidates left:
+#     - For-loop carry typing under multi-class (the OpPhi for
+#       m_vals/l_vals at width n_rc=8 may be wrong)
+#     - Cross-iteration smem region aliasing (multiple FragApply
+#       ops sharing alloc IDs unexpectedly)
+#     - GEMM2's A-frag (FragConvert output) lane layout mismatch
+#       when it feeds a subsequent MMA whose B has a specific
+#       internal layout
+# * Two speculative fixes tried and reverted (4859121, f5e126a):
+#   coopmat stride from tensor.stride[0] vs shape[-1] (broke gemm),
+#   and warp_dyn_offset preference in _add_dyn_offset (broke gemm
+#   /patchify/unpatchify). Both reverted in 964905a.
 #
-# Tracked for the next pass; the per-row reduce work in this session
-# stays in even though smoke can't prove it because the addressing
-# bug masks output values.
+# Tracked for the next pass; the per-row reduce work stays in
+# even though smoke can't prove it because the addressing bug
+# masks output values.
 _SPV_KNOWN_NUMERICAL_LIMITS = frozenset({"attn"})
 
 
