@@ -477,7 +477,7 @@ def _auto_alloc_staging(
     )
 
 
-def _rc_info(cfg: Any) -> tuple[int, tuple[int, ...]]:
+def _rc_info(cfg: Any) -> tuple[int, tuple[int, ...] | None]:
     """Return (n_rc, slot_to_selector_idx) for per-row-class scaling.
 
     ``n_rc`` is the count of distinct ``dr`` values in ``cd_offsets``
@@ -485,7 +485,14 @@ def _rc_info(cfg: Any) -> tuple[int, tuple[int, ...]]:
     ``cd_offsets`` slot to its row-class index — used as the
     ``selectors`` index when ``frag_for_each`` runs the per-element
     body, so the right scalar lands per fragment slot.
+
+    Intel SPV variant: cd_offsets is an opaque ``((0, 0),) * c_regs``
+    placeholder (the lane↔(r, c) mapping is implementation-private),
+    so ``n_rc = shape.m`` (full per-row) and the lowerer does
+    dynamic-row-dispatch via ``slot_to_selector_idx=None``.
     """
+    if "_intel_" in cfg.shape_id:
+        return cfg.shape.m, None
     dr_vals = sorted({dr for dr, _ in cfg.cd_offsets})
     n_rc = len(dr_vals)
     slot_to_selector_idx = tuple(dr_vals.index(dr) for dr, _ in cfg.cd_offsets)

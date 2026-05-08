@@ -2413,10 +2413,35 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
         ctx.val_to_id[op.body_row_var.id] = row_id
         ctx.val_to_id[op.body_col_var.id] = col_id
         if op.body_selector_var is not None:
-            slot_to_sel = op.attrs.get("slot_to_selector_idx", ())
-            sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
-            sel_v = op.operands[1 + sel_idx]
-            ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
+            slot_to_sel_attr = op.attrs.get("slot_to_selector_idx")
+            n_selectors = len(op.operands) - 1
+            if slot_to_sel_attr is not None:
+                slot_to_sel = slot_to_sel_attr
+                sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
+                sel_v = op.operands[1 + sel_idx]
+                ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
+            else:
+                # Dynamic-row-dispatch: row already computed as
+                # ``row_id``. OpSelect-chain selectors against the row.
+                bool_t = ctx.text.type_bool()
+                sel_chain = ctx.val_to_id[op.operands[1 + n_selectors - 1].id]
+                for i in range(n_selectors - 2, -1, -1):
+                    cmp_id = ctx.text.alloc_id(f"frag_each_sel_cmp_{s}_{i}")
+                    i_const = ctx.text.const_uint(i)
+                    ctx.text.emit_function(
+                        f"{cmp_id} = OpIEqual {bool_t} {row_id} {i_const}"
+                    )
+                    sel_lhs = ctx.val_to_id[op.operands[1 + i].id]
+                    sel_dtype_id = _emit_dtype(
+                        ctx.text, op.operands[1 + i].dtype, ctx,
+                    )
+                    sel_id_new = ctx.text.alloc_id(f"frag_each_sel_{s}_{i}")
+                    ctx.text.emit_function(
+                        f"{sel_id_new} = OpSelect {sel_dtype_id} {cmp_id} "
+                        f"{sel_lhs} {sel_chain}"
+                    )
+                    sel_chain = sel_id_new
+                ctx.val_to_id[op.body_selector_var.id] = sel_chain
         saved_stack = ctx.loop_yield_stack
         ctx.loop_yield_stack = []  # type: ignore[assignment]
         try:

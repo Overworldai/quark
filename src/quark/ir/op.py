@@ -1324,10 +1324,10 @@ class FragForEachOp(Op):
         if selectors:
             if self.body_selector_var is None:
                 raise ValueError("FragForEachOp: selectors present but body_selector_var is None")
-            if "slot_to_selector_idx" not in self.attrs:
-                raise ValueError(
-                    "FragForEachOp: selectors present but 'slot_to_selector_idx' attr missing"
-                )
+            # ``slot_to_selector_idx`` is optional — when absent the
+            # lowerer dynamically derives the selector index from the
+            # smem slot's row (used by SPV/Intel coopmat where the
+            # lane↔(r, c) mapping is implementation-private).
             for s in selectors:
                 if s.width != 1:
                     raise ValueError(

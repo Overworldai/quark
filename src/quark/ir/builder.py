@@ -1354,14 +1354,18 @@ class Builder:
             raise KeyError(f"frag_for_each: shape {shape_id!r} not registered")
         selectors = tuple(selectors)
         if selectors:
-            if slot_to_selector_idx is None:
-                raise ValueError("frag_for_each: selectors= given without slot_to_selector_idx")
-            n_slots = shape.c_regs
-            if len(slot_to_selector_idx) != n_slots:
-                raise ValueError(
-                    f"frag_for_each: slot_to_selector_idx length "
-                    f"{len(slot_to_selector_idx)} ≠ shape.c_regs {n_slots}"
-                )
+            # ``slot_to_selector_idx=None`` → dynamic-row-dispatch mode
+            # (SPV/Intel coopmat path; lane↔(r, c) is implementation-
+            # private, lowerer derives row from smem layout). Static
+            # mode requires the per-c_reg map to match c_regs as
+            # before.
+            if slot_to_selector_idx is not None:
+                n_slots = shape.c_regs
+                if len(slot_to_selector_idx) != n_slots:
+                    raise ValueError(
+                        f"frag_for_each: slot_to_selector_idx length "
+                        f"{len(slot_to_selector_idx)} ≠ shape.c_regs {n_slots}"
+                    )
 
         elem = self._fresh(ValueShape(frag.dtype), "foreach_elem")
         row = self._fresh(ValueShape(DType.U32), "foreach_row")
@@ -1389,9 +1393,10 @@ class Builder:
             self._cse_stack.pop()
 
         attrs: dict = {"shape_id": shape_id, "cd_offsets": cd_offsets}
-        if selectors:
-            assert slot_to_selector_idx is not None
+        if selectors and slot_to_selector_idx is not None:
             attrs["slot_to_selector_idx"] = tuple(slot_to_selector_idx)
+        # else: dynamic-row-dispatch — slot_to_selector_idx absent,
+        # lowerer derives selector index from the smem slot's row.
         op = _op.FragForEachOp(
             results=(),
             operands=(frag, *selectors),
