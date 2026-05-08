@@ -1768,8 +1768,58 @@ def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
 
 
 def _visit_vec_build(op: VecBuildOp, ctx: _SpvCtx) -> None:
-    """``OpCompositeConstruct`` from N scalar operands."""
+    """``OpCompositeConstruct`` from N scalar operands.
+
+    With ``packed_b32=True`` (the ``qk.vec_build_packed_b32`` IR
+    helper): inputs are B32 scalars, each holding 2 elements of the
+    output's element dtype. Inverse of the packed_b32 ``vec_extract``
+    path. Splits each B32 into a (lo_b16, hi_b16) pair, bitcasts each
+    half to the element dtype (bf16/f16), then composes into an
+    array<elem, 2*N>.
+    """
     (out,) = op.results
+    if op.attrs.get("packed_b32"):
+        elem_dt = out.dtype
+        elem_type = _emit_dtype(ctx.text, elem_dt, ctx)
+        u16 = _emit_dtype(ctx.text, DType.B16, ctx)
+        u32 = ctx.text.type_int(32, signed=False)
+        mask = ctx.text.const_uint(0xFFFF)
+        sixteen = ctx.text.const_uint(16)
+
+        all_elems: list[str] = []
+        for i, b32_v in enumerate(op.operands):
+            b32_id = ctx.val_to_id[b32_v.id]
+            # B32 already lowers to u32; the OpBitcast is for clarity
+            # (and would be a real conversion if B32 ever splits from
+            # u32 in a future visitor).
+            asu32 = ctx.text.alloc_id(f"vb32_as_u32_{i}")
+            ctx.text.emit_function(f"{asu32} = OpBitcast {u32} {b32_id}")
+            lo_u32 = ctx.text.alloc_id(f"vb_lo_u32_{i}")
+            hi_u32 = ctx.text.alloc_id(f"vb_hi_u32_{i}")
+            ctx.text.emit_function(
+                f"{lo_u32} = OpBitwiseAnd {u32} {asu32} {mask}"
+            )
+            ctx.text.emit_function(
+                f"{hi_u32} = OpShiftRightLogical {u32} {asu32} {sixteen}"
+            )
+            lo_u16 = ctx.text.alloc_id(f"vb_lo_u16_{i}")
+            hi_u16 = ctx.text.alloc_id(f"vb_hi_u16_{i}")
+            ctx.text.emit_function(f"{lo_u16} = OpUConvert {u16} {lo_u32}")
+            ctx.text.emit_function(f"{hi_u16} = OpUConvert {u16} {hi_u32}")
+            lo_e = ctx.text.alloc_id(f"vb_lo_e_{i}")
+            hi_e = ctx.text.alloc_id(f"vb_hi_e_{i}")
+            ctx.text.emit_function(f"{lo_e} = OpBitcast {elem_type} {lo_u16}")
+            ctx.text.emit_function(f"{hi_e} = OpBitcast {elem_type} {hi_u16}")
+            all_elems.extend([lo_e, hi_e])
+
+        vec_type = ctx.text.type_vec(elem_type, len(all_elems))
+        res_id = ctx.text.alloc_id("vec_build_pb32")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = OpCompositeConstruct {vec_type} {' '.join(all_elems)}"
+        )
+        return
+
     elem_type = _emit_dtype(ctx.text, op.operands[0].dtype, ctx)
     vec_type = ctx.text.type_vec(elem_type, len(op.operands))
     res_id = ctx.text.alloc_id("vec_build")
@@ -1781,11 +1831,57 @@ def _visit_vec_build(op: VecBuildOp, ctx: _SpvCtx) -> None:
 
 
 def _visit_vec_extract(op: VecExtractOp, ctx: _SpvCtx) -> None:
-    """``OpCompositeExtract`` — pick one component from a vector."""
+    """``OpCompositeExtract`` — pick one component from a vector.
+
+    With ``packed_b32=True`` (the ``qk.packed_extract_b32`` IR helper):
+    extracts the ``index``-th 32-bit word from a packed bf16/f16 vec
+    (each B32 holds two consecutive 16-bit elements). Used by
+    ``fma_bf16x2`` and friends. SPIR-V doesn't allow bitcasting a
+    composite directly, so we extract the two element halves, bitcast
+    each to u16, and merge u16×2 → u32 (mirrors the inverse of
+    ``MergeB32Op``).
+    """
     (out,) = op.results
     idx = int(op.attrs["index"])
+    src_v = op.operands[0]
+    src_id = ctx.val_to_id[src_v.id]
+
+    if op.attrs.get("packed_b32"):
+        elem_type = _emit_dtype(ctx.text, src_v.dtype, ctx)  # bf16 / f16
+        u16 = _emit_dtype(ctx.text, DType.B16, ctx)
+        u32 = ctx.text.type_int(32, signed=False)
+        sixteen = ctx.text.const_uint(16)
+
+        lo_idx = 2 * idx
+        hi_idx = 2 * idx + 1
+        elem_lo = ctx.text.alloc_id(f"px_e_lo_{idx}")
+        elem_hi = ctx.text.alloc_id(f"px_e_hi_{idx}")
+        ctx.text.emit_function(
+            f"{elem_lo} = OpCompositeExtract {elem_type} {src_id} {lo_idx}"
+        )
+        ctx.text.emit_function(
+            f"{elem_hi} = OpCompositeExtract {elem_type} {src_id} {hi_idx}"
+        )
+        u16_lo = ctx.text.alloc_id(f"px_u16_lo_{idx}")
+        u16_hi = ctx.text.alloc_id(f"px_u16_hi_{idx}")
+        ctx.text.emit_function(f"{u16_lo} = OpBitcast {u16} {elem_lo}")
+        ctx.text.emit_function(f"{u16_hi} = OpBitcast {u16} {elem_hi}")
+        u32_lo = ctx.text.alloc_id(f"px_u32_lo_{idx}")
+        u32_hi = ctx.text.alloc_id(f"px_u32_hi_{idx}")
+        ctx.text.emit_function(f"{u32_lo} = OpUConvert {u32} {u16_lo}")
+        ctx.text.emit_function(f"{u32_hi} = OpUConvert {u32} {u16_hi}")
+        u32_hi_shl = ctx.text.alloc_id(f"px_hi_shl_{idx}")
+        ctx.text.emit_function(
+            f"{u32_hi_shl} = OpShiftLeftLogical {u32} {u32_hi} {sixteen}"
+        )
+        res_id = ctx.text.alloc_id(f"px_b32_{idx}")
+        ctx.val_to_id[out.id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = OpBitwiseOr {u32} {u32_lo} {u32_hi_shl}"
+        )
+        return
+
     elem_type = _emit_dtype(ctx.text, out.dtype, ctx)
-    src_id = ctx.val_to_id[op.operands[0].id]
     res_id = ctx.text.alloc_id(f"vec_x{idx}")
     ctx.val_to_id[out.id] = res_id
     ctx.text.emit_function(
