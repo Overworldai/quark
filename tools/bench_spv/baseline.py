@@ -74,6 +74,16 @@ for kcls in all_kernels():
                         if isinstance(getattr(kernel.spec, a, None), DType)}
             if not (not spec_dts or spec_dts <= _OK):
                 continue
+            # Mirror test_spv_smoke: resolve empty ``config.main_shape``
+            # via the device's caps before is_valid_for runs (the
+            # default config carries ``main_shape=''`` for many kernels
+            # — the launcher resolves it at compile time, but
+            # is_valid_for sees the un-resolved config).
+            resolved_cfg = launcher._maybe_resolve_main_shape(
+                kcls, kernel.spec, kernel.config,
+            )
+            if resolved_cfg is not kernel.config:
+                kernel = kcls(kernel.spec, resolved_cfg)
             if not kernel.is_valid_for(device.caps):
                 continue
             try:
