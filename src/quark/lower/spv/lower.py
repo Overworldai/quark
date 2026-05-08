@@ -2123,11 +2123,15 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _SpvCtx) -> None:
     col_id = ctx.val_to_id[op.operands[1].id]
     ptr_id, _storage_class = _emit_matrix_pointer(tensor, row_id, col_id, ctx)
 
-    # Stride in elements between consecutive tile rows. For row-major
-    # tile loads from a 2D tensor with shape (R, C), the stride is C
-    # (the last-dim size).
-    stride_id = ctx.text.const_uint(tensor.shape[-1])
-    layout_id = ctx.text.const_uint(0)  # CooperativeMatrixLayoutRowMajorKHR
+    # Memory layout: the framework's gemm cohort stores B as (N, K)
+    # row-major (K axis contiguous — the "B^T in storage" convention
+    # every gemm uses). From MMA's K×N point of view, that's a
+    # column-major matrix, so ``b`` loads emit
+    # ``MemoryLayout = ColumnMajor``. ``a`` and ``c`` use row-major
+    # since their tensors are stored in M-contiguous form.
+    last_dim = tensor.shape[-1]
+    layout_id = ctx.text.const_uint(1 if which == "b" else 0)
+    stride_id = ctx.text.const_uint(last_dim)
 
     res_id = ctx.text.alloc_id(f"coop_load_{which}")
     ctx.val_to_id[out.id] = res_id

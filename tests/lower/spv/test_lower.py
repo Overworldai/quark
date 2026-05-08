@@ -824,6 +824,10 @@ def _build_coopmat_mma_ir():
 
     g_a = GlobalTensor(dtype=DType.BF16, shape=(8, 16), stride=(16, 1),
                        name="A", param=fn.params[0])
+    # B follows the framework's gemm convention: stored (N, K)
+    # row-major so the K axis is contiguous. The SPV ``b`` load
+    # treats this as a column-major K×N tile, which the MMA reads
+    # as the standard ``B`` matrix (K×N math view).
     g_b = GlobalTensor(dtype=DType.BF16, shape=(16, 16), stride=(16, 1),
                        name="B", param=fn.params[1])
     g_c = GlobalTensor(dtype=DType.F32, shape=(8, 16), stride=(16, 1),
@@ -917,15 +921,17 @@ def test_coopmat_mma_runs_end_to_end(driver):
         return (u16.astype("<u4") << 16).view("<f4")
 
     A_f32 = rng.standard_normal((M, K)).astype(np.float32) * 0.5
-    B_f32 = rng.standard_normal((K, N)).astype(np.float32) * 0.5
+    # B in storage: (N, K) row-major (the framework's gemm
+    # convention). The math view is K×N, accessed as B^T-of-storage.
+    Bt_f32 = rng.standard_normal((N, K)).astype(np.float32) * 0.5
     C_f32 = rng.standard_normal((M, N)).astype(np.float32)
 
     A_bf16 = to_bf16_bits(A_f32)
-    B_bf16 = to_bf16_bits(B_f32)
+    Bt_bf16 = to_bf16_bits(Bt_f32)
     # Round through bf16 so the GPU sees the same input precision.
     A_round = bf16_to_f32(A_bf16)
-    B_round = bf16_to_f32(B_bf16)
-    expected = (A_round.astype(np.float32) @ B_round.astype(np.float32)
+    Bt_round = bf16_to_f32(Bt_bf16)
+    expected = (A_round.astype(np.float32) @ Bt_round.astype(np.float32).T
                 + C_f32).astype(np.float32)
 
     result = SpirVLowerer(local_size=(32, 1, 1)).lower_module(
@@ -934,11 +940,11 @@ def test_coopmat_mma_runs_end_to_end(driver):
     binary = text_to_binary(result.source)
 
     a_h, a_p = driver.allocate_buffer(A_bf16.nbytes)
-    b_h, b_p = driver.allocate_buffer(B_bf16.nbytes)
+    b_h, b_p = driver.allocate_buffer(Bt_bf16.nbytes)
     c_h, c_p = driver.allocate_buffer(C_f32.nbytes)
     d_h, d_p = driver.allocate_buffer(M * N * 4)
     ctypes.memmove(a_p, A_bf16.ctypes.data, A_bf16.nbytes)
-    ctypes.memmove(b_p, B_bf16.ctypes.data, B_bf16.nbytes)
+    ctypes.memmove(b_p, Bt_bf16.ctypes.data, Bt_bf16.nbytes)
     ctypes.memmove(c_p, C_f32.ctypes.data, C_f32.nbytes)
 
     compiled = driver.compile(
