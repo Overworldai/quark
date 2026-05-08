@@ -560,6 +560,67 @@ class TestExistingKernelsCompile:
             )
             assert ck.module.handle != 0
 
+    def test_ada_gate_residual_bf16_runs_end_to_end_against_numpy_reference(
+        self, spv_device,
+    ):
+        """``AdaGateResidualKernel`` runs E2E natively at bf16 — exercises
+        the ``packed_b32`` path (``vec_extract`` + ``vec_build`` with the
+        ``packed_b32=True`` attr) for ``fma_bf16x2``-style packed compute.
+
+        Output is bf16-bit-identical to the numpy reference (no rounding
+        slack) — the kernel emits the same fused-multiply-add chain,
+        the numpy reference upconverts to f32 for the math then rounds
+        back to bf16. The bit-identity confirms the packed b32 visitor
+        chain (split → bitcast → merge) and the wide-vec
+        ``OpTypeArray`` fallback both round-trip correctly."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.ada_gate_residual.kernel import (
+            AdaGateResidualKernel,
+        )
+        from quark.kernels.ada_gate_residual.spec import AdaGateResidualSpec
+        from quark.kernels.ada_gate_residual.config import (
+            AdaGateResidualConfig,
+        )
+        from quark.kernels.ada_gate_residual.reference import (
+            ada_gate_residual_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        spec = AdaGateResidualSpec(G=1, M=64, D=256, dtype=DType.BF16)
+        cfg = AdaGateResidualConfig(n_warps=1, chunk_D=256, direct=True)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(AdaGateResidualKernel, spec, cfg)
+
+        tensors = AdaGateResidualKernel.make_tensors_numpy(
+            {"G": 1, "M": 64, "D": 256, "dtype": DType.BF16}
+        )
+        ref = ada_gate_residual_reference_numpy(
+            spec, X=tensors["X"], Y=tensors["Y"], gate=tensors["gate"]
+        )
+
+        handles: list[int] = []
+        out_ptr = 0
+        for buf in ck.param_spec.buffers:
+            arr = tensors[buf.name]
+            h, ptr = _sd.allocate_buffer(arr.nbytes)
+            if buf.name == "Out":
+                out_ptr = ptr
+            else:
+                ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
+            handles.append(h)
+
+        ck.launch(buffers=handles)
+
+        got = np.empty(ref.shape, dtype=np.uint16)
+        ctypes.memmove(got.ctypes.data, out_ptr, got.nbytes)
+        # Bit-identical comparison — bf16 storage is uint16, the
+        # math chain is the same on both sides.
+        np.testing.assert_array_equal(got, ref.view(np.uint16))
+
     def test_head_rmsnorm_runs_end_to_end_against_numpy_reference(
         self, spv_device,
     ):
