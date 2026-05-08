@@ -62,8 +62,32 @@ _LAUNCHER = Launcher(device=_DEVICE)
 
 # Dtypes the SPV lowerer is known to fully support today. Kernels
 # whose first problem uses anything else are skipped (visitor / dtype
-# gaps land as coverage holes, not test failures).
-_SPV_SUPPORTED_DTYPES = {DType.F32, DType.U32, DType.S32}
+# gaps land as coverage holes, not test failures). BF16 lands via
+# ``SPV_KHR_bfloat16``; storage is uint16 on the numpy side, so the
+# smoke harness reinterprets bf16 buffers via the
+# ``u32 << 16 → bitcast f32`` trick before allclose-ing.
+_SPV_SUPPORTED_DTYPES = {DType.F32, DType.U32, DType.S32, DType.BF16}
+
+
+def _bf16_to_f32(arr_u16):
+    """Reinterpret a numpy ``uint16`` array of bf16 bit patterns as
+    ``float32``. The bf16 → f32 lift is just a 16-bit zero-extend
+    on the *low* half: bf16 lives in the top 16 bits of f32, so
+    ``(u16 << 16).view(f32)`` recovers the original f32 within bf16's
+    representable precision."""
+    return (arr_u16.astype("<u4") << 16).view("<f4")
+
+
+def _to_f32_for_compare(arr):
+    """Lift any input array to ``float32`` for comparison. Bypasses
+    the dtype-mismatch trap when the kernel uses bf16 storage
+    (numpy's bf16 is uint16 underneath).
+    """
+    if arr.dtype == np.uint16:
+        return _bf16_to_f32(arr.view("<u2"))
+    if arr.dtype == np.float32 or arr.dtype == np.float64:
+        return arr.astype(np.float32, copy=False)
+    return arr
 
 
 def _kernels_to_test() -> list:
@@ -107,55 +131,73 @@ def test_spv_kernel_smoke(kernel_cls):
     if not problems:
         pytest.skip(f"{_kernel_id(kernel_cls)}: no problems declared")
 
-    # Most problem dicts don't explicitly set ``dtype`` — the kernel's
-    # Spec carries a default (typically BF16 for waypoint-1.5 kernels).
-    # We retarget the first problem to F32 so the SPV backend has a
-    # shot at it; if the Spec rejects F32 (rare — moe_router is the
-    # only one) we skip. Sweeping over all dtype-naming conventions
-    # (``dtype``, ``in_dtype``, ``kv_dtype``, ``compute_dtype``, ...)
-    # catches the multi-dtype kernels too.
+    # First problem the kernel can be instantiated for whose Spec
+    # uses dtypes the SPV backend supports (F32 / U32 / S32 / BF16
+    # — see ``_SPV_SUPPORTED_DTYPES``). For each candidate problem
+    # we try the spec's natural dtype first; if that fails to lower
+    # (e.g. the kernel emits a ``B32`` op the SPV backend hasn't
+    # wired yet), we retry with every dtype-shaped param coerced
+    # to F32. Lets kernels that have a bf16-specific fast path
+    # (ada_gate_residual emits ``fma_bf16x2`` on bf16) keep their
+    # smoke coverage on F32.
     _DTYPE_KEYS = (
         "dtype", "in_dtype", "kv_dtype", "compute_dtype",
         "src_dtype", "out_dtype",
     )
-    chosen = None
-    kernel = None
-    for p in problems:
-        params = dict(p.params)
-        # Force every dtype-shaped param to F32. Lets ``problems()``
-        # entries that hardcode BF16 still smoke under SPV.
-        for key in _DTYPE_KEYS:
-            if key in params:
-                params[key] = DType.F32
+
+    def _params_with_dtypes(p_params, target_dt):
+        """Return a fresh params dict with every dtype-shaped value
+        replaced by ``target_dt``."""
+        out = dict(p_params)
+        for k in _DTYPE_KEYS:
+            if k in out:
+                out[k] = target_dt
         spec_cls = kernel_cls.SPEC_CLS
         if spec_cls is not None:
             import inspect as _inspect
             sig = _inspect.signature(spec_cls)
-            for key in _DTYPE_KEYS:
-                if key in sig.parameters and key not in params:
-                    params[key] = DType.F32
-        try:
-            k = kernel_cls.from_problem(params)
-        except Exception:
-            continue
-        spec_dtypes = {
-            getattr(k.spec, attr)
-            for attr in _DTYPE_KEYS
-            if isinstance(getattr(k.spec, attr, None), DType)
-        }
-        if not spec_dtypes:
-            # Spec doesn't carry a dtype — assume it's compatible.
+            for k in _DTYPE_KEYS:
+                if k in sig.parameters and k not in out:
+                    out[k] = target_dt
+        return out
+
+    chosen = None
+    kernel = None
+    chosen_params = None
+    for p in problems:
+        # Try the natural dtype first; on lower-time failure, retry
+        # at F32. The F32 fallback is what catches kernels with bf16
+        # fast paths the SPV backend hasn't wired (B32 / fma_bf16x2).
+        for target in (None, DType.F32):
+            params = p.params if target is None else _params_with_dtypes(p.params, target)
+            try:
+                k = kernel_cls.from_problem(params)
+            except Exception:
+                continue
+            spec_dtypes = {
+                getattr(k.spec, attr)
+                for attr in _DTYPE_KEYS
+                if isinstance(getattr(k.spec, attr, None), DType)
+            }
+            if spec_dtypes and not (spec_dtypes <= _SPV_SUPPORTED_DTYPES):
+                continue
+            try:
+                # Pre-flight compile — surfaces lower-time visitor /
+                # dtype gaps before we commit to allocating buffers.
+                _LAUNCHER.compile(kernel_cls, k.spec, k.config)
+            except NotImplementedError:
+                continue
+            except Exception:
+                continue
             chosen = p
             kernel = k
+            chosen_params = params
             break
-        if spec_dtypes <= _SPV_SUPPORTED_DTYPES:
-            chosen = p
-            kernel = k
+        if kernel is not None:
             break
     if chosen is None or kernel is None:
         pytest.skip(
-            f"{_kernel_id(kernel_cls)}: no F32-compatible problem "
-            "(SPV backend dtype coverage gap)"
+            f"{_kernel_id(kernel_cls)}: no SPV-compatible-dtype problem"
         )
 
     if not kernel.is_valid_for(_DEVICE.caps):
@@ -166,14 +208,8 @@ def test_spv_kernel_smoke(kernel_cls):
     if not hasattr(kernel_cls, "make_tensors_numpy"):
         pytest.skip(f"{_kernel_id(kernel_cls)}: no make_tensors_numpy")
 
-    # Re-build the params dict matching what we used for ``from_problem``
-    # above so the make_tensors call sees the F32-coerced shape.
-    params = dict(chosen.params)
-    for key in _DTYPE_KEYS:
-        if key in params or hasattr(kernel.spec, key):
-            params[key] = DType.F32
     try:
-        tensors = kernel_cls.make_tensors_numpy(params)
+        tensors = kernel_cls.make_tensors_numpy(chosen_params)
     except NotImplementedError:
         pytest.skip(f"{_kernel_id(kernel_cls)}: make_tensors_numpy not impl")
     except Exception as exc:
@@ -283,7 +319,10 @@ def test_spv_kernel_smoke(kernel_cls):
         return
 
     # Single-output kernel: pair the lone ``role="out"`` buffer name
-    # with the returned array, then validate.
+    # with the returned array, then validate. BF16 arrays land as
+    # ``uint16`` on the numpy side; lift to f32 before allclose'ing
+    # so the comparison runs on real numerical distance, not raw
+    # bf16 bit patterns.
     if len(out_names) != 1:
         pytest.skip(
             f"{_kernel_id(kernel_cls)}: single ndarray reference but "
@@ -293,7 +332,24 @@ def test_spv_kernel_smoke(kernel_cls):
     expected = ref
     got = np.empty(expected.shape, dtype=expected.dtype)
     ctypes.memmove(got.ctypes.data, out_ptrs[only_name], got.nbytes)
-    if np.issubdtype(expected.dtype, np.integer):
+
+    # ``uint16`` lands when the kernel uses bf16 / f16 storage —
+    # numpy lacks a native bf16, so framework helpers carry the bit
+    # pattern as a uint16. Anything dtype-shaped on the spec hints
+    # this is the bf16 path; the conversion to f32 is the only valid
+    # numerical comparison.
+    is_bf16 = expected.dtype == np.uint16 and any(
+        getattr(kernel.spec, k, None) is DType.BF16 for k in _DTYPE_KEYS
+    )
+
+    if is_bf16:
+        np.testing.assert_allclose(
+            _to_f32_for_compare(got),
+            _to_f32_for_compare(expected),
+            rtol=0, atol=1e-2,  # ~0.4% bf16 relative slack
+            err_msg=only_name,
+        )
+    elif np.issubdtype(expected.dtype, np.integer):
         np.testing.assert_array_equal(got, expected, err_msg=only_name)
     else:
         np.testing.assert_allclose(

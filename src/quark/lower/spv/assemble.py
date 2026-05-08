@@ -25,13 +25,13 @@ class SpirvAsNotFound(RuntimeError):
     """Raised when the ``spirv-as`` CLI is missing."""
 
 
-def text_to_binary(spirv_text: str, *, target_env: str = "vulkan1.3") -> bytes:
+def text_to_binary(spirv_text: str, *, target_env: str = "vulkan1.4") -> bytes:
     """Run ``spirv-as`` on ``spirv_text``, return the binary words.
 
-    ``target_env`` selects the validator profile — ``vulkan1.3``
-    matches ``_spv_dispatch.cpp``'s ``apiVersion`` choice; mismatches
-    surface as syntax errors when the assembler enforces the older
-    profile's tighter rules.
+    ``target_env`` selects the validator profile. ``vulkan1.4``
+    enables ``OpTypeFloat 16 BFloat16KHR`` (the proper bf16 type
+    from ``SPV_KHR_bfloat16``); earlier targets reject the suffix.
+    Battlemage exposes ``apiVersion = 1.4.x``, so 1.4 is safe.
 
     Errors:
       * ``SpirvAsNotFound`` — ``spirv-as`` not on PATH.

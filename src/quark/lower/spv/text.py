@@ -138,7 +138,14 @@ class SpvText:
         key = f"int_{width}_{int(signed)}"
         return self._cached_type(key, f"OpTypeInt {width} {int(signed)}")
 
-    def type_float(self, width: int = 32) -> str:
+    def type_float(self, width: int = 32, bfloat16: bool = False) -> str:
+        """Emit ``OpTypeFloat <width>`` (or ``OpTypeFloat 16 BFloat16KHR``
+        when ``bfloat16`` is set). The BFloat16 variant is gated on
+        ``SPV_KHR_bfloat16`` + ``BFloat16TypeKHR`` (declared by callers
+        before invoking this); spirv-as ``vulkan1.4`` accepts the
+        suffixed form, earlier targets reject it."""
+        if bfloat16 and width == 16:
+            return self._cached_type("bfloat16", "OpTypeFloat 16 BFloat16KHR")
         key = f"float_{width}"
         return self._cached_type(key, f"OpTypeFloat {width}")
 

@@ -188,16 +188,14 @@ def _emit_dtype(text: SpvText, dt: DType, ctx: "_SpvCtx | None" = None) -> str:
             text.add_capability("BFloat16TypeKHR")
             text.add_extension("SPV_KHR_bfloat16")
             ctx.has_bf16_cap = True
-        # BFloat16 is an OpTypeFloat 16 with a Width=16 BFloat16
-        # tag — but ``spirv-as`` accepts ``OpTypeFloat 16 BFloat16``
-        # only on the ``vulkan1.4`` profile. For now we emit the same
-        # ``OpTypeFloat 16`` and rely on the capability gating + the
-        # KHR_shader_bfloat16 storage flag at the buffer / coopmat
-        # site to keep it interpreted as bf16.
-        # TODO: re-emit as ``OpTypeFloat 16 BFloat16KHR`` once the
-        # framework standardises on Vulkan 1.4 (see PORTABILITY_PLAN
-        # §3.2 sub-table for the version bump).
-        return text.type_float(16)
+        # ``OpTypeFloat 16 BFloat16KHR`` — the proper bf16 type from
+        # SPV_KHR_bfloat16. spirv-as accepts the suffix only on
+        # ``vulkan1.4`` (or higher) so the assembler target was bumped
+        # to 1.4 alongside this. The earlier f16 fallback caused
+        # silent miscompiles: f16's exponent bias / range are wrong
+        # for bf16 bit patterns, so loaded values were re-interpreted
+        # as out-of-range f16 NaNs / denormals.
+        return text.type_float(16, bfloat16=True)
     if dt is DType.PRED:
         # PRED → OpTypeBool. Vulkan compute doesn't allow OpTypeBool
         # in storage buffers — it lives only as an SSA value (cmp
