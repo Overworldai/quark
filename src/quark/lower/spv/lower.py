@@ -1247,6 +1247,31 @@ def _flatten_index(indices: tuple, shape: tuple, ctx: _SpvCtx) -> str:
     return flat
 
 
+def _add_dyn_offset(flat: str, tensor, ctx: _SpvCtx) -> str:
+    """Append ``tensor.dyn_offset`` to a flat index when present.
+
+    Used after ``_flatten_index`` for SharedRegion accesses. The
+    scalar ``dyn_offset`` is what ``view(dyn_offset=…)`` /
+    ``warp_lane_view`` set — e.g. ``store_acc(per_warp=True)`` uses
+    ``warp_id * (warp_rows * stride_elems)`` as the offset to give
+    each warp a private slice of the staging smem.
+
+    Without this, multi-warp kernels write to the same staging
+    address and the last writer wins — ``attn``'s output had cols
+    4-7, 12-15, … zeroed because warp 1 overwrote warp 0's writes.
+    """
+    scalar_dyn = getattr(tensor, "dyn_offset", None)
+    if scalar_dyn is None:
+        return flat
+    u32 = ctx.text.type_int(32, signed=False)
+    d_id = ctx.val_to_id[scalar_dyn.id]
+    new_flat = ctx.text.alloc_id("flat_dyn")
+    ctx.text.emit_function(
+        f"{new_flat} = OpIAdd {u32} {flat} {d_id}"
+    )
+    return new_flat
+
+
 def _visit_load(op: LoadOp, ctx: _SpvCtx) -> None:
     (out,) = op.results
     tensor = op.attrs["tensor"]
@@ -1274,6 +1299,7 @@ def _visit_load(op: LoadOp, ctx: _SpvCtx) -> None:
             )
         var_id, elem_type, elem_ptr, _n = rec
         idx_id = _flatten_index(tuple(op.operands), tensor.shape, ctx)
+        idx_id = _add_dyn_offset(idx_id, tensor, ctx)
         chain_id = ctx.text.alloc_id("smem_chain")
         # Workgroup-class arrays are ``OpVariable Workgroup
         # OpTypeArray T n`` — no enclosing struct — so the access
@@ -1317,6 +1343,7 @@ def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
         var_id, _elem_type, elem_ptr, _n = rec
         value_id = ctx.val_to_id[op.operands[0].id]
         idx_id = _flatten_index(tuple(op.operands[1:]), tensor.shape, ctx)
+        idx_id = _add_dyn_offset(idx_id, tensor, ctx)
         chain_id = ctx.text.alloc_id("smem_chain")
         ctx.text.emit_function(
             f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
@@ -1882,6 +1909,7 @@ def _visit_vec_load(op: VecLoadOp, ctx: _SpvCtx) -> None:
         base_id = _flatten_global_index(tuple(indices), tensor, ctx)
     else:
         base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
+        base_id = _add_dyn_offset(base_id, tensor, ctx)
     u32 = ctx.text.type_int(32, signed=False)
 
     loaded: list[str] = []
@@ -1949,6 +1977,7 @@ def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
         base_id = _flatten_global_index(tuple(indices), tensor, ctx)
     else:
         base_id = _flatten_index(tuple(indices), tensor.shape, ctx)
+        base_id = _add_dyn_offset(base_id, tensor, ctx)
     vec_id = ctx.val_to_id[vec_v.id]
     u32 = ctx.text.type_int(32, signed=False)
 
