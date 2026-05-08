@@ -161,37 +161,6 @@ def test_spv_kernel_smoke(kernel_cls):
                     out[k] = target_dt
         return out
 
-    # Intel cooperative-matrix shapes that ``is_valid_for`` may need
-    # threaded into the config when the kernel's default
-    # ``main_shape=""`` falls back via ``lookup_mma`` to a PTX shape
-    # (PORTABILITY_PLAN §3.7 v2 follow-up — device-aware default
-    # shape resolution isn't wired yet). Iterating these covers GEMM
-    # / attn / moe_inproj / moe_outproj / patchify / unpatchify on
-    # Battlemage smoke without a device-aware ``lookup_mma``.
-    _INTEL_SHAPES_FOR_FALLBACK = (
-        "m8n16k16_intel_bf16_f32",
-        "m8n16k16_intel_f16_f32",
-    )
-
-    def _maybe_force_main_shape(k, shape_id):
-        """Return a fresh kernel instance with ``config.main_shape``
-        set to ``shape_id``; ``None`` if the config has no
-        ``main_shape`` field or if the substitution doesn't validate.
-        """
-        cfg = k.config
-        if not hasattr(cfg, "main_shape"):
-            return None
-        try:
-            import dataclasses as _dc
-            new_cfg = _dc.replace(cfg, main_shape=shape_id)
-        except (TypeError, ValueError):
-            return None
-        try:
-            new_k = type(k)(k.spec, new_cfg)
-        except Exception:
-            return None
-        return new_k
-
     chosen = None
     kernel = None
     chosen_params = None
@@ -212,32 +181,34 @@ def test_spv_kernel_smoke(kernel_cls):
             }
             if spec_dtypes and not (spec_dtypes <= _SPV_SUPPORTED_DTYPES):
                 continue
-            # Try the kernel's default config first; if it doesn't
-            # validate (typical when ``main_shape=""`` resolves to a
-            # PTX shape via ``lookup_mma``), retry with each Intel
-            # cooperative-matrix shape forced into the config.
-            candidates = [k]
-            for shape_id in _INTEL_SHAPES_FOR_FALLBACK:
-                forced = _maybe_force_main_shape(k, shape_id)
-                if forced is not None:
-                    candidates.append(forced)
-            for cand in candidates:
-                if not cand.is_valid_for(_DEVICE.caps):
-                    continue
-                try:
-                    # Pre-flight compile — surfaces lower-time visitor /
-                    # dtype gaps before we commit to allocating buffers.
-                    _LAUNCHER.compile(kernel_cls, cand.spec, cand.config)
-                except NotImplementedError:
-                    continue
-                except Exception:
-                    continue
-                chosen = p
-                kernel = cand
-                chosen_params = params
-                break
-            if kernel is not None:
-                break
+            # Resolve empty ``config.main_shape`` from device caps —
+            # the Launcher does this internally during compile, but
+            # the pre-validation ``is_valid_for`` below sees the
+            # un-resolved config, so we mirror the resolver here.
+            # Without this, MMA-using kernels with ``main_shape=""``
+            # default would fall through ``lookup_mma`` to a PTX
+            # shape and fail the pre-validation check.
+            resolved_cfg = _LAUNCHER._maybe_resolve_main_shape(
+                kernel_cls, k.spec, k.config,
+            )
+            cand = (
+                k if resolved_cfg is k.config
+                else kernel_cls(k.spec, resolved_cfg)
+            )
+            if not cand.is_valid_for(_DEVICE.caps):
+                continue
+            try:
+                # Pre-flight compile — surfaces lower-time visitor /
+                # dtype gaps before we commit to allocating buffers.
+                _LAUNCHER.compile(kernel_cls, cand.spec, cand.config)
+            except NotImplementedError:
+                continue
+            except Exception:
+                continue
+            chosen = p
+            kernel = cand
+            chosen_params = params
+            break
         if kernel is not None:
             break
     if chosen is None or kernel is None:
