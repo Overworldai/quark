@@ -2981,6 +2981,12 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
             f"!= n_results={n_results}"
         )
     ctx.text.add_capability("GroupNonUniformClustered")
+    # ``OpGroupNonUniformBroadcast`` lives under ``GroupNonUniform
+    # Ballot`` in the SPIR-V spec — declare the capability whenever we
+    # emit the broadcast. (The driver chain has it on every Vulkan 1.1+
+    # device that exposes basic subgroup ops, but spirv-val rejects
+    # the binary without the explicit capability line.)
+    ctx.text.add_capability("GroupNonUniformBallot")
     cluster_const = ctx.text.const_uint(cluster_size)
 
     slot_reduced: list[str] = []
