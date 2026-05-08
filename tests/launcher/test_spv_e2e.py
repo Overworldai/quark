@@ -560,6 +560,149 @@ class TestExistingKernelsCompile:
             )
             assert ck.module.handle != 0
 
+    def test_head_rmsnorm_runs_end_to_end_against_numpy_reference(
+        self, spv_device,
+    ):
+        """``HeadRMSNormKernel`` runs E2E and matches its reference.
+        Per-head RMS over Dh-wide column ranges of a packed QKV tensor;
+        the K/V heads are normalized after the Q heads, V columns are
+        copied through. Multiple per-block reductions exercise smem +
+        subgroup_reduce."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.head_rmsnorm.kernel import HeadRMSNormKernel
+        from quark.kernels.head_rmsnorm.spec import HeadRMSNormSpec
+        from quark.kernels.head_rmsnorm.config import HeadRMSNormConfig
+        from quark.kernels.head_rmsnorm.reference import (
+            head_rmsnorm_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        n_q, n_kv, Dh = 4, 2, 64
+        M = 4
+        D_full = (n_q + 2 * n_kv) * Dh  # 8 * 64 = 512
+        spec = HeadRMSNormSpec(
+            M=M, D_full=D_full, n_q_heads=n_q, n_kv_heads=n_kv, Dh=Dh,
+            dtype=DType.F32,
+        )
+
+        rng = np.random.default_rng(0xC0FFEE_5EED & 0xFFFFFFFF)
+        X = rng.standard_normal((M, D_full)).astype(np.float32)
+        expected = head_rmsnorm_reference_numpy(spec, X=X)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(HeadRMSNormKernel, spec, HeadRMSNormConfig(n_warps=1))
+
+        x_h, x_map = _sd.allocate_buffer(X.nbytes)
+        o_h, o_map = _sd.allocate_buffer(M * D_full * 4)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+
+        ck.launch(buffers=[x_h, o_h])
+
+        got = np.empty((M, D_full), dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-4)
+
+    def test_value_residual_runs_end_to_end_against_numpy_reference(
+        self, spv_device,
+    ):
+        """``ValueResidualKernel`` runs E2E and matches its reference.
+        ``out = v + lamb * (v1 - v)`` — flat 1D residual lerp; 4 buffers."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.value_residual.kernel import ValueResidualKernel
+        from quark.kernels.value_residual.spec import ValueResidualSpec
+        from quark.kernels.value_residual.config import ValueResidualConfig
+        from quark.kernels.value_residual.reference import (
+            value_residual_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        N = 256
+        spec = ValueResidualSpec(N=N, dtype=DType.F32)
+
+        rng = np.random.default_rng(0xBADC0FFEE & 0xFFFFFFFF)
+        V = rng.standard_normal(N).astype(np.float32)
+        V1 = rng.standard_normal(N).astype(np.float32)
+        lamb = np.array([0.31], dtype=np.float32)
+        expected = value_residual_reference_numpy(spec, V=V, V1=V1, lamb=lamb)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            ValueResidualKernel, spec,
+            ValueResidualConfig(n_warps=1, elems_per_block=N),
+        )
+
+        v_h, v_map = _sd.allocate_buffer(V.nbytes)
+        v1_h, v1_map = _sd.allocate_buffer(V1.nbytes)
+        l_h, l_map = _sd.allocate_buffer(lamb.nbytes)
+        o_h, o_map = _sd.allocate_buffer(N * 4)
+        ctypes.memmove(v_map, V.ctypes.data, V.nbytes)
+        ctypes.memmove(v1_map, V1.ctypes.data, V1.nbytes)
+        ctypes.memmove(l_map, lamb.ctypes.data, lamb.nbytes)
+
+        ck.launch(buffers=[v_h, v1_h, l_h, o_h])
+
+        got = np.empty(N, dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-6)
+
+    def test_ada_gate_residual_runs_end_to_end_against_numpy_reference(
+        self, spv_device,
+    ):
+        """``AdaGateResidualKernel`` runs E2E and matches its reference.
+        ``out = x + gate * y`` with gate broadcast from [G, D] to [B, D].
+        4 buffers; chunk-D loop over the feature dim (uses ForLoopOp)."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.ada_gate_residual.kernel import (
+            AdaGateResidualKernel,
+        )
+        from quark.kernels.ada_gate_residual.spec import AdaGateResidualSpec
+        from quark.kernels.ada_gate_residual.config import (
+            AdaGateResidualConfig,
+        )
+        from quark.kernels.ada_gate_residual.reference import (
+            ada_gate_residual_reference_numpy,
+        )
+        from quark.launcher import Launcher
+
+        G, M, D = 1, 32, 128
+        B = G * M
+        spec = AdaGateResidualSpec(G=G, M=M, D=D, dtype=DType.F32)
+
+        rng = np.random.default_rng(0xA9A_DEC0DE & 0xFFFFFFFF)
+        X = rng.standard_normal((B, D)).astype(np.float32)
+        Y = rng.standard_normal((B, D)).astype(np.float32)
+        gate = rng.standard_normal((G, D)).astype(np.float32) * 0.1
+        expected = ada_gate_residual_reference_numpy(spec, X=X, Y=Y, gate=gate)
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(
+            AdaGateResidualKernel, spec,
+            AdaGateResidualConfig(n_warps=1, chunk_D=128, direct=True),
+        )
+
+        x_h, x_map = _sd.allocate_buffer(X.nbytes)
+        y_h, y_map = _sd.allocate_buffer(Y.nbytes)
+        g_h, g_map = _sd.allocate_buffer(gate.nbytes)
+        o_h, o_map = _sd.allocate_buffer(B * D * 4)
+        ctypes.memmove(x_map, X.ctypes.data, X.nbytes)
+        ctypes.memmove(y_map, Y.ctypes.data, Y.nbytes)
+        ctypes.memmove(g_map, gate.ctypes.data, gate.nbytes)
+
+        ck.launch(buffers=[x_h, y_h, g_h, o_h])
+
+        got = np.empty((B, D), dtype=np.float32)
+        ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-5)
+
     def test_elementwise_kernel_compiles(self, spv_device):
         """``ElementwiseKernel`` — vec_load + per-elem op (add/mul/etc.) +
         vec_store. Cohort backbone for the attention block's scalar
