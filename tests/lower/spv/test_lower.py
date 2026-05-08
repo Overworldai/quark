@@ -1384,6 +1384,71 @@ def test_multi_warp_frag_visitors_partition_smem_per_warp():
     assert src4.count("smem_base") >= 1
 
 
+@pytest.mark.parametrize(
+    "shape,a_dt,b_dt,out_dt",
+    [
+        ("m8n16k16_intel_bf16_f32", "BF16", "BF16", "BF16"),
+        ("m8n16k16_intel_f16_f32", "F16", "F16", "F16"),
+    ],
+)
+def test_gemm_lowers_on_intel_shapes(shape, a_dt, b_dt, out_dt):
+    """GEMM lowers on every Intel cooperative-matrix shape that the
+    framework supports today (bf16 and f16 inputs, both with f32
+    accumulator since GemmSpec requires F32 acc). Locks in dtype
+    coverage for the SPV cooperative-matrix path so a regression in
+    the f16 type emit (e.g. missing capability, wrong OpTypeFloat
+    width) doesn't slip past the bf16-only suite."""
+    from quark.kernels.gemm.kernel import GemmKernel
+    from quark.kernels.gemm.config import GemmConfig
+    from quark.kernels.gemm.spec import GemmSpec
+    from quark.lower.legalize import legalize
+    from quark.ir.module import Module
+
+    a = getattr(DType, a_dt)
+    b = getattr(DType, b_dt)
+    o = getattr(DType, out_dt)
+    spec = GemmSpec(
+        M=128, N=128, K=128,
+        a_dtype=a, b_dtype=b, acc_dtype=DType.F32, out_dtype=o,
+        compute_dtype=a,
+    )
+    cfg = GemmConfig(
+        BM=32, BN=32, BK=16, n_warps=1, n_stages=1,
+        main_shape=shape, impl="ws",
+    )
+    k = GemmKernel(spec, cfg)
+    # Synthesize Intel caps that include both shapes so either
+    # parametrisation validates.
+    from quark.device import DeviceCaps, DeviceFamily
+
+    caps = DeviceCaps(
+        family=DeviceFamily.INTEL_GPU, name="battlemage_synth",
+        compute_unit_count=20, subgroup_width=32,
+        max_threads_per_block=1024, max_smem_per_block=64 * 1024,
+        max_regs_per_thread=0, max_regs_per_block=0,
+        arch_tag="xe2", compute_capability=None,
+        supports_async_copy=False, supports_graph_capture=False,
+        supports_fp8_e4m3=False, supports_bf16_mma=True,
+        matmul_shapes=frozenset(["m8n16k16_intel_bf16_f32",
+                                 "m8n16k16_intel_f16_f32"]),
+    )
+    assert k.is_valid_for(caps), (
+        f"GEMM bf16/f16 ({shape}): not valid on Intel caps"
+    )
+    ir = k.emit()
+    if isinstance(ir, Module):
+        legalize(ir, caps)
+    src = SpirVLowerer(local_size=k.block()).lower_module(ir).source
+    assert "OpCapability CooperativeMatrixKHR" in src
+    assert "OpCooperativeMatrixMulAddKHR" in src
+    if a is DType.F16:
+        # f16 input requires the Float16 capability.
+        assert "OpCapability Float16" in src
+    elif a is DType.BF16:
+        assert "OpCapability BFloat16TypeKHR" in src
+        assert "OpCapability BFloat16CooperativeMatrixKHR" in src
+
+
 def test_attn_lowers_on_spv_exercises_full_visitor_surface():
     """Attention is the headline coopmat kernel — it exercises every
     visitor on the SPV path: cooperative-matrix Load/Store/MulAdd,
