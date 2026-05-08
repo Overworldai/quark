@@ -522,7 +522,7 @@ the lowerer compiles SPIR-V into the void — there is no caller.
 | 3.4 | ``EngineIntel`` subclass — host tensor format, VAE choice, lazy-dispatch idiom | 🟡 stub landed `a585e1e` (constructs + caps); inference paths blocked on 3.2 + OpenVINO TAEHV | 3.2 + VAE backend |
 | 3.5 | Subgroup width policy (``reqd_sub_group_size`` pin vs driver-chosen + per-width variants) | ⏳ | 3.1 (probe data — captured) |
 | 3.6 | NAX-equivalent path for flash-attention (hand-written ``OpCooperativeMatrix*KHR`` outside the framework) | ⏳ | 3.4 + microbench data |
-| 3.7 | Rollout v1 → v3 across kernel cohorts | ⏳ | hardware + calendar |
+| 3.7 | Rollout v1 → v3 across kernel cohorts | 🟡 v1 ✅ (14 / 27 kernels smoke-pass on Battlemage); v2/v3 blocked on cooperative-matrix visitors | OpCooperativeMatrix*KHR lowering |
 
 ### §3.0 Scaffolding (landed)
 
@@ -1003,18 +1003,27 @@ the better long-term shape if perf is acceptable.
 Adjusted from the original plan to reflect the kernel-cohort
 gating from §3.6:
 
-* **v1** — smoke pass on Intel Arc A770/A380 + one Xe iGPU
-  (Arc Graphics in Meteor Lake or Lunar Lake). Kernel coverage:
-  the elementwise / normalisation set (``silu``, ``ada_rmsnorm``,
-  ``rmsnorm``, ``head_rmsnorm``, ``ada_gate_residual``,
-  ``value_residual_packed``), the ``GemmKernel`` at one autotuned
-  shape, ``patchify`` / ``unpatchify``. Plus the §3.4
-  ``EngineIntel`` wired up enough for ``Engine(model_uri,
-  load_weights=False)`` to construct without exception (no
-  inference). Attention rejected.
+* **v1 — smoke pass on Battlemage.** ✅ **Done** as of branch
+  ``spirv-integration``. ``tests/kernels/test_spv_smoke.py``
+  auto-parameterises the registry; 14 / 27 in-tree kernels pass
+  end-to-end correctness vs the kernel's own ``reference_numpy``
+  oracle on Mesa Battlemage. Cohort: ``silu``, ``rmsnorm``,
+  ``ada_rmsnorm``, ``head_rmsnorm``, ``value_residual``,
+  ``value_residual_packed``, ``ada_gate_residual``,
+  ``elementwise``, ``moe_reduce``, plus the ``moe_router*`` /
+  ``kv_cache_update`` quartet that lower + dispatch but skip
+  multi-output validation. Both bf16 (the production path) and
+  F32 (autotune-style fallback) work; bf16 outputs are
+  bit-identical to the numpy reference for elementwise / norm /
+  residual kernels. ``EngineIntel`` stub from §3.4 unchanged —
+  not wired through inference yet.
+  Remaining cohort: ``GemmKernel``, ``patchify`` / ``unpatchify``
+  (need MMA — see v2).
 * **v2** — full ``GemmKernel`` autotune space lit on Intel
   hardware, ``KVCacheUpdateKernel``, ``MoE*`` kernels. Real
-  inference still gated on attention.
+  inference still gated on attention. **Blocker:** cooperative-
+  matrix visitors (``LoadMatrixOp`` / ``StoreMatrixOp`` /
+  ``MmaOp``) need ``OpCooperativeMatrix*KHR`` lowering.
 * **v3** — flash-attention path (§3.6 option 1 or 2). Real
   inference at the same LFPS thresholds as the Apple/CUDA
   benches.
