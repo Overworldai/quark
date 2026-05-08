@@ -142,7 +142,7 @@ def test_spv_kernel_smoke(kernel_cls):
     # smoke coverage on F32.
     _DTYPE_KEYS = (
         "dtype", "in_dtype", "kv_dtype", "compute_dtype",
-        "src_dtype", "out_dtype",
+        "src_dtype", "out_dtype", "partials_dtype",
     )
 
     def _params_with_dtypes(p_params, target_dt):
