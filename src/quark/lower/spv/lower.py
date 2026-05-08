@@ -50,6 +50,7 @@ from quark.ir.op import (
     ConstOp,
     ConvertOp,
     ForLoopOp,
+    FragForEachOp,
     GroupIdOp,
     IfRegionOp,
     LaneIdOp,
@@ -904,7 +905,14 @@ def _visit_for_loop(op: ForLoopOp, ctx: _SpvCtx) -> None:
     carry_next_ids: list[str] = []
     carry_type_ids: list[str] = []
     for i, body_var in enumerate(op.carried_body_vars):
-        c_type = _emit_dtype(ctx.text, body_var.dtype, ctx)
+        # Carry value type — element dtype lifted to a vector when
+        # the carry's shape is wider than 1 (the accumulator pattern
+        # GEMM uses: the carry is a width-N f32 vec).
+        elem_t = _emit_dtype(ctx.text, body_var.dtype, ctx)
+        if body_var.width > 1:
+            c_type = ctx.text.type_vec(elem_t, body_var.width)
+        else:
+            c_type = elem_t
         phi_id = ctx.text.alloc_id(f"carry{i}")
         next_id = ctx.text.alloc_id(f"carry{i}_next")
         carry_phi_ids.append(phi_id)
@@ -1920,9 +1928,19 @@ def _visit_vec_extract(op: VecExtractOp, ctx: _SpvCtx) -> None:
 def _ensure_coopmat_caps(ctx: _SpvCtx) -> None:
     """Lazy-declare the ``CooperativeMatrixKHR`` capability +
     ``SPV_KHR_cooperative_matrix`` extension. Idempotent — repeated
-    calls fold into the dedup'd capability list."""
+    calls fold into the dedup'd capability list.
+
+    The CooperativeMatrixKHR capability requires VulkanMemoryModel
+    (Vulkan validation rejects the SPIR-V otherwise). The
+    VulkanMemoryModel capability needs the matching
+    ``OpMemoryModel Logical Vulkan`` declaration too — but the
+    framework's text emitter pins ``OpMemoryModel Logical GLSL450``
+    by default. We override the memory model lazily here.
+    """
     ctx.text.add_capability("CooperativeMatrixKHR")
+    ctx.text.add_capability("VulkanMemoryModel")
     ctx.text.add_extension("SPV_KHR_cooperative_matrix")
+    ctx.text.set_memory_model("Logical Vulkan")
 
 
 # IR ``which`` (a/b/c) → SPIR-V Use index. ``c`` and ``d`` both map to
@@ -2016,6 +2034,9 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _SpvCtx) -> None:
     use = _COOPMAT_USE[which]
 
     elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    if dtype is DType.BF16:
+        # bf16 coopmat element type needs the matching capability.
+        ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
     coop_t = ctx.text.type_coop_matrix(
         elem_type, scope=3, rows=rows, cols=cols, use=use,
     )
@@ -2057,6 +2078,161 @@ def _visit_store_matrix(op: StoreMatrixOp, ctx: _SpvCtx) -> None:
     )
 
 
+def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
+    """``FragForEachOp`` via smem roundtrip.
+
+    The IR primitive iterates a body over each storage slot of a
+    fragment. PTX/Metal can index the per-register / per-lane storage
+    directly; SPIR-V cooperative_matrix doesn't expose that mapping
+    (it's implementation-private). The portable workaround is to
+    ``OpCooperativeMatrixStoreKHR`` the fragment to a smem scratch
+    region in row-major layout — at that point the (row, col)
+    addressing the body uses is well-defined — then walk through the
+    elements one slot at a time per lane.
+
+    Lane-slot partition: each lane owns ``rows*cols / subgroup_size``
+    slots, indexed as ``lane_id + s * subgroup_size``. The
+    ``rows*cols`` must divide the subgroup size (Battlemage's 32
+    matches the four ``m8n16k16_intel_*`` shapes' 8×16 tile).
+
+    The body's ``body_input_var`` / ``body_row_var`` / ``body_col_var``
+    are bound per slot before walking the body ops; the visitor
+    surface (load, store, arith, etc.) sees them as plain SSA ids.
+    """
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    _ensure_coopmat_caps(ctx)
+    shape_id = op.attrs["shape_id"]
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_frag_for_each: unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+    rows, cols, dtype = _coop_dims_for(shape, "c")
+    n_elems = rows * cols
+    subgroup_width = 32  # Battlemage. TODO: pull from caps when Xe-LPG lands.
+    if n_elems % subgroup_width != 0:
+        raise NotImplementedError(
+            f"_visit_frag_for_each: tile {rows}×{cols}={n_elems} not "
+            f"divisible by subgroup_width={subgroup_width}"
+        )
+    n_slots_per_lane = n_elems // subgroup_width
+
+    # 1. Allocate a unique scratch smem region for this FragForEach.
+    # We mimic the SmemAllocOp emit pattern but inline — no IR-level
+    # SmemAllocOp is created.
+    elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    n_const = ctx.text.const_uint(n_elems)
+    arr_id = ctx.text.alloc_id("frag_each_arr")
+    ctx.text.add_type_line(f"{arr_id} = OpTypeArray {elem_type} {n_const}")
+    ptr_arr = ctx.text.type_pointer("Workgroup", arr_id)
+    var_id = ctx.text.alloc_id("frag_each_smem")
+    ctx.text.add_type_line(f"{var_id} = OpVariable {ptr_arr} Workgroup")
+    elem_ptr = ctx.text.type_pointer("Workgroup", elem_type)
+    # Track the scratch in smem_allocs so the entry-point interface
+    # walker picks it up. ``smem_allocs`` keys on a Value.id; use a
+    # synthetic key (id() of this op) since there's no IR Value here.
+    ctx.smem_allocs[id(op)] = (var_id, elem_type, elem_ptr, n_elems)
+
+    # 2. Get a pointer to scratch[0] for the coop store.
+    zero = ctx.text.const_uint(0)
+    base_ptr = ctx.text.alloc_id("frag_each_base")
+    ctx.text.emit_function(
+        f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {zero}"
+    )
+
+    # 3. Store the coopmat to scratch in row-major order.
+    coop_id = ctx.val_to_id[op.in_frag.id]
+    cols_const = ctx.text.const_uint(cols)
+    layout_id = ctx.text.const_uint(0)  # RowMajor
+    ctx.text.emit_function(
+        f"OpCooperativeMatrixStoreKHR {base_ptr} {coop_id} "
+        f"{layout_id} {cols_const}"
+    )
+
+    # 4. Subgroup barrier so all lanes see the coopmat-store writes
+    # before reading per-slot below. Subgroup scope is sufficient
+    # because the partition is per-subgroup; AcquireRelease |
+    # WorkgroupMemory matches the smem semantics other barriers use.
+    sg_scope = ctx.text.const_uint(3)  # Subgroup
+    sg_sem = ctx.text.const_uint(0x8 | 0x100)
+    ctx.text.emit_function(
+        f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
+    )
+
+    # 5. Get lane id (SubgroupLocalInvocationId) — already cached by
+    # ``_ensure_builtin_vec3_component`` etc.; use the lane_id helper.
+    u32 = ctx.text.type_int(32, signed=False)
+    lane_id_ssa = _ensure_lane_id(ctx)
+
+    # 6. Iterate slots Python-side. Each slot reads its element from
+    # scratch and binds the body inputs.
+    sgw_const = ctx.text.const_uint(subgroup_width)
+    cols_const_div = ctx.text.const_uint(cols)
+    for s in range(n_slots_per_lane):
+        # idx = lane_id + s * subgroup_width
+        if s == 0:
+            idx_id = lane_id_ssa
+        else:
+            offset = ctx.text.const_uint(s * subgroup_width)
+            idx_id = ctx.text.alloc_id(f"frag_each_idx_{s}")
+            ctx.text.emit_function(
+                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
+            )
+
+        # row = idx / cols, col = idx % cols
+        row_id = ctx.text.alloc_id(f"frag_each_row_{s}")
+        ctx.text.emit_function(
+            f"{row_id} = OpUDiv {u32} {idx_id} {cols_const_div}"
+        )
+        col_id = ctx.text.alloc_id(f"frag_each_col_{s}")
+        ctx.text.emit_function(
+            f"{col_id} = OpUMod {u32} {idx_id} {cols_const_div}"
+        )
+
+        # Load element from scratch[idx].
+        chain_id = ctx.text.alloc_id(f"frag_each_load_chain_{s}")
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
+        )
+        elem_id = ctx.text.alloc_id(f"frag_each_elem_{s}")
+        ctx.text.emit_function(
+            f"{elem_id} = OpLoad {elem_type} {chain_id}"
+        )
+
+        # Bind body vars and walk the body ops.
+        ctx.val_to_id[op.body_input_var.id] = elem_id
+        ctx.val_to_id[op.body_row_var.id] = row_id
+        ctx.val_to_id[op.body_col_var.id] = col_id
+        for body_op in op.body.ops:
+            _walk_op(body_op, ctx)
+
+
+def _ensure_lane_id(ctx: _SpvCtx) -> str:
+    """Return the SSA id for ``SubgroupLocalInvocationId``, declaring
+    the input variable + load lazily (mirrors the lane_id_x_loaded
+    cache the LaneIdOp visitor uses)."""
+    cached = getattr(ctx, "lane_id_x_loaded", "")
+    if cached:
+        return cached
+    var_id = getattr(ctx, "lane_id_var", "")
+    if not var_id:
+        u32 = ctx.text.type_int(32, signed=False)
+        ptr = ctx.text.type_pointer("Input", u32)
+        var_id = ctx.text.alloc_id("SubgroupLocalInvocationId")
+        ctx.text.add_type_line(f"{var_id} = OpVariable {ptr} Input")
+        ctx.text.add_decoration(
+            f"OpDecorate {var_id} BuiltIn SubgroupLocalInvocationId"
+        )
+        ctx.lane_id_var = var_id
+    u32 = ctx.text.type_int(32, signed=False)
+    loaded = ctx.text.alloc_id("SubgroupLocalInvocationId_v")
+    ctx.text.emit_function(f"{loaded} = OpLoad {u32} {var_id}")
+    ctx.lane_id_x_loaded = loaded
+    return loaded
+
+
 def _visit_mma(op: MmaOp, ctx: _SpvCtx) -> None:
     """``MmaOp`` → ``OpCooperativeMatrixMulAddKHR``. ``D = A * B + C``."""
     from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
@@ -2073,6 +2249,8 @@ def _visit_mma(op: MmaOp, ctx: _SpvCtx) -> None:
     # Result is the accumulator (use=2) shape with acc_dtype.
     rows, cols, dtype = _coop_dims_for(shape, "c")
     elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    if dtype is DType.BF16:
+        ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
     coop_t = ctx.text.type_coop_matrix(
         elem_type, scope=3, rows=rows, cols=cols, use=2,
     )
@@ -2113,6 +2291,7 @@ _DISPATCH: dict[type, Any] = {
     LoadMatrixOp: _visit_load_matrix,
     StoreMatrixOp: _visit_store_matrix,
     MmaOp: _visit_mma,
+    FragForEachOp: _visit_frag_for_each,
     VecLoadOp: _visit_vec_load,
     VecStoreOp: _visit_vec_store,
     VecBuildOp: _visit_vec_build,

@@ -82,6 +82,15 @@ class SpvText:
         if line not in self.capabilities:
             self.capabilities.append(line)
 
+    def set_memory_model(self, model: str) -> None:
+        """Override the default ``OpMemoryModel Logical GLSL450``.
+
+        The CooperativeMatrixKHR + VulkanMemoryModel capability pair
+        (used by the SPV cooperative-matrix path) requires
+        ``Logical Vulkan`` instead. Idempotent.
+        """
+        self.memory_model = f"OpMemoryModel {model}"
+
     def add_extension(self, ext: str) -> None:
         line = f'OpExtension "{ext}"'
         if line not in self.extensions:
