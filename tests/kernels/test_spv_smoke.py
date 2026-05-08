@@ -121,13 +121,32 @@ def _problem_dtypes(problem_params: dict) -> set:
 
 # Kernels with documented numerical-correctness limitations on the SPV
 # backend that should xfail rather than hard-fail in smoke. Today the
-# only entry is ``attn``: the multi-class FragReduce/FragApply path
-# (commit 3433693) fixes per-row softmax normalisation, but a
-# separate pre-existing addressing bug in the SPV pipeline still
-# zeroes cols 4-7 / 12-15 / … of every row in the output. The bug is
-# orthogonal to per-row reduce — present at b17fb32 too (one block
-# of zeros pre-multi-class; alternating 4-col blocks post-multi-
-# class). Path-to-fix tracked separately.
+# only entry is ``attn``.
+#
+# Bisect findings (1b73261):
+# * Multi-class FragReduce/FragApply path (3433693) fixes per-row
+#   softmax normalisation — verified.
+# * A separate pre-existing addressing bug zeroes ~50 % of every
+#   output row. With uniform Q/K/V=0.1 the surviving non-zero cols
+#   are exactly ``[0..3, 8..11, 16..19, 24..27, 32..35, 40..43,
+#   48..51, 56..59]`` — i.e. lanes where ``lane_id & 4 == 0``
+#   (PTX-style ``group_id`` even). Lanes with ``group_id`` odd
+#   (4-7, 12-15, 20-23, …) write zero. The pattern is independent of
+#   row, n_warps, MTiles, and KvTile — every config tested showed it.
+# * Likely a coopmat lane→element layout mismatch: PTX-style
+#   per-lane addressing (group_id-based) silently being applied
+#   somewhere on the consume side of the smem-roundtrip pattern,
+#   when Intel KHR coopmat needs subgroup-uniform pointers (compare
+#   the warp_dyn_offset-vs-dyn_offset distinction the
+#   ``_emit_matrix_pointer`` fix in f0ade34 captured).
+# * GEMM with NT=4 per warp (BM=8 BN=64 nw=1) is bit-identical, so
+#   it's not "multi-n-tile-per-warp" generically — narrows to one
+#   of attn's softmax-specific paths (FragApply / FragReduce /
+#   FragConvert internal smem accesses).
+#
+# Tracked for the next pass; the per-row reduce work in this session
+# stays in even though smoke can't prove it because the addressing
+# bug masks output values.
 _SPV_KNOWN_NUMERICAL_LIMITS = frozenset({"attn"})
 
 
