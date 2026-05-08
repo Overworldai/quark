@@ -250,6 +250,23 @@ def _dtype_byte_width(dt: DType) -> int:
     )
 
 
+def _same_size_int_dtype(dt: DType) -> DType:
+    """Return a same-size unsigned-integer dtype for ``dt``. Used by
+    the vec_load/vec_store reinterpret path: float / bf16 elements
+    bitcast to their same-size int form before being packed into a
+    larger integer (``vec2-u16 → u32`` for the bf16 → b32 case).
+    """
+    if dt in (DType.B32, DType.U32, DType.S32, DType.F32):
+        return DType.B32
+    if dt in (DType.B16, DType.U16, DType.S16, DType.F16, DType.BF16):
+        return DType.B16
+    if dt in (DType.U8, DType.S8):
+        return DType.U8
+    raise NotImplementedError(
+        f"_same_size_int_dtype: no integer alias for {dt!r}"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────
 # Visitor implementations.
 # ─────────────────────────────────────────────────────────────────
@@ -1912,8 +1929,34 @@ def _visit_vec_load(op: VecLoadOp, ctx: _SpvCtx) -> None:
         base_id = _add_dyn_offset(base_id, tensor, ctx)
     u32 = ctx.text.type_int(32, signed=False)
 
+    # Reinterpret-load: ``out.dtype`` may differ from the tensor's
+    # natural element type (e.g. ``vec_load(bf16_tensor, ...,
+    # width=4, dtype=B32)`` reads 4 b32 = 8 bf16 worth, not 4 bf16).
+    # Load ``nat_count = width * out.dtype.bytes / nat.bytes``
+    # natural-type elements, then bitcast/pack to ``width`` of
+    # ``out.dtype``. PTX's ``_vec_phys_form`` does the equivalent
+    # via reg-class widening; on SPV we materialise it explicitly
+    # because OpLoad returns a single scalar of the pointee type.
+    nat_bytes = tensor.dtype.bytes
+    out_bytes = out.dtype.bytes
+    if out.dtype is tensor.dtype:
+        nat_count = width
+        ratio = 1
+    else:
+        if (width * out_bytes) % nat_bytes != 0:
+            raise NotImplementedError(
+                f"_visit_vec_load: width={width} {out.dtype!r} not byte-"
+                f"divisible by natural {tensor.dtype!r}"
+            )
+        nat_count = (width * out_bytes) // nat_bytes
+        if nat_count % width != 0:
+            raise NotImplementedError(
+                f"_visit_vec_load: nat_count={nat_count} not divisible by width={width}"
+            )
+        ratio = nat_count // width
+
     loaded: list[str] = []
-    for i in range(width):
+    for i in range(nat_count):
         if i == 0:
             idx_id = base_id
         else:
@@ -1929,12 +1972,60 @@ def _visit_vec_load(op: VecLoadOp, ctx: _SpvCtx) -> None:
         ctx.text.emit_function(f"{ld_id} = OpLoad {elem_type} {chain_id}")
         loaded.append(ld_id)
 
+    # Convert ``loaded`` (nat_count scalars of natural type) to
+    # ``packed`` (width scalars of out.dtype). Same dtype → identity.
+    # Otherwise bitcast same-size pieces, OpCompositeConstruct vec
+    # of intermediate ints, OpBitcast to the target int.
+    out_elem_type = _emit_dtype(ctx.text, out.dtype, ctx)
+    if ratio == 1:
+        if out.dtype is tensor.dtype:
+            packed = loaded
+        else:
+            packed = []
+            for i, src in enumerate(loaded):
+                bid = ctx.text.alloc_id(f"vec_bcast_{i}")
+                ctx.text.emit_function(
+                    f"{bid} = OpBitcast {out_elem_type} {src}"
+                )
+                packed.append(bid)
+    else:
+        # ratio > 1: combine ratio natural elements into one out-elem.
+        # Bitcast each natural-type scalar to a same-size int, then
+        # ``OpCompositeConstruct`` a vec(intR, ratio), then ``OpBitcast``
+        # to ``out_elem_type``. For the bf16 → b32 case, intR is u16
+        # — declared via ``DType.B16`` (gates the Int16 capability).
+        nat_int_dtype = _same_size_int_dtype(tensor.dtype)
+        nat_int_type = _emit_dtype(ctx.text, nat_int_dtype, ctx)
+        bcast_int: list[str] = []
+        for i, src in enumerate(loaded):
+            if nat_int_dtype is tensor.dtype:
+                bcast_int.append(src)
+            else:
+                bid = ctx.text.alloc_id(f"vec_natbcast_{i}")
+                ctx.text.emit_function(
+                    f"{bid} = OpBitcast {nat_int_type} {src}"
+                )
+                bcast_int.append(bid)
+        intR_vec_type = ctx.text.type_vec(nat_int_type, ratio)
+        packed = []
+        for j in range(width):
+            comps = bcast_int[j * ratio : (j + 1) * ratio]
+            cc_id = ctx.text.alloc_id(f"vec_pack_{j}")
+            ctx.text.emit_function(
+                f"{cc_id} = OpCompositeConstruct {intR_vec_type} {' '.join(comps)}"
+            )
+            out_id = ctx.text.alloc_id(f"vec_packbc_{j}")
+            ctx.text.emit_function(
+                f"{out_id} = OpBitcast {out_elem_type} {cc_id}"
+            )
+            packed.append(out_id)
+
     # Assemble the vector. The result's vec type needs declaring.
-    vec_type = ctx.text.type_vec(elem_type, width)
+    vec_type = ctx.text.type_vec(out_elem_type, width)
     res_id = ctx.text.alloc_id(f"vec_w{width}")
     ctx.val_to_id[out.id] = res_id
     ctx.text.emit_function(
-        f"{res_id} = OpCompositeConstruct {vec_type} {' '.join(loaded)}"
+        f"{res_id} = OpCompositeConstruct {vec_type} {' '.join(packed)}"
     )
 
 
@@ -1981,12 +2072,77 @@ def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
     vec_id = ctx.val_to_id[vec_v.id]
     u32 = ctx.text.type_int(32, signed=False)
 
-    for i in range(width):
-        # Extract element i from the vector.
-        elem_id = ctx.text.alloc_id(f"vec_elem_{i}")
-        ctx.text.emit_function(
-            f"{elem_id} = OpCompositeExtract {elem_type} {vec_id} {i}"
-        )
+    # Reinterpret-store: ``vec_v.dtype`` (the source) may differ
+    # from the tensor's natural element type. Mirror of the
+    # ``_visit_vec_load`` reinterpret path: each source element of
+    # ``vec.dtype`` covers ``ratio = vec_bytes / nat_bytes`` natural
+    # elements. We OpBitcast each source to a vec(intR, ratio),
+    # extract the natural-sized ints, OpBitcast each back to the
+    # natural type, and OpStore at base+nat_idx.
+    nat_bytes = tensor.dtype.bytes
+    src_bytes = vec_v.dtype.bytes
+    src_elem_type = _emit_dtype(ctx.text, vec_v.dtype, ctx)
+    if vec_v.dtype is tensor.dtype:
+        nat_count = width
+        ratio = 1
+    else:
+        if (width * src_bytes) % nat_bytes != 0:
+            raise NotImplementedError(
+                f"_visit_vec_store: width={width} {vec_v.dtype!r} not byte-"
+                f"divisible by natural {tensor.dtype!r}"
+            )
+        nat_count = (width * src_bytes) // nat_bytes
+        if nat_count % width != 0:
+            raise NotImplementedError(
+                f"_visit_vec_store: nat_count={nat_count} not divisible by width={width}"
+            )
+        ratio = nat_count // width
+
+    # Extract ``width`` source elements then unpack to ``nat_count``
+    # natural-typed scalars to store individually.
+    nat_scalars: list[str] = []
+    if ratio == 1:
+        for i in range(width):
+            elem_id = ctx.text.alloc_id(f"vec_elem_{i}")
+            ctx.text.emit_function(
+                f"{elem_id} = OpCompositeExtract {src_elem_type} {vec_id} {i}"
+            )
+            if vec_v.dtype is tensor.dtype:
+                nat_scalars.append(elem_id)
+            else:
+                bid = ctx.text.alloc_id(f"vec_bcast_{i}")
+                ctx.text.emit_function(
+                    f"{bid} = OpBitcast {elem_type} {elem_id}"
+                )
+                nat_scalars.append(bid)
+    else:
+        nat_int_dtype = _same_size_int_dtype(tensor.dtype)
+        nat_int_type = _emit_dtype(ctx.text, nat_int_dtype, ctx)
+        intR_vec_type = ctx.text.type_vec(nat_int_type, ratio)
+        for i in range(width):
+            elem_id = ctx.text.alloc_id(f"vec_elem_{i}")
+            ctx.text.emit_function(
+                f"{elem_id} = OpCompositeExtract {src_elem_type} {vec_id} {i}"
+            )
+            unpack_id = ctx.text.alloc_id(f"vec_unpack_{i}")
+            ctx.text.emit_function(
+                f"{unpack_id} = OpBitcast {intR_vec_type} {elem_id}"
+            )
+            for j in range(ratio):
+                int_part = ctx.text.alloc_id(f"vec_uintp_{i}_{j}")
+                ctx.text.emit_function(
+                    f"{int_part} = OpCompositeExtract {nat_int_type} {unpack_id} {j}"
+                )
+                if nat_int_dtype is tensor.dtype:
+                    nat_scalars.append(int_part)
+                else:
+                    nat_scalar = ctx.text.alloc_id(f"vec_natbc_{i}_{j}")
+                    ctx.text.emit_function(
+                        f"{nat_scalar} = OpBitcast {elem_type} {int_part}"
+                    )
+                    nat_scalars.append(nat_scalar)
+
+    for i, scalar_id in enumerate(nat_scalars):
         if i == 0:
             idx_id = base_id
         else:
@@ -1998,7 +2154,7 @@ def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
         ctx.text.emit_function(
             f"{chain_id} = OpAccessChain {elem_ptr} {chain_args} {idx_id}"
         )
-        ctx.text.emit_function(f"OpStore {chain_id} {elem_id}")
+        ctx.text.emit_function(f"OpStore {chain_id} {scalar_id}")
 
 
 def _visit_vec_build(op: VecBuildOp, ctx: _SpvCtx) -> None:
