@@ -1319,6 +1319,71 @@ def test_mma_kernel_lowers_on_spv_with_intel_shape(kernel_name):
     assert "OpCooperativeMatrixStoreKHR" in result.source
 
 
+def test_multi_warp_frag_visitors_partition_smem_per_warp():
+    """Multi-warp kernels (n_warps > 1) need per-warp partitioned smem
+    scratch in the FragForEach / FragApply / FragReduce / FragConvert
+    visitors. Without that, every warp's
+    ``OpCooperativeMatrixStoreKHR`` writes the SAME ``scratch[0..N]``
+    range and the per-lane reads after the subgroup-scope barrier pull
+    a mix of warps' data — silently corrupting any kernel that uses
+    the smem-roundtrip pattern (e.g. multi-warp GEMM's epilogue).
+
+    Lower a multi-warp GEMM and assert the partition is emitted:
+    SubgroupId BuiltIn declared, ``warp_base`` SSA ids in the function
+    body, and one OpIMul per Frag* op (``subgroup_id * n_per_warp``)."""
+    from quark.kernels.gemm.kernel import GemmKernel
+    from quark.kernels.gemm.config import GemmConfig
+    from quark.kernels.gemm.spec import GemmSpec
+    from quark.lower.legalize import legalize
+    from quark.ir.module import Module
+
+    caps = _intel_caps()
+    spec = GemmSpec(
+        M=128, N=128, K=128,
+        a_dtype=DType.BF16, b_dtype=DType.BF16,
+        acc_dtype=DType.F32, out_dtype=DType.BF16,
+        compute_dtype=DType.BF16,
+    )
+
+    # Single-warp baseline: no warp partition needed.
+    cfg1 = GemmConfig(
+        BM=32, BN=32, BK=16, n_warps=1, n_stages=1,
+        main_shape=_INTEL_SHAPE, impl="ws",
+    )
+    k1 = GemmKernel(spec, cfg1)
+    ir1 = k1.emit()
+    if isinstance(ir1, Module):
+        legalize(ir1, caps)
+    src1 = SpirVLowerer(local_size=k1.block()).lower_module(ir1).source
+    # Single-warp shouldn't emit any warp_base offset.
+    assert "warp_base" not in src1
+    assert "warp_off" not in src1
+
+    # Multi-warp (n_warps=4) should emit per-warp offsets in every
+    # FragForEach in the epilogue.
+    cfg4 = GemmConfig(
+        BM=64, BN=64, BK=16, n_warps=4, n_stages=1,
+        main_shape=_INTEL_SHAPE, impl="ws",
+    )
+    k4 = GemmKernel(spec, cfg4)
+    ir4 = k4.emit()
+    if isinstance(ir4, Module):
+        legalize(ir4, caps)
+    src4 = SpirVLowerer(local_size=k4.block()).lower_module(ir4).source
+    # Per-FragForEach: one ``warp_base`` (smem-base SSA) + one
+    # ``warp_off`` (the AccessChain offset for the OpCooperativeMatrix
+    # StoreKHR base). Each FragForEach call emits both, so the total
+    # count scales with the number of frag visitors.
+    assert "warp_base" in src4
+    assert "warp_off" in src4
+    # SubgroupId BuiltIn must be declared (used for warp partition).
+    assert "BuiltIn SubgroupId" in src4
+    # The address-compute layer must add the warp offset to lane_id.
+    # Each frag visitor emits ``smem_base = OpIAdd warp_base lane_id``
+    # once. Floor at 1 (any FragForEach in the lowered output).
+    assert src4.count("smem_base") >= 1
+
+
 def test_attn_lowers_on_spv_exercises_full_visitor_surface():
     """Attention is the headline coopmat kernel — it exercises every
     visitor on the SPV path: cooperative-matrix Load/Store/MulAdd,

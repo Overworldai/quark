@@ -2303,10 +2303,14 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
     n_slots_per_lane = n_elems // subgroup_width
 
     # 1. Allocate a unique scratch smem region for this FragForEach.
-    # We mimic the SmemAllocOp emit pattern but inline — no IR-level
-    # SmemAllocOp is created.
+    # Sized per-warp so multi-warp kernels don't race on the same
+    # smem range — see ``_frag_scratch_warp_partition``.
     elem_type = _emit_dtype(ctx.text, dtype, ctx)
-    n_const = ctx.text.const_uint(n_elems)
+    total_elems, smem_base_ssa, mat_base_ssa = _frag_scratch_warp_partition(
+        ctx, n_elems, name_hint="frag_each",
+    )
+    multi_warp = total_elems != n_elems
+    n_const = ctx.text.const_uint(total_elems)
     arr_id = ctx.text.alloc_id("frag_each_arr")
     ctx.text.add_type_line(f"{arr_id} = OpTypeArray {elem_type} {n_const}")
     ptr_arr = ctx.text.type_pointer("Workgroup", arr_id)
@@ -2316,14 +2320,28 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
     # Track the scratch in smem_allocs so the entry-point interface
     # walker picks it up. ``smem_allocs`` keys on a Value.id; use a
     # synthetic key (id() of this op) since there's no IR Value here.
-    ctx.smem_allocs[id(op)] = (var_id, elem_type, elem_ptr, n_elems)
+    ctx.smem_allocs[id(op)] = (var_id, elem_type, elem_ptr, total_elems)
 
-    # 2. Get a pointer to scratch[0] for the coop store.
+    # 2. Get a pointer to scratch[warp_offset] for the coop store
+    # (each subgroup writes its private slice).
     zero = ctx.text.const_uint(0)
-    base_ptr = ctx.text.alloc_id("frag_each_base")
-    ctx.text.emit_function(
-        f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {zero}"
-    )
+    if not multi_warp:
+        base_ptr = ctx.text.alloc_id("frag_each_base")
+        ctx.text.emit_function(
+            f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {zero}"
+        )
+    else:
+        u32_t = ctx.text.type_int(32, signed=False)
+        sgid = _ensure_subgroup_id_ssa(ctx)
+        n_per_warp = ctx.text.const_uint(n_elems)
+        warp_off = ctx.text.alloc_id("frag_each_warp_off")
+        ctx.text.emit_function(
+            f"{warp_off} = OpIMul {u32_t} {sgid} {n_per_warp}"
+        )
+        base_ptr = ctx.text.alloc_id("frag_each_base")
+        ctx.text.emit_function(
+            f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {warp_off}"
+        )
 
     # 3. Store the coopmat to scratch in row-major order.
     coop_id = ctx.val_to_id[op.in_frag.id]
@@ -2336,7 +2354,7 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
 
     # 4. Subgroup barrier so all lanes see the coopmat-store writes
     # before reading per-slot below. Subgroup scope is sufficient
-    # because the partition is per-subgroup; AcquireRelease |
+    # because each warp's smem slice is private; AcquireRelease |
     # WorkgroupMemory matches the smem semantics other barriers use.
     sg_scope = ctx.text.const_uint(3)  # Subgroup
     sg_sem = ctx.text.const_uint(0x8 | 0x100)
@@ -2344,40 +2362,38 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
         f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
     )
 
-    # 5. Get lane id (SubgroupLocalInvocationId) — already cached by
-    # ``_ensure_builtin_vec3_component`` etc.; use the lane_id helper.
+    # 5. Iterate slots Python-side. Each slot has two indices: smem
+    # index ``smem_base + s*32`` (= warp_base + lane_id + s*32, the
+    # actual smem slot to access) and matrix index ``lane_id + s*32``
+    # (used to compute the body's row/col bindings — those are
+    # matrix-relative, not warp-relative).
     u32 = ctx.text.type_int(32, signed=False)
-    lane_id_ssa = _ensure_lane_id(ctx)
-
-    # 6. Iterate slots Python-side. Each slot reads its element from
-    # scratch and binds the body inputs.
-    sgw_const = ctx.text.const_uint(subgroup_width)
     cols_const_div = ctx.text.const_uint(cols)
     for s in range(n_slots_per_lane):
-        # idx = lane_id + s * subgroup_width
-        if s == 0:
-            idx_id = lane_id_ssa
-        else:
-            offset = ctx.text.const_uint(s * subgroup_width)
-            idx_id = ctx.text.alloc_id(f"frag_each_idx_{s}")
-            ctx.text.emit_function(
-                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
-            )
+        smem_idx = _frag_scratch_slot_idx(
+            ctx, base_ssa=smem_base_ssa, s=s,
+            subgroup_width=subgroup_width, name_prefix="frag_each_smem",
+        )
+        mat_idx = _frag_scratch_slot_idx(
+            ctx, base_ssa=mat_base_ssa, s=s,
+            subgroup_width=subgroup_width, name_prefix="frag_each_mat",
+        ) if multi_warp else smem_idx
 
-        # row = idx / cols, col = idx % cols
+        # row = mat_idx / cols, col = mat_idx % cols (matrix-relative,
+        # warp-independent — every warp's coopmat has the same shape).
         row_id = ctx.text.alloc_id(f"frag_each_row_{s}")
         ctx.text.emit_function(
-            f"{row_id} = OpUDiv {u32} {idx_id} {cols_const_div}"
+            f"{row_id} = OpUDiv {u32} {mat_idx} {cols_const_div}"
         )
         col_id = ctx.text.alloc_id(f"frag_each_col_{s}")
         ctx.text.emit_function(
-            f"{col_id} = OpUMod {u32} {idx_id} {cols_const_div}"
+            f"{col_id} = OpUMod {u32} {mat_idx} {cols_const_div}"
         )
 
-        # Load element from scratch[idx].
+        # Load element from scratch[smem_idx] (warp-private slice).
         chain_id = ctx.text.alloc_id(f"frag_each_load_chain_{s}")
         ctx.text.emit_function(
-            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {smem_idx}"
         )
         elem_id = ctx.text.alloc_id(f"frag_each_elem_{s}")
         ctx.text.emit_function(
@@ -2426,6 +2442,82 @@ def _ensure_lane_id(ctx: _SpvCtx) -> str:
     ctx.text.emit_function(f"{loaded} = OpLoad {u32} {var_id}")
     ctx.lane_id_x_loaded = loaded
     return loaded
+
+
+def _ensure_subgroup_id_ssa(ctx: _SpvCtx) -> str:
+    """Return the SSA id for ``SubgroupId`` (the warp index inside the
+    workgroup, 0..n_warps-1). Used by frag visitors to partition
+    workgroup-scope scratch by warp so multiple subgroups don't race
+    on the same smem region."""
+    return _ensure_scalar_builtin(
+        ctx,
+        var_attr="subgroup_id_var",
+        cache_attr="subgroup_id_loaded",
+        builtin_name="SubgroupId",
+    )
+
+
+def _frag_scratch_warp_partition(
+    ctx: _SpvCtx, n_elems_per_warp: int, *, name_hint: str = "frag",
+) -> tuple[int, str, str]:
+    """Return ``(total_elems, smem_base_ssa, matrix_base_ssa)`` for a
+    Frag* visitor's smem scratch.
+
+    Each subgroup (warp) gets a private ``n_elems_per_warp`` slot in a
+    workgroup-scoped scratch sized ``n_warps * n_elems_per_warp``.
+
+    Two address spaces:
+    * ``smem_base_ssa = warp_base + lane_id`` — used as the smem slot
+      base for ``OpAccessChain``. Each warp's slice is disjoint so the
+      cross-subgroup race that bit the original FragForEach pattern
+      (every warp wrote ``scratch[0..127]``) is gone.
+    * ``matrix_base_ssa = lane_id`` — matrix-local, used to compute
+      the body's ``(row, col)`` bindings. Independent of warp; each
+      warp's coopmat has the same matrix shape.
+
+    Without this partition the FragForEach / FragApply / FragReduce /
+    FragConvert smem-roundtrip pattern corrupts any kernel with
+    ``n_warps > 1`` (e.g. multi-warp GEMM epilogue).
+
+    For ``n_warps == 1`` both bases are the cached lane id (no extra
+    OpIAdd, no SubgroupId capability).
+    """
+    n_warps = max(1, (
+        ctx.local_size[0] * ctx.local_size[1] * ctx.local_size[2]
+    ) // 32)
+    lane_id_ssa = _ensure_lane_id(ctx)
+    if n_warps == 1:
+        return n_elems_per_warp, lane_id_ssa, lane_id_ssa
+    total_elems = n_elems_per_warp * n_warps
+    u32 = ctx.text.type_int(32, signed=False)
+    sgid = _ensure_subgroup_id_ssa(ctx)
+    n_const = ctx.text.const_uint(n_elems_per_warp)
+    warp_base = ctx.text.alloc_id(f"{name_hint}_warp_base")
+    ctx.text.emit_function(f"{warp_base} = OpIMul {u32} {sgid} {n_const}")
+    smem_base = ctx.text.alloc_id(f"{name_hint}_smem_base")
+    ctx.text.emit_function(f"{smem_base} = OpIAdd {u32} {warp_base} {lane_id_ssa}")
+    return total_elems, smem_base, lane_id_ssa
+
+
+def _frag_scratch_slot_idx(
+    ctx: _SpvCtx,
+    *,
+    base_ssa: str,
+    s: int,
+    subgroup_width: int,
+    name_prefix: str,
+) -> str:
+    """Compute ``base + s * subgroup_width`` as an SSA id. Used to
+    derive both the smem-slot index (from ``smem_base``) and the
+    matrix-element index (from ``matrix_base``). ``s == 0``
+    short-circuits to ``base_ssa``."""
+    if s == 0:
+        return base_ssa
+    u32 = ctx.text.type_int(32, signed=False)
+    offset = ctx.text.const_uint(s * subgroup_width)
+    idx_id = ctx.text.alloc_id(f"{name_prefix}_idx_{s}")
+    ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_ssa} {offset}")
+    return idx_id
 
 
 _FRAG_REDUCE_TO_SUBGROUP_OP: dict[tuple[str, str], str] = {
@@ -2515,23 +2607,41 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
     if dtype is DType.BF16:
         ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
 
-    # Scratch smem for the input coopmat.
-    n_const = ctx.text.const_uint(n_elems)
+    # Scratch smem for the input coopmat. Per-warp partition so
+    # multi-warp kernels don't race on the same smem range.
+    total_elems, smem_base_ssa, _mat_base_ssa = _frag_scratch_warp_partition(
+        ctx, n_elems, name_hint="frag_red",
+    )
+    multi_warp = total_elems != n_elems
+    n_const = ctx.text.const_uint(total_elems)
     arr_id = ctx.text.alloc_id("frag_red_arr")
     ctx.text.add_type_line(f"{arr_id} = OpTypeArray {elem_type} {n_const}")
     ptr_arr = ctx.text.type_pointer("Workgroup", arr_id)
     var_id = ctx.text.alloc_id("frag_red_smem")
     ctx.text.add_type_line(f"{var_id} = OpVariable {ptr_arr} Workgroup")
     elem_ptr = ctx.text.type_pointer("Workgroup", elem_type)
-    ctx.smem_allocs[id(op)] = (var_id, elem_type, elem_ptr, n_elems)
+    ctx.smem_allocs[id(op)] = (var_id, elem_type, elem_ptr, total_elems)
 
     zero = ctx.text.const_uint(0)
-    base_ptr = ctx.text.alloc_id("frag_red_base")
-    ctx.text.emit_function(
-        f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {zero}"
-    )
+    if not multi_warp:
+        base_ptr = ctx.text.alloc_id("frag_red_base")
+        ctx.text.emit_function(
+            f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {zero}"
+        )
+    else:
+        u32_t = ctx.text.type_int(32, signed=False)
+        sgid = _ensure_subgroup_id_ssa(ctx)
+        n_per_warp = ctx.text.const_uint(n_elems)
+        warp_off = ctx.text.alloc_id("frag_red_warp_off")
+        ctx.text.emit_function(
+            f"{warp_off} = OpIMul {u32_t} {sgid} {n_per_warp}"
+        )
+        base_ptr = ctx.text.alloc_id("frag_red_base")
+        ctx.text.emit_function(
+            f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {warp_off}"
+        )
 
-    # Store input coopmat to scratch.
+    # Store input coopmat to scratch (warp's private slice).
     in_id = ctx.val_to_id[op.operands[0].id]
     cols_const = ctx.text.const_uint(cols)
     layout_id = ctx.text.const_uint(0)  # RowMajor
@@ -2547,19 +2657,14 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
     )
 
     u32 = ctx.text.type_int(32, signed=False)
-    lane_id_ssa = _ensure_lane_id(ctx)
 
-    # Per-lane partial reduction across its slots.
+    # Per-lane partial reduction across its slots (smem-relative).
     accum: str | None = None
     for s in range(n_slots_per_lane):
-        if s == 0:
-            idx_id = lane_id_ssa
-        else:
-            offset = ctx.text.const_uint(s * subgroup_width)
-            idx_id = ctx.text.alloc_id(f"frag_red_idx_{s}")
-            ctx.text.emit_function(
-                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
-            )
+        idx_id = _frag_scratch_slot_idx(
+            ctx, base_ssa=smem_base_ssa, s=s,
+            subgroup_width=subgroup_width, name_prefix="frag_red",
+        )
         chain = ctx.text.alloc_id(f"frag_red_chain_{s}")
         ctx.text.emit_function(
             f"{chain} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
@@ -2665,13 +2770,20 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
     if src_dtype is DType.BF16 or dst_dtype is DType.BF16:
         ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
 
-    # Scratch for sources (one per source frag) + dst.
+    # Scratch for sources (one per source frag) + dst, partitioned
+    # per-warp so multi-warp kernels don't race on the same range.
     src_n_elems = src_rows * src_cols
     dst_n_elems = dst_rows * dst_cols
     subgroup_width = 32
+    n_warps = max(1, (
+        ctx.local_size[0] * ctx.local_size[1] * ctx.local_size[2]
+    ) // 32)
+    src_total = src_n_elems * n_warps
+    dst_total = dst_n_elems * n_warps
+    multi_warp = n_warps > 1
 
-    src_n_const = ctx.text.const_uint(src_n_elems)
-    dst_n_const = ctx.text.const_uint(dst_n_elems)
+    src_n_const = ctx.text.const_uint(src_total)
+    dst_n_const = ctx.text.const_uint(dst_total)
 
     src_arr_id = ctx.text.alloc_id("frag_cvt_src_arr")
     ctx.text.add_type_line(
@@ -2693,12 +2805,12 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
         ctx.text.add_type_line(f"{v} = OpVariable {src_ptr_arr} Workgroup")
         src_vars.append(v)
         ctx.smem_allocs[(id(op), "src", i)] = (
-            v, src_elem, src_elem_ptr, src_n_elems,
+            v, src_elem, src_elem_ptr, src_total,
         )
     dst_var = ctx.text.alloc_id("frag_cvt_dst")
     ctx.text.add_type_line(f"{dst_var} = OpVariable {dst_ptr_arr} Workgroup")
     ctx.smem_allocs[(id(op), "dst")] = (
-        dst_var, dst_elem, dst_elem_ptr, dst_n_elems,
+        dst_var, dst_elem, dst_elem_ptr, dst_total,
     )
 
     zero = ctx.text.const_uint(0)
@@ -2706,12 +2818,32 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
     dst_cols_const = ctx.text.const_uint(dst_cols)
     layout_id = ctx.text.const_uint(0)  # RowMajor
 
-    # Store each source coopmat to its smem.
+    # Compute per-warp offsets for src and dst arrays.
+    u32 = ctx.text.type_int(32, signed=False)
+    lane_id_ssa = _ensure_lane_id(ctx)
+    if multi_warp:
+        sgid = _ensure_subgroup_id_ssa(ctx)
+        src_n_per_warp = ctx.text.const_uint(src_n_elems)
+        dst_n_per_warp = ctx.text.const_uint(dst_n_elems)
+        src_warp_off = ctx.text.alloc_id("frag_cvt_src_warp_off")
+        ctx.text.emit_function(
+            f"{src_warp_off} = OpIMul {u32} {sgid} {src_n_per_warp}"
+        )
+        dst_warp_off = ctx.text.alloc_id("frag_cvt_dst_warp_off")
+        ctx.text.emit_function(
+            f"{dst_warp_off} = OpIMul {u32} {sgid} {dst_n_per_warp}"
+        )
+    else:
+        src_warp_off = ""
+        dst_warp_off = ""
+
+    # Store each source coopmat to its smem at warp-private offset.
     for i in range(num_src):
         in_id = ctx.val_to_id[op.operands[i].id]
         base = ctx.text.alloc_id(f"frag_cvt_src{i}_base")
+        offset_id = src_warp_off if multi_warp else zero
         ctx.text.emit_function(
-            f"{base} = OpAccessChain {src_elem_ptr} {src_vars[i]} {zero}"
+            f"{base} = OpAccessChain {src_elem_ptr} {src_vars[i]} {offset_id}"
         )
         ctx.text.emit_function(
             f"OpCooperativeMatrixStoreKHR {base} {in_id} "
@@ -2724,37 +2856,46 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
         f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
     )
 
-    u32 = ctx.text.type_int(32, signed=False)
-    lane_id_ssa = _ensure_lane_id(ctx)
-
     # Per-lane: each slot owns one (row, k_col) position in the dst
     # M×K_dst tile. k_col = src_idx*src_cols + col_within_src.
     dst_n_slots_per_lane = dst_n_elems // subgroup_width
     src_n_slots_per_lane = src_n_elems // subgroup_width
 
     for s in range(dst_n_slots_per_lane):
+        # Matrix-relative dst index (lane_id + s*32) — used to derive
+        # row/col within the dst frag's logical M×K_dst tile.
         if s == 0:
-            idx_id = lane_id_ssa
+            mat_idx_id = lane_id_ssa
         else:
             offset = ctx.text.const_uint(s * subgroup_width)
-            idx_id = ctx.text.alloc_id(f"frag_cvt_idx_{s}")
+            mat_idx_id = ctx.text.alloc_id(f"frag_cvt_mat_idx_{s}")
             ctx.text.emit_function(
-                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
+                f"{mat_idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
             )
+        # Smem-relative dst index (warp_base + lane_id + s*32) — used
+        # for OpAccessChain into the warp's private dst slice.
+        if multi_warp:
+            idx_id = ctx.text.alloc_id(f"frag_cvt_smem_idx_{s}")
+            ctx.text.emit_function(
+                f"{idx_id} = OpIAdd {u32} {dst_warp_off} {mat_idx_id}"
+            )
+        else:
+            idx_id = mat_idx_id
         # Determine which source frag this slot pulls from.
         # idx in dst space: row = idx / dst_cols, col = idx % dst_cols.
         # src_idx = col / src_cols, col_within_src = col % src_cols.
-        # In smem: src_var[row * src_cols + col_within_src].
-        # Compute via integer div/mod.
+        # row/col within the dst frag — derived from the matrix-relative
+        # index, NOT the warp-offset smem index (different warps share
+        # the same matrix shape).
         dst_cols_div = ctx.text.const_uint(dst_cols)
         src_cols_div = ctx.text.const_uint(src_cols)
         row_id = ctx.text.alloc_id(f"frag_cvt_row_{s}")
         ctx.text.emit_function(
-            f"{row_id} = OpUDiv {u32} {idx_id} {dst_cols_div}"
+            f"{row_id} = OpUDiv {u32} {mat_idx_id} {dst_cols_div}"
         )
         col_id = ctx.text.alloc_id(f"frag_cvt_col_{s}")
         ctx.text.emit_function(
-            f"{col_id} = OpUMod {u32} {idx_id} {dst_cols_div}"
+            f"{col_id} = OpUMod {u32} {mat_idx_id} {dst_cols_div}"
         )
         src_idx_id = ctx.text.alloc_id(f"frag_cvt_srcidx_{s}")
         ctx.text.emit_function(
@@ -2764,15 +2905,23 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
         ctx.text.emit_function(
             f"{col_in_src_id} = OpUMod {u32} {col_id} {src_cols_div}"
         )
-        # src_addr = row * src_cols + col_in_src.
+        # src_addr = warp_off + row * src_cols + col_in_src (smem
+        # offset within src array; warp_off=0 in single-warp mode).
         row_mul = ctx.text.alloc_id(f"frag_cvt_rowmul_{s}")
         ctx.text.emit_function(
             f"{row_mul} = OpIMul {u32} {row_id} {src_cols_div}"
         )
-        src_addr = ctx.text.alloc_id(f"frag_cvt_srcaddr_{s}")
+        local_addr = ctx.text.alloc_id(f"frag_cvt_locaddr_{s}")
         ctx.text.emit_function(
-            f"{src_addr} = OpIAdd {u32} {row_mul} {col_in_src_id}"
+            f"{local_addr} = OpIAdd {u32} {row_mul} {col_in_src_id}"
         )
+        if multi_warp:
+            src_addr = ctx.text.alloc_id(f"frag_cvt_srcaddr_{s}")
+            ctx.text.emit_function(
+                f"{src_addr} = OpIAdd {u32} {src_warp_off} {local_addr}"
+            )
+        else:
+            src_addr = local_addr
 
         # The source array to read from depends on ``src_idx_id`` at
         # runtime. We unconditionally load from each source scratch
@@ -2923,10 +3072,13 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
         ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
 
     # Two scratch regions: one for the input fragment, one for the
-    # output. We could reuse one but pipelining iterations risks
-    # write-vs-read hazards across lanes; the two-region split is the
-    # simplest correct shape.
-    n_const = ctx.text.const_uint(n_elems)
+    # output. Each is partitioned per-warp so multi-warp kernels don't
+    # race on the same smem range — see ``_frag_scratch_warp_partition``.
+    total_elems, smem_base_ssa, _mat_base_ssa = _frag_scratch_warp_partition(
+        ctx, n_elems, name_hint="frag_apply",
+    )
+    multi_warp = total_elems != n_elems
+    n_const = ctx.text.const_uint(total_elems)
     in_arr_id = ctx.text.alloc_id("frag_apply_in_arr")
     ctx.text.add_type_line(f"{in_arr_id} = OpTypeArray {elem_type} {n_const}")
     out_arr_id = ctx.text.alloc_id("frag_apply_out_arr")
@@ -2938,18 +3090,35 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
     ctx.text.add_type_line(f"{in_var} = OpVariable {ptr_in_arr} Workgroup")
     ctx.text.add_type_line(f"{out_var} = OpVariable {ptr_out_arr} Workgroup")
     elem_ptr = ctx.text.type_pointer("Workgroup", elem_type)
-    ctx.smem_allocs[id(op)] = (in_var, elem_type, elem_ptr, n_elems)
-    ctx.smem_allocs[(id(op), "out")] = (out_var, elem_type, elem_ptr, n_elems)
+    ctx.smem_allocs[id(op)] = (in_var, elem_type, elem_ptr, total_elems)
+    ctx.smem_allocs[(id(op), "out")] = (out_var, elem_type, elem_ptr, total_elems)
 
     zero = ctx.text.const_uint(0)
-    base_ptr_in = ctx.text.alloc_id("frag_apply_base_in")
-    ctx.text.emit_function(
-        f"{base_ptr_in} = OpAccessChain {elem_ptr} {in_var} {zero}"
-    )
-    base_ptr_out = ctx.text.alloc_id("frag_apply_base_out")
-    ctx.text.emit_function(
-        f"{base_ptr_out} = OpAccessChain {elem_ptr} {out_var} {zero}"
-    )
+    if not multi_warp:
+        base_ptr_in = ctx.text.alloc_id("frag_apply_base_in")
+        ctx.text.emit_function(
+            f"{base_ptr_in} = OpAccessChain {elem_ptr} {in_var} {zero}"
+        )
+        base_ptr_out = ctx.text.alloc_id("frag_apply_base_out")
+        ctx.text.emit_function(
+            f"{base_ptr_out} = OpAccessChain {elem_ptr} {out_var} {zero}"
+        )
+    else:
+        u32_t = ctx.text.type_int(32, signed=False)
+        sgid = _ensure_subgroup_id_ssa(ctx)
+        n_per_warp = ctx.text.const_uint(n_elems)
+        warp_off = ctx.text.alloc_id("frag_apply_warp_off")
+        ctx.text.emit_function(
+            f"{warp_off} = OpIMul {u32_t} {sgid} {n_per_warp}"
+        )
+        base_ptr_in = ctx.text.alloc_id("frag_apply_base_in")
+        ctx.text.emit_function(
+            f"{base_ptr_in} = OpAccessChain {elem_ptr} {in_var} {warp_off}"
+        )
+        base_ptr_out = ctx.text.alloc_id("frag_apply_base_out")
+        ctx.text.emit_function(
+            f"{base_ptr_out} = OpAccessChain {elem_ptr} {out_var} {warp_off}"
+        )
 
     cols_const = ctx.text.const_uint(cols)
     layout_id = ctx.text.const_uint(0)
@@ -2968,17 +3137,12 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
     )
 
     u32 = ctx.text.type_int(32, signed=False)
-    lane_id_ssa = _ensure_lane_id(ctx)
 
     for s in range(n_slots_per_lane):
-        if s == 0:
-            idx_id = lane_id_ssa
-        else:
-            offset = ctx.text.const_uint(s * subgroup_width)
-            idx_id = ctx.text.alloc_id(f"frag_apply_idx_{s}")
-            ctx.text.emit_function(
-                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
-            )
+        idx_id = _frag_scratch_slot_idx(
+            ctx, base_ssa=smem_base_ssa, s=s,
+            subgroup_width=subgroup_width, name_prefix="frag_apply",
+        )
 
         chain_in = ctx.text.alloc_id(f"frag_apply_in_chain_{s}")
         ctx.text.emit_function(
