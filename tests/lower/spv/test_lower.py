@@ -1492,3 +1492,79 @@ def test_attn_lowers_on_spv_exercises_full_visitor_surface():
         "attn n_warps=2 must emit per-warp smem partition"
     )
     assert src.count("smem_base") >= 1
+
+
+def test_launcher_resolves_empty_main_shape_from_intel_caps():
+    """``Launcher._maybe_resolve_main_shape`` fills in
+    ``config.main_shape`` from ``device.caps.matmul_shapes`` when the
+    caller passes an explicit config but leaves the shape empty. Tests
+    GEMM with the Intel m8n16k16 bf16/f32 shape — same set of
+    candidates that ``tune_space_resolved`` walks during autotune, so
+    non-autotuned compiles get the same device-aware default
+    treatment.
+
+    Synthesises a Launcher-like object (we can't instantiate the real
+    Launcher on Mac because ``_driver_for(INTEL_GPU)`` needs Vulkan)
+    that carries the same ``device.caps`` field the resolver reads.
+    Verifies the resolver chooses an Intel shape from the caps' allow
+    list, leaves already-set shapes alone, and falls through when no
+    compatible shape is available."""
+    from quark.kernels.gemm.kernel import GemmKernel
+    from quark.kernels.gemm.config import GemmConfig
+    from quark.kernels.gemm.spec import GemmSpec
+    from quark.launcher.launcher import Launcher
+
+    caps = _intel_caps()
+    spec = GemmSpec(
+        M=128, N=128, K=128,
+        a_dtype=DType.BF16, b_dtype=DType.BF16,
+        acc_dtype=DType.F32, out_dtype=DType.BF16,
+        compute_dtype=DType.BF16,
+    )
+
+    # Build a synthetic launcher object — bypass __init__ so we don't
+    # trigger ``_driver_for(INTEL_GPU)`` on Mac.
+    launcher = Launcher.__new__(Launcher)
+    from types import SimpleNamespace
+    launcher.device = SimpleNamespace(caps=caps)
+
+    # Empty main_shape → resolved to one of the Intel shapes.
+    cfg_empty = GemmConfig(
+        BM=32, BN=32, BK=16, n_warps=1, n_stages=1,
+        main_shape="", impl="ws",
+    )
+    resolved = launcher._maybe_resolve_main_shape(
+        GemmKernel, spec, cfg_empty,
+    )
+    assert resolved.main_shape in caps.matmul_shapes
+    assert resolved.main_shape.startswith("m8n16k16_intel_")
+
+    # Already-set main_shape → unchanged.
+    cfg_set = GemmConfig(
+        BM=32, BN=32, BK=16, n_warps=1, n_stages=1,
+        main_shape="m8n16k16_intel_bf16_f32", impl="ws",
+    )
+    assert (
+        launcher._maybe_resolve_main_shape(GemmKernel, spec, cfg_set).main_shape
+        == "m8n16k16_intel_bf16_f32"
+    )
+
+    # No compatible shape → original config returned (will fail
+    # ``is_valid_for`` below the resolver with a useful error message).
+    from quark.device import DeviceCaps, DeviceFamily
+
+    empty_caps = DeviceCaps(
+        family=DeviceFamily.INTEL_GPU, name="empty",
+        compute_unit_count=20, subgroup_width=32,
+        max_threads_per_block=1024, max_smem_per_block=64 * 1024,
+        max_regs_per_thread=0, max_regs_per_block=0,
+        arch_tag="xe2", compute_capability=None,
+        supports_async_copy=False, supports_graph_capture=False,
+        supports_fp8_e4m3=False, supports_bf16_mma=False,
+        matmul_shapes=frozenset(),
+    )
+    launcher.device = SimpleNamespace(caps=empty_caps)
+    assert (
+        launcher._maybe_resolve_main_shape(GemmKernel, spec, cfg_empty).main_shape
+        == ""
+    )
