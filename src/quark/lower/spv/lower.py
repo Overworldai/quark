@@ -2626,27 +2626,24 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
     reduction, then ``OpGroupNonUniform<kind>`` broadcasts the
     cross-lane reduction so every result lane sees the full scalar.
 
-    Known limitation (per-row reduce on Intel coopmat):
+    Multi-class path (Intel coopmat, ``n_classes_override`` set):
 
       Intel ``cd_offsets`` is ``((0,0),) * c_regs`` because the
       lane↔(row,col) mapping inside an Intel cooperative matrix is
       implementation-private (Vulkan KHR coopmat does not expose it).
-      With those placeholders, ``len({dr})`` is 1, so the IR-level
-      contract collapses to a single class — i.e. one full-tile
-      reduction. The lowerer below honours that contract (single
-      cross-lane reduce, broadcast result).
+      With those placeholders, ``len({dr})`` is 1, so the cd_offsets-
+      derived contract collapses to a single class.
 
-      For online softmax, the *correct* reduction is per-row across
-      the full tile (e.g. 8 maxes for an 8×16 fragment). Achieving
-      that on KHR-only coopmat requires either (a) a vendor extension
-      like ``SPV_NV_cooperative_matrix2``'s ``OpCooperativeMatrix
-      ReduceNV`` (Mesa/anv does not expose this on Battlemage as of
-      mid-2026), or (b) breaking the cd_offsets-↔-c_regs coupling
-      (multiple results per FragReduce on Intel) which spans the IR
-      contract, kernel-side derivation, and lowerer. Without that
-      change attention output drifts ~1.6e-1 from the numpy reference
-      (single-class softmax normalisation). GEMM and other coopmat
-      kernels that don't depend on per-row reduce remain correct.
+      ``n_classes_override`` (set by the kernel via the SPV-aware
+      ``frag_reduce(..., n_classes_override=shape.m)`` path) bypasses
+      that derivation and produces ``rows`` results via
+      ``ClusteredReduce(cluster_size=cols)`` + ``OpGroupNonUniform
+      Broadcast`` from each row's leader lane. Single source of truth
+      for the result count is the override attr.
+
+      Single-class fallback below (``n_results == 1``) keeps the
+      simple cross-lane reduce + broadcast for PTX/Apple paths whose
+      cd_offsets actually produces useful row-class info.
     """
     from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
 
