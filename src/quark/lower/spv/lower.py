@@ -55,8 +55,10 @@ from quark.ir.op import (
     LaneIdOp,
     LoadOp,
     MathOp,
+    MergeB32Op,
     SelectOp,
     SmemAllocOp,
+    SplitB32Op,
     StoreOp,
     SubgroupIdOp,
     SubgroupReduceOp,
@@ -140,6 +142,7 @@ class _SpvCtx:
     # to avoid re-emitting the capability line.
     has_f16_cap: bool = False
     has_bf16_cap: bool = False
+    has_int16_cap: bool = False
     # Smem allocations: SmemAllocOp result Value.id → (var_id,
     # element_type_id, elem_pointer_id, total_elements). Visitors
     # that load/store on a SharedRegion look up by the
@@ -203,6 +206,24 @@ def _emit_dtype(text: SpvText, dt: DType, ctx: "_SpvCtx | None" = None) -> str:
         # buffer would need an explicit u8/u32 storage encoding at
         # the kernel boundary.
         return text.type_bool()
+    if dt is DType.B32:
+        # ``B32`` is a raw 32-bit bit pattern — used by the
+        # ``fma_bf16x2`` legalization to carry a packed bf16×2 pair.
+        # SPIR-V has no distinct "bits" type at width 32; OpTypeInt 32
+        # is the canonical reinterpretation target (every bitcast
+        # site goes through OpBitcast which doesn't care about
+        # signedness).
+        return text.type_int(32, signed=False)
+    if dt is DType.B16:
+        # ``B16`` is a raw 16-bit bit pattern — used by the
+        # ``fma_bf16x2`` expansion's split/merge step. Needs the
+        # ``Int16`` capability to land an ``OpTypeInt 16``; the
+        # capability is gated on the device exposing it
+        # (Battlemage does, behind ``shaderInt16``).
+        if ctx is not None and not getattr(ctx, "has_int16_cap", False):
+            text.add_capability("Int16")
+            ctx.has_int16_cap = True  # type: ignore[attr-defined]
+        return text.type_int(16, signed=False)
     raise NotImplementedError(
         f"SpirVLowerer: dtype {dt!r} not yet supported. See "
         "PORTABILITY_PLAN §3.2 — extend the visitor table to "
@@ -1248,6 +1269,81 @@ def _visit_convert(op: ConvertOp, ctx: _SpvCtx) -> None:
     ctx.text.emit_function(f"{res_id} = {spv_op} {dst_t} {src_id}")
 
 
+def _visit_split_b32(op: SplitB32Op, ctx: _SpvCtx) -> None:
+    """``SplitB32Op``: B32 → (B16 lo, B16 hi).
+
+    SPIR-V doesn't have a "split into halves" opcode, so we emit:
+        b32_u32 = OpBitcast u32 b32_in    ; raw bits as u32
+        lo_u32  = OpBitwiseAnd u32 b32_u32 0xFFFF
+        hi_u32  = OpShiftRightLogical u32 b32_u32 16
+        lo_b16  = OpUConvert u16 lo_u32
+        hi_b16  = OpUConvert u16 hi_u32
+
+    The ``OpUConvert`` is the right narrowing op when both src and
+    dst are unsigned ints (the IR carries B16 / B32 as raw bits;
+    we model them as unsigned). Used by the ``fma_bf16x2``
+    legalization expansion to peel a packed bf16×2 register.
+    """
+    lo, hi = op.results
+    src_id = ctx.val_to_id[op.operands[0].id]
+    u32 = ctx.text.type_int(32, signed=False)
+    u16 = _emit_dtype(ctx.text, DType.B16, ctx)
+    mask = ctx.text.const_uint(0xFFFF)
+    sixteen = ctx.text.const_uint(16)
+
+    # As-uint32 reinterpretation. B32 lowers to OpTypeInt 32 already,
+    # so OpBitcast is a no-op (same type) — but we emit it to keep
+    # the chain explicit and let spirv-as fold the redundancy.
+    asu32 = ctx.text.alloc_id("b32_as_u32")
+    ctx.text.emit_function(f"{asu32} = OpBitcast {u32} {src_id}")
+
+    lo_u32 = ctx.text.alloc_id("split_lo_u32")
+    ctx.text.emit_function(
+        f"{lo_u32} = OpBitwiseAnd {u32} {asu32} {mask}"
+    )
+    hi_u32 = ctx.text.alloc_id("split_hi_u32")
+    ctx.text.emit_function(
+        f"{hi_u32} = OpShiftRightLogical {u32} {asu32} {sixteen}"
+    )
+
+    lo_id = ctx.text.alloc_id("split_lo")
+    hi_id = ctx.text.alloc_id("split_hi")
+    ctx.val_to_id[lo.id] = lo_id
+    ctx.val_to_id[hi.id] = hi_id
+    ctx.text.emit_function(f"{lo_id} = OpUConvert {u16} {lo_u32}")
+    ctx.text.emit_function(f"{hi_id} = OpUConvert {u16} {hi_u32}")
+
+
+def _visit_merge_b32(op: MergeB32Op, ctx: _SpvCtx) -> None:
+    """``MergeB32Op``: (B16 lo, B16 hi) → B32.
+
+    Inverse of ``SplitB32Op``. Widen each B16 to u32 first (so the
+    shift on ``hi`` doesn't lose bits), or-merge, bitcast to B32.
+    """
+    (out,) = op.results
+    lo_id = ctx.val_to_id[op.operands[0].id]
+    hi_id = ctx.val_to_id[op.operands[1].id]
+    u32 = ctx.text.type_int(32, signed=False)
+    sixteen = ctx.text.const_uint(16)
+
+    lo_u32 = ctx.text.alloc_id("merge_lo_u32")
+    hi_u32 = ctx.text.alloc_id("merge_hi_u32")
+    ctx.text.emit_function(f"{lo_u32} = OpUConvert {u32} {lo_id}")
+    ctx.text.emit_function(f"{hi_u32} = OpUConvert {u32} {hi_id}")
+    hi_shifted = ctx.text.alloc_id("merge_hi_shl")
+    ctx.text.emit_function(
+        f"{hi_shifted} = OpShiftLeftLogical {u32} {hi_u32} {sixteen}"
+    )
+    merged = ctx.text.alloc_id("merge_or")
+    ctx.text.emit_function(
+        f"{merged} = OpBitwiseOr {u32} {lo_u32} {hi_shifted}"
+    )
+    res_dt = _emit_dtype(ctx.text, out.dtype, ctx)
+    res_id = ctx.text.alloc_id("merge_b32")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(f"{res_id} = OpBitcast {res_dt} {merged}")
+
+
 def _visit_bitcast(op: BitcastOp, ctx: _SpvCtx) -> None:
     """Reinterpret-cast: ``OpBitcast`` to the destination type. SPIR-V
     requires src and dst to have the same total bit width; the IR's
@@ -1703,6 +1799,8 @@ _DISPATCH: dict[type, Any] = {
     CmpOp: _visit_cmp,
     ConvertOp: _visit_convert,
     BitcastOp: _visit_bitcast,
+    SplitB32Op: _visit_split_b32,
+    MergeB32Op: _visit_merge_b32,
     MathOp: _visit_math,
     SelectOp: _visit_select,
     ThreadIdxOp: _visit_thread_idx,
