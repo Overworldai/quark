@@ -1069,7 +1069,12 @@ def _ensure_buffer_var(tensor: GlobalTensor, binding_index: int,
     ``binding_index`` if not already present. Returns
     ``(buffer_var_id, elem_pointer_type_id)`` for the load/store
     visitors to use."""
-    tid = id(tensor)
+    # Key the per-buffer caches on the param's id, not the tensor
+    # instance — every ``GlobalTensor.view()`` returns a fresh
+    # tensor object that shares the parent's ``param``. Without this,
+    # any tile-load through a sub-tensor falls off the cache and
+    # blows up at the ``tensor_to_binding`` lookup.
+    tid = id(tensor.param)
     if tid in ctx.tensor_to_var:
         return ctx.tensor_to_var[tid], ctx.tensor_to_elem_ptr[tid]
 
@@ -1228,9 +1233,9 @@ def _visit_load(op: LoadOp, ctx: _SpvCtx) -> None:
     (out,) = op.results
     tensor = op.attrs["tensor"]
     if isinstance(tensor, GlobalTensor):
-        binding = ctx.tensor_to_binding[id(tensor)]
+        binding = ctx.tensor_to_binding[id(tensor.param)]
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
-        elem_type = ctx.tensor_to_elem_type[id(tensor)]
+        elem_type = ctx.tensor_to_elem_type[id(tensor.param)]
         zero = ctx.text.const_uint(0)
         idx_id = _flatten_global_index(tuple(op.operands), tensor, ctx)
         chain_id = ctx.text.alloc_id("chain")
@@ -1272,7 +1277,7 @@ def _visit_load(op: LoadOp, ctx: _SpvCtx) -> None:
 def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
     tensor = op.attrs["tensor"]
     if isinstance(tensor, GlobalTensor):
-        binding = ctx.tensor_to_binding[id(tensor)]
+        binding = ctx.tensor_to_binding[id(tensor.param)]
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
         value_id = ctx.val_to_id[op.operands[0].id]
         zero = ctx.text.const_uint(0)
@@ -1343,7 +1348,7 @@ def _visit_atomic_rmw(op: AtomicRmwOp, ctx: _SpvCtx) -> None:
             f"{type(tensor).__name__} not wired (only GlobalTensor today)"
         )
 
-    binding = ctx.tensor_to_binding[id(tensor)]
+    binding = ctx.tensor_to_binding[id(tensor.param)]
     var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
 
     value_id = ctx.val_to_id[op.operands[0].id]
@@ -1835,9 +1840,9 @@ def _visit_vec_load(op: VecLoadOp, ctx: _SpvCtx) -> None:
         indices = indices[:-1]
 
     if isinstance(tensor, GlobalTensor):
-        binding = ctx.tensor_to_binding[id(tensor)]
+        binding = ctx.tensor_to_binding[id(tensor.param)]
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
-        elem_type = ctx.tensor_to_elem_type[id(tensor)]
+        elem_type = ctx.tensor_to_elem_type[id(tensor.param)]
         zero = ctx.text.const_uint(0)
         chain_prefix = (var_id, zero)
     elif isinstance(tensor, SharedRegion):
@@ -1903,9 +1908,9 @@ def _visit_vec_store(op: VecStoreOp, ctx: _SpvCtx) -> None:
         indices = indices[:-1]
 
     if isinstance(tensor, GlobalTensor):
-        binding = ctx.tensor_to_binding[id(tensor)]
+        binding = ctx.tensor_to_binding[id(tensor.param)]
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
-        elem_type = ctx.tensor_to_elem_type[id(tensor)]
+        elem_type = ctx.tensor_to_elem_type[id(tensor.param)]
         zero = ctx.text.const_uint(0)
         chain_prefix = (var_id, zero)
     elif isinstance(tensor, SharedRegion):
@@ -2153,7 +2158,7 @@ def _emit_matrix_pointer(
     ctx.text.emit_function(f"{flat} = OpIAdd {u32} {row_mul} {col_id}")
 
     if isinstance(tensor, GlobalTensor):
-        binding = ctx.tensor_to_binding[id(tensor)]
+        binding = ctx.tensor_to_binding[id(tensor.param)]
         var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
         zero = ctx.text.const_uint(0)
         chain_id = ctx.text.alloc_id("coop_chain")
@@ -2528,7 +2533,7 @@ class SpirVLowerer:
         ctx.tensor_to_binding = {}  # type: ignore[attr-defined]
         global_tensors = self._collect_global_tensors(fn, ctx)
         for binding_index, t in enumerate(global_tensors):
-            ctx.tensor_to_binding[id(t)] = binding_index
+            ctx.tensor_to_binding[id(t.param)] = binding_index
 
         text = ctx.text
         # ── Boilerplate sections ─────────────────────────────────
@@ -2588,7 +2593,7 @@ class SpirVLowerer:
         # Storage buffers in declaration order — matches binding
         # index, makes the disassembly readable.
         for t in global_tensors:
-            var_id = ctx.tensor_to_var.get(id(t))
+            var_id = ctx.tensor_to_var.get(id(t.param))
             if var_id is not None:
                 interface.append(var_id)
         # Workgroup-class smem variables. Vulkan 1.4 SPIR-V requires
@@ -2700,8 +2705,8 @@ class SpirVLowerer:
         so we proactively call ``_ensure_buffer_var`` here for every
         tensor that hasn't been emitted yet."""
         for t in global_tensors:
-            if id(t) not in ctx.tensor_to_var:
-                binding = ctx.tensor_to_binding[id(t)]
+            if id(t.param) not in ctx.tensor_to_var:
+                binding = ctx.tensor_to_binding[id(t.param)]
                 _ensure_buffer_var(t, binding, ctx)
 
     def _resolve_local_size(self, fn: Function) -> tuple[int, int, int]:
