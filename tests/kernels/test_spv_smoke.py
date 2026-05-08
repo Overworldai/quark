@@ -120,47 +120,24 @@ def _problem_dtypes(problem_params: dict) -> set:
 
 
 # Kernels with documented numerical-correctness limitations on the SPV
-# backend that should xfail rather than hard-fail in smoke. Today the
-# only entry is ``attn``.
-#
-# Bisect findings (1b73261, 8e870a0, 964905a):
-# * Multi-class FragReduce/FragApply path (3433693) fixes per-row
-#   softmax normalisation — verified.
-# * A separate pre-existing addressing bug zeroes ~50 % of every
-#   output row. With uniform Q/K/V=0.1 the surviving non-zero cols
-#   are exactly ``[0..3, 8..11, 16..19, 24..27, 32..35, 40..43,
-#   48..51, 56..59]`` — i.e. lanes where ``lane_id & 4 == 0``
-#   (PTX-style ``group_id`` even). Lanes with ``group_id`` odd
-#   (4-7, 12-15, 20-23, …) write zero. Pattern independent of row,
-#   n_warps, MTiles, KvTile, KvPad — every config tested showed it.
-# * Direct on-hardware probes showed every visitor works in
-#   isolation:
-#     - MMA + FragForEach: all 128 elements correct.
-#     - MMA + FragApply (no selectors) + FragForEach: correct.
-#     - MMA + FragApply (8 selectors, dynamic-row-dispatch) +
-#       FragForEach: correct, all rows scaled by row index.
-#     - MMA + FragReduce (8 row-classes via n_classes_override):
-#       all 8 row sums match.
-#     - MMA → FragConvert → MMA → FragForEach: all 128 correct.
-#   So the bug is NOT in any single op — it manifests only in the
-#   composed attn flow (K-loop carry + multi-class FragApply chain
-#   + multiple iterations). Likely candidates left:
-#     - For-loop carry typing under multi-class (the OpPhi for
-#       m_vals/l_vals at width n_rc=8 may be wrong)
-#     - Cross-iteration smem region aliasing (multiple FragApply
-#       ops sharing alloc IDs unexpectedly)
-#     - GEMM2's A-frag (FragConvert output) lane layout mismatch
-#       when it feeds a subsequent MMA whose B has a specific
-#       internal layout
-# * Two speculative fixes tried and reverted (4859121, f5e126a):
-#   coopmat stride from tensor.stride[0] vs shape[-1] (broke gemm),
-#   and warp_dyn_offset preference in _add_dyn_offset (broke gemm
-#   /patchify/unpatchify). Both reverted in 964905a.
-#
-# Tracked for the next pass; the per-row reduce work stays in
-# even though smoke can't prove it because the addressing bug
-# masks output values.
-_SPV_KNOWN_NUMERICAL_LIMITS = frozenset({"attn"})
+# backend that should xfail rather than hard-fail in smoke. Empty
+# today — the prior ``attn`` cols-zero bug was tracked back to two
+# orthogonal causes both fixed in this branch:
+#   * No SubgroupSize-32 pin (PORTABILITY_PLAN §3.5) — Mesa Battlemage
+#     defaulted to SIMD16 for kernels using ``OpCooperativeMatrixMul
+#     AddKHR``, so the lowerer's hardcoded ``subgroup_width = 32`` slot
+#     partition wrote half the elements through every smem-roundtrip
+#     frag visitor. Wired the pin via ``VkPipelineShaderStage
+#     RequiredSubgroupSizeCreateInfo`` in ``_spv_dispatch.cpp``.
+#   * ``vec_load`` / ``vec_store`` ignored the op's ``out.dtype`` —
+#     reading ``width`` natural-type elements instead of
+#     ``width × out.bytes / nat.bytes``. The attn epilogue staged
+#     bf16 results to smem then issued ``v4.b32`` reads; under-read
+#     by 2× left half the output columns un-written, surfacing as
+#     the alternating-quartet ``cols 4..7, 12..15, …, 60..63`` zero
+#     pattern. Fixed by emitting the proper number of natural loads
+#     and OpBitcast-packing pairs into the requested out.dtype.
+_SPV_KNOWN_NUMERICAL_LIMITS = frozenset()
 
 
 @pytestmark_e2e
@@ -194,6 +171,7 @@ def test_spv_kernel_smoke(kernel_cls):
     _DTYPE_KEYS = (
         "dtype", "in_dtype", "kv_dtype", "compute_dtype",
         "src_dtype", "out_dtype", "partials_dtype",
+        "a_dtype", "b_dtype",
     )
 
     def _params_with_dtypes(p_params, target_dt):
