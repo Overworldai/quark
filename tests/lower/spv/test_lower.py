@@ -1088,3 +1088,107 @@ def test_for_loop_window_sum_end_to_end(driver):
     got = np.empty(n, dtype=np.float32)
     ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tier 1 — registry-survey (lower-only, no driver / no spirv-as).
+# ─────────────────────────────────────────────────────────────────
+
+
+def _intel_caps():
+    """Synthetic Battlemage-like ``DeviceCaps`` for lower-only tests.
+
+    Pinned to ``INTEL_GPU`` family with Xe2 chip generation so MMA
+    shapes filter to the ``m8n16k16_intel_*`` cohort. Smem cap mirrors
+    Battlemage's 64 KB; full byte-accurate caps don't matter here
+    because the lowerer doesn't consume them — it's the kernel's
+    ``is_valid_for`` that uses them, and we want the kernels to *pass*
+    that check on this fake caps object."""
+    from quark.device import DeviceCaps, DeviceFamily
+
+    return DeviceCaps(
+        family=DeviceFamily.INTEL_GPU,
+        name="battlemage_synth",
+        compute_unit_count=20,
+        subgroup_width=32,
+        max_threads_per_block=1024,
+        max_smem_per_block=64 * 1024,
+        max_regs_per_thread=0,
+        max_regs_per_block=0,
+        arch_tag="xe2",
+        compute_capability=None,
+        supports_async_copy=False,
+        supports_graph_capture=False,
+        supports_fp8_e4m3=False,
+        supports_bf16_mma=True,
+        matmul_shapes=frozenset(["m8n16k16_intel_bf16_f32",
+                                 "m8n16k16_intel_f16_f32"]),
+    )
+
+
+# Kernels known to lower cleanly through the SPV backend on Battlemage-
+# like caps using their FIRST registered problem + default config.
+# This is a lock-in list — if a kernel here starts failing to lower on
+# the SPV path, the test below catches the regression. Kernels NOT on
+# this list either lack default-config compatibility with the Intel MMA
+# shapes (need an explicit ``main_shape="m8n16k16_intel_*"``) or use
+# dtypes / ops the SPV lowerer doesn't yet support; tracking them here
+# would be churn.
+_KNOWN_LOWERS_ON_SPV = (
+    "ada_gate_residual",
+    "ada_rmsnorm",
+    "elementwise",
+    "head_rmsnorm",
+    "kv_cache_update",
+    "moe_reduce",
+    "moe_router",
+    "moe_router_correct",
+    "moe_router_shared",
+    "rmsnorm",
+    "silu",
+    "value_residual",
+    "value_residual_packed",
+)
+
+
+@pytest.mark.parametrize("kernel_name", _KNOWN_LOWERS_ON_SPV)
+def test_known_kernel_lowers_on_spv(kernel_name):
+    """Tier-1 regression net: each kernel in ``_KNOWN_LOWERS_ON_SPV``
+    produces parseable SPIR-V text from its first ``problems()`` entry
+    + default config. No driver, no ``spirv-as`` — pure IR-build →
+    ``SpirVLowerer.lower_module`` round-trip on synthetic
+    Battlemage-like caps. Locks in the platform-agnostic claim that
+    the framework's ``Kernel.emit() → IR Module → SpirVLowerer`` chain
+    works on these kernels with zero kernel-side edits."""
+    from quark.kernels import all_kernels
+    from quark.lower.legalize import legalize
+    from quark.ir.module import Module
+
+    kc = next((k for k in all_kernels()
+               if getattr(k, "NAME", k.__name__) == kernel_name), None)
+    if kc is None:
+        pytest.skip(f"{kernel_name}: not in registry")
+
+    problems = kc.problems()
+    if not problems:
+        pytest.skip(f"{kernel_name}: empty problems")
+    p = problems[0]
+
+    caps = _intel_caps()
+    k = kc.from_problem(p.params)
+    assert k.is_valid_for(caps), (
+        f"{kernel_name}: first problem {p.name} no longer valid on Intel "
+        f"caps — config-selection drift?"
+    )
+    ir = k.emit()
+    if isinstance(ir, Module):
+        legalize(ir, caps)
+    lowerer = SpirVLowerer(local_size=k.block())
+    result = lowerer.lower_module(ir)
+    # Sanity checks on the lowered output. ``n_buffers > 0`` covers the
+    # entry-point interface; the source must mention ``OpEntryPoint``
+    # (every kernel emits one); ``LocalSize`` baked from ``k.block()``
+    # so the kernel runs at the geometry it was authored against.
+    assert result.n_buffers > 0
+    assert "OpEntryPoint" in result.source
+    assert "LocalSize" in result.source
