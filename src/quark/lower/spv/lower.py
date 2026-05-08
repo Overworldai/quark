@@ -1622,10 +1622,14 @@ class SpirVLowerer:
         # Walk the IR via the recursive ``_walk_op`` helper so the
         # if/while-region visitors can recurse into body ops without
         # duplicating the dispatch table. ``_ensure_buffer_var``
-        # fires lazily off load/store so an unused param doesn't
-        # produce a SPIR-V validation error.
+        # fires lazily off load/store; after the body walk, we
+        # explicitly declare bindings for any unused params so the
+        # final ``n_buffers`` matches the launcher's ``ParamSpec``
+        # exactly (phantom storage buffers without OpAccessChain
+        # references are valid Vulkan).
         for op in fn.body.ops:
             _walk_op(op, ctx)
+        self._ensure_unused_bindings_declared(global_tensors, ctx)
 
         text.emit_function("OpReturn")
         text.emit_function("OpFunctionEnd")
@@ -1695,12 +1699,19 @@ class SpirVLowerer:
         produced shader bindings out of phase with the framework's
         per-buffer launch list — kernel reads the wrong buffer.
 
-        Walks IR ops to discover *which* params are actually used,
-        then orders by ``fn.params`` index. Unused params don't get
-        a binding (Vulkan rejects unreferenced descriptor-set
-        bindings on some configurations); they take a slot in the
-        launcher's buffer list anyway, but the lowerer skips them.
+        For every param the function declares, this returns a
+        ``GlobalTensor`` (synthesising a phantom one for params the
+        body never loads/stores from — e.g. ``ElementwiseKernel``'s
+        ``Y`` slot for unary ops). The phantom binding is declared
+        but never has an OpAccessChain referencing it, which Vulkan
+        accepts as long as the descriptor-set binding is present in
+        the pipeline layout. Phantom bindings keep the lowered
+        ``n_buffers`` aligned with the launcher's ``ParamSpec`` so
+        ``CompiledKernel.launch`` doesn't trip its buffer-count
+        check on kernels with declared-but-unused params.
         """
+        from quark.ir.types import BufferType
+
         used_param_ids: set[int] = set()
         param_to_tensor: dict[int, GlobalTensor] = {}
 
@@ -1719,13 +1730,41 @@ class SpirVLowerer:
 
         walk(fn.body.ops)
 
-        # Order by the param's index in ``fn.params``, so bindings 0
-        # ..n-1 line up with the launcher's per-buffer launch list.
+        # Order by the param's index in ``fn.params``. For params
+        # without a load/store-discovered GlobalTensor, synthesise a
+        # phantom shape=(1,) tensor so the binding gets declared and
+        # the launcher's per-buffer dispatch lines up.
         ordered: list[GlobalTensor] = []
         for p in fn.params:
-            if id(p) in used_param_ids and id(p) in param_to_tensor:
+            if id(p) in param_to_tensor:
                 ordered.append(param_to_tensor[id(p)])
+                continue
+            if isinstance(p.type, BufferType):
+                phantom = GlobalTensor(
+                    dtype=p.type.dtype,
+                    shape=(1,),
+                    stride=(1,),
+                    name=f"{p.name}_unused",
+                    param=p,
+                )
+                ordered.append(phantom)
         return ordered
+
+    def _ensure_unused_bindings_declared(
+        self, global_tensors: list[GlobalTensor], ctx: _SpvCtx,
+    ) -> None:
+        """Pre-declare a ``StorageBuffer`` ``OpVariable`` for every
+        global tensor — even unused (phantom) ones — so the lowered
+        kernel's ``n_buffers`` matches the launcher's ``ParamSpec``.
+
+        Used tensors get their bindings lazily via ``_ensure_buffer_var``
+        on first load/store; phantoms never see one of those visitors,
+        so we proactively call ``_ensure_buffer_var`` here for every
+        tensor that hasn't been emitted yet."""
+        for t in global_tensors:
+            if id(t) not in ctx.tensor_to_var:
+                binding = ctx.tensor_to_binding[id(t)]
+                _ensure_buffer_var(t, binding, ctx)
 
     def _resolve_local_size(self, fn: Function) -> tuple[int, int, int]:
         if self._local_size is not None:
