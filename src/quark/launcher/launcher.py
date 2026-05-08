@@ -124,6 +124,28 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
         elapsed_s = _time.perf_counter() - t_bench
         return (elapsed_s * 1e6) / max(n_bench, 1)
 
+    if dev.family is DeviceFamily.INTEL_GPU:
+        # SPV / Vulkan path: ``SpvDriver.launch`` waits inline today
+        # (eager-submit shape — see ``_spv_dispatch.cpp``), so each
+        # ``fn()`` call returns after the dispatch completes. The
+        # accumulating-command-buffer optim from the Metal path will
+        # land here as PORTABILITY_PLAN §3.7's perf work matures, at
+        # which point this branch grows an explicit drain. Until then,
+        # the same eager loop the Metal path uses is correct and
+        # gives a clean μs/call.
+        t0 = _time.perf_counter()
+        n_warm = 0
+        while (_time.perf_counter() - t0) * 1000 < warmup_ms:
+            fn()
+            n_warm += 1
+        t_bench = _time.perf_counter()
+        n_bench = 0
+        while (_time.perf_counter() - t_bench) * 1000 < bench_ms:
+            fn()
+            n_bench += 1
+        elapsed_s = _time.perf_counter() - t_bench
+        return (elapsed_s * 1e6) / max(n_bench, 1)
+
     from quark.runtime.cuda import CudaRuntime
 
     rt = CudaRuntime.instance()
