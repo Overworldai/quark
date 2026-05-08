@@ -153,6 +153,18 @@ class SpvText:
         return self._cached_type("bool", "OpTypeBool")
 
     def type_vec(self, elem_id: str, width: int) -> str:
+        # SPIR-V's ``OpTypeVector`` only allows 2/3/4 components in
+        # Vulkan compute (``Vector16`` is OpenCL-only — disallowed by
+        # the Vulkan 1.4 spec). Raise loud and early so kernels that
+        # ask for an 8+ wide vec (e.g. ``vec_elems = 16 // 2`` for
+        # bf16 16-byte loads) surface the gap as a coverage bug
+        # rather than silently failing at validation time.
+        if width > 4:
+            raise NotImplementedError(
+                f"type_vec: width {width} > 4 not supported in Vulkan "
+                f"compute (would need OpenCL ``Vector16`` capability). "
+                f"Lower as a chain of width-4 vectors instead."
+            )
         key = f"vec_{elem_id}_{width}"
         return self._cached_type(key, f"OpTypeVector {elem_id} {width}")
 
