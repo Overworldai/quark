@@ -937,6 +937,75 @@ class TestExistingKernelsCompile:
         ctypes.memmove(got.ctypes.data, o_map, got.nbytes)
         np.testing.assert_allclose(got, expected, rtol=0, atol=1e-5)
 
+    def test_gemm_single_k_iter_runs_end_to_end(self, spv_device):
+        """``GemmKernel`` runs E2E at the smallest config (M=8, N=16,
+        K=16, BM/BN/BK=8/16/16, n_warps=1, n_stages=1) and matches
+        the numpy reference bit-identically.
+
+        Single K-iteration so the for-loop accumulator carry is set
+        up but the multi-iter tile-offset path doesn't kick in
+        (tile offsets in the gmem→smem produce don't yet thread
+        through the SPV vec_load chain — multi-iter K is the next
+        gap). K=16 single-iter exercises:
+          - cooperative-matrix LoadKHR for A (RowMajor) and B
+            (ColumnMajor — the framework's gemm convention with B
+            stored as N×K row-major).
+          - MulAddKHR with the bf16/f32 ``m8n16k16`` shape.
+          - StoreKHR via the FragForEach smem-roundtrip path.
+          - For-loop carry phi typed as a coop-matrix accumulator
+            (the ``coopmat-typed accumulator carry`` commit).
+        """
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.gemm.kernel import GemmKernel
+        from quark.kernels.gemm.spec import GemmSpec
+        from quark.kernels.gemm.config import GemmConfig
+        from quark.kernels.gemm.reference import gemm_reference_numpy
+        from quark.launcher import Launcher
+
+        M, N, K = 8, 16, 16
+        spec = GemmSpec(
+            M=M, N=N, K=K,
+            a_dtype=DType.BF16, b_dtype=DType.BF16,
+            acc_dtype=DType.F32, out_dtype=DType.BF16,
+        )
+        cfg = GemmConfig(
+            BM=8, BN=16, BK=16,
+            n_warps=1, n_stages=1,
+            main_shape="m8n16k16_intel_bf16_f32",
+        )
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(GemmKernel, spec, cfg)
+
+        tensors = GemmKernel.make_tensors_numpy({
+            "M": M, "N": N, "K": K,
+            "a_dtype": DType.BF16, "b_dtype": DType.BF16,
+            "out_dtype": DType.BF16,
+        })
+        ref = gemm_reference_numpy(spec, A=tensors["A"], B=tensors["B"])
+
+        handles: list[int] = []
+        out_ptr = 0
+        for buf in ck.param_spec.buffers:
+            arr = tensors[buf.name]
+            h, ptr = _sd.allocate_buffer(arr.nbytes)
+            if buf.name == "Out":
+                out_ptr = ptr
+            else:
+                ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
+            handles.append(h)
+
+        ck.launch(buffers=handles)
+
+        got = np.empty((M, N), dtype=np.uint16)
+        ctypes.memmove(got.ctypes.data, out_ptr, got.nbytes)
+        # bf16 bit-identity vs the numpy reference — the SPV
+        # cooperative-matrix MulAdd path matches exactly.
+        np.testing.assert_array_equal(got, ref.view(np.uint16))
+
     def test_value_residual_packed_kernel_compiles(self, spv_device):
         """``ValueResidualPackedKernel`` — packed-QKV variant. First
         kernel through SPV that needs PRED-typed values (boolean SSA
