@@ -272,6 +272,104 @@ def _same_size_int_dtype(dt: DType) -> DType:
 # ─────────────────────────────────────────────────────────────────
 
 
+def _coopmat_type_for_value(v, ctx) -> str | None:
+    """Trace ``v`` back through the IR producers and return the SPIR-V
+    coopmat-type id if ``v`` is coopmat-typed, else ``None``.
+
+    Handles direct coopmat-producing ops (``MmaOp`` / ``LoadMatrixOp``
+    / ``FragApplyOp`` / ``FragConvertOp``) and recursively through
+    ``IfRegionOp`` and ``ForLoopOp`` results — picks the matching
+    index of the yielded value from each region's terminator. Used by
+    ``_visit_if`` and ``_visit_for_loop`` to decide whether the
+    OpPhi at the merge / header should be coopmat-typed instead of
+    the IR-element scalar/vec type. Without coopmat-typed OpPhis,
+    yielded MMA / coopmat values pass through as ``v4float`` and
+    spirv-val rejects the binary at any subsequent
+    ``OpCooperativeMatrix*`` use site.
+    """
+    if v is None:
+        return None
+    prod = v.producer
+    if prod is None:
+        return None
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    # Direct coopmat-producing ops.
+    if isinstance(prod, (MmaOp, LoadMatrixOp)):
+        cfg = _BY_SHAPE_ID.get(prod.attrs.get("shape_id"))
+        if cfg is None:
+            return None
+        which = "c" if isinstance(prod, MmaOp) else prod.attrs.get("which", "c")
+        rows, cols, dtype = _coop_dims_for(cfg.shape, which)
+        elem_t = _emit_dtype(ctx.text, dtype, ctx)
+        if dtype is DType.BF16:
+            ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+        use = _COOPMAT_USE[which]
+        _ensure_coopmat_caps(ctx)
+        return ctx.text.type_coop_matrix(
+            elem_t, scope=3, rows=rows, cols=cols, use=use,
+        )
+    if isinstance(prod, FragApplyOp):
+        # FragApply returns a use=2 (acc) coopmat at the input shape.
+        cfg = _BY_SHAPE_ID.get(prod.attrs.get("shape_id"))
+        if cfg is None:
+            return None
+        rows, cols, dtype = _coop_dims_for(cfg.shape, "c")
+        elem_t = _emit_dtype(ctx.text, dtype, ctx)
+        if dtype is DType.BF16:
+            ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+        _ensure_coopmat_caps(ctx)
+        return ctx.text.type_coop_matrix(
+            elem_t, scope=3, rows=rows, cols=cols, use=_COOPMAT_USE["c"],
+        )
+    if isinstance(prod, FragConvertOp):
+        # FragConvert returns a use=0 (A-frag) coopmat.
+        cfg = _BY_SHAPE_ID.get(prod.attrs.get("shape_id"))
+        if cfg is None:
+            return None
+        shape = cfg.shape
+        src_cols = _coop_dims_for(shape, "c")[1]
+        dst_rows = shape.m
+        dst_cols = int(prod.attrs["num_src_frags"]) * src_cols
+        dst_elem_dt = prod.attrs["dst_dtype"]
+        elem_t = _emit_dtype(ctx.text, dst_elem_dt, ctx)
+        if dst_elem_dt is DType.BF16:
+            ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+        _ensure_coopmat_caps(ctx)
+        return ctx.text.type_coop_matrix(
+            elem_t, scope=3, rows=dst_rows, cols=dst_cols, use=_COOPMAT_USE["a"],
+        )
+    # Recurse through control-flow result wrappers. ``Value`` doesn't
+    # carry a result-index slot; we identify the slot by ``is`` against
+    # the producer's results tuple, then index into each region's
+    # terminator operands.
+    def _result_idx(value, prod_results) -> int | None:
+        for i, r in enumerate(prod_results):
+            if r is value:
+                return i
+        return None
+
+    if isinstance(prod, IfRegionOp):
+        idx = _result_idx(v, prod.results)
+        if idx is None:
+            return None
+        for region in (prod.then_region, prod.else_region):
+            term = region.terminator
+            if term is None or idx >= len(term.operands):
+                continue
+            ct = _coopmat_type_for_value(term.operands[idx], ctx)
+            if ct is not None:
+                return ct
+    if isinstance(prod, ForLoopOp):
+        idx = _result_idx(v, prod.results)
+        if idx is None:
+            return None
+        term = prod.body.terminator
+        if term is not None and idx < len(term.operands):
+            return _coopmat_type_for_value(term.operands[idx], ctx)
+    return None
+
+
 def _visit_const(op: ConstOp, ctx: _SpvCtx) -> None:
     (out,) = op.results
     dt = out.dtype
@@ -758,12 +856,31 @@ def _visit_if_region(op: IfRegionOp, ctx: _SpvCtx) -> None:
 
     # Per-arm yield-target ids (forward-declared; defined when the
     # arm's terminating YieldOp fires via OpCopyObject).
+    #
+    # Pre-scan both arms' terminators for coopmat-producing yields so
+    # the OpPhi at the merge block uses the coopmat type when either
+    # arm yields a coopmat (MmaOp / LoadMatrixOp / FragApplyOp /
+    # FragConvertOp result). Without this, OpPhi gets emitted at the
+    # IR element type (vec4-float for an Accumulators slot) and a
+    # downstream ``OpCooperativeMatrix*Khr`` use rejects with
+    # spirv-val "Object type is not a cooperative matrix type" — the
+    # owl_attn ``if_(valid, carried=...)`` masking pattern hits this.
+    # Mirrors ``_visit_for_loop``'s ``_coopmat_type_for_carry_yield``.
     has_carries = bool(op.results)
     then_yield_ids: list[str] = []
     else_yield_ids: list[str] = []
     type_ids: list[str] = []
+    then_term = op.then_region.terminator
+    else_term = op.else_region.terminator
+    then_yields = list(then_term.operands) if then_term is not None else []
+    else_yields = list(else_term.operands) if else_term is not None else []
     for i, res in enumerate(op.results):
-        type_id = _emit_dtype(ctx.text, res.dtype, ctx)
+        coop_t = None
+        if i < len(then_yields):
+            coop_t = _coopmat_type_for_value(then_yields[i], ctx)
+        if coop_t is None and i < len(else_yields):
+            coop_t = _coopmat_type_for_value(else_yields[i], ctx)
+        type_id = coop_t if coop_t is not None else _emit_dtype(ctx.text, res.dtype, ctx)
         type_ids.append(type_id)
         then_yield_ids.append(ctx.text.alloc_id(f"if_then{i}"))
         else_yield_ids.append(ctx.text.alloc_id(f"if_else{i}"))
