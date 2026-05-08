@@ -638,7 +638,17 @@ class OwlAttnKernel(Kernel):
         # the segment loop closes; here we just keep ``q_in_smem`` /
         # ``out_row_warp`` / ``warp_id`` in scope.
 
-        n_rc = len({dr for dr, _ in mma_cfg.cd_offsets})
+        # Row classes per m-tile:
+        #   - PTX m16n8 → 2 (dr ∈ {0, 8}); m8n8k8 → 1 (dr ∈ {0})
+        #   - Intel SPV → ``shape.m`` (full per-row, since cd_offsets is
+        #     ``((0, 0),) * c_regs`` placeholder; the SPV lowerer derives
+        #     row from the smem layout per-slot — see ``online_softmax_
+        #     block`` ``is_intel_spv``).
+        is_intel_spv = "_intel_" in mma_cfg.shape_id
+        n_rc = (
+            mma_cfg.shape.m if is_intel_spv
+            else len({dr for dr, _ in mma_cfg.cd_offsets})
+        )
         n_ml = MTiles * n_rc
 
         # Typed carry — O + per-(mt, rc) m / l scalars. See attn/kernel.py
