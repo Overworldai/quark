@@ -788,45 +788,55 @@ class Launcher:
         return ck
 
     def _maybe_resolve_main_shape(self, kernel_cls, spec, config):
-        """Fill in ``config.main_shape`` from device caps when the
-        caller passed an explicit config but left the shape empty.
+        """Fill in ``config.main_shape`` and downgrade ``n_stages`` for
+        the active device when the caller passed an explicit config
+        but left those device-dependent knobs at their defaults.
 
         Walks the kernel's MMA sites, picks the first shape whose
         dtype axes match the site's ``a_dtype`` / ``b_dtype`` AND
-        which is in ``device.caps.matmul_shapes``. Returns the
-        original ``config`` unchanged if there are no MMA sites, no
-        ``main_shape`` field, the field is already set, or no
-        compatible shape is found (the latter case will fail
-        ``is_valid_for`` below with a useful error). Same set of
-        candidates ``tune_space_resolved`` walks during autotune —
-        non-autotuned compiles get the same device-aware default
-        treatment instead of falling through to a PTX-only
-        ``lookup_mma`` result.
+        which is in ``device.caps.matmul_shapes``.
+
+        Also downgrades ``config.n_stages`` to 1 on devices without
+        ``supports_async_copy`` (today: Metal, SPV/Intel). The
+        double-buffer scaffolding emits ``async_copy`` ops that the
+        legalizer rewrites to sync loads on those devices, but the
+        outer two-buffer + extra-barrier wrapping stays — strictly
+        slower than ``n_stages=1`` without the overlap. Measured on
+        Battlemage at ~1.4× wall-time for owl-sized GEMM.
+
+        Returns the original ``config`` unchanged if no field needs
+        adjusting. Same set of candidates ``tune_space_resolved``
+        walks during autotune — non-autotuned compiles get the same
+        device-aware default treatment instead of falling through to
+        a PTX-only ``lookup_mma`` result.
         """
         import dataclasses as _dc
 
-        if not hasattr(config, "main_shape"):
+        new_kwargs: dict[str, object] = {}
+
+        # main_shape resolution
+        if hasattr(config, "main_shape") and not config.main_shape:
+            sites = kernel_cls.mma_sites(spec)
+            matmul_shapes = getattr(self.device.caps, "matmul_shapes", frozenset())
+            if sites and matmul_shapes:
+                for site in sites:
+                    legal = sorted(s for s in matmul_shapes if site.shape_matches(s))
+                    if legal:
+                        new_kwargs["main_shape"] = legal[0]
+                        break
+
+        # n_stages downgrade on devices without async-copy. Keep
+        # n_stages=1 untouched; only step down from >=2.
+        if (
+            hasattr(config, "n_stages")
+            and getattr(config, "n_stages", 1) > 1
+            and not getattr(self.device.caps, "supports_async_copy", True)
+        ):
+            new_kwargs["n_stages"] = 1
+
+        if not new_kwargs:
             return config
-        if config.main_shape:
-            return config
-        sites = kernel_cls.mma_sites(spec)
-        if not sites:
-            return config
-        matmul_shapes = getattr(self.device.caps, "matmul_shapes", frozenset())
-        if not matmul_shapes:
-            return config
-        # Pick the first compatible shape per site. Sites that share
-        # a knob name should resolve to the same shape; today every
-        # kernel has a single ``main`` site.
-        for site in sites:
-            legal = sorted(s for s in matmul_shapes if site.shape_matches(s))
-            if not legal:
-                continue
-            # Choose the first legal shape — order is deterministic
-            # (sorted by shape id), matching the autotuner's
-            # tie-break.
-            return _dc.replace(config, main_shape=legal[0])
-        return config
+        return _dc.replace(config, **new_kwargs)
 
     def _lower(self, ir_or_program, kernel):
         """Lower the kernel's emit() output to a backend-specific artifact.
