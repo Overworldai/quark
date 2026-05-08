@@ -48,13 +48,14 @@ class AttnConfig(KernelConfig):
         is_fp8_compute = spec.compute_dtype_resolved in (DType.E4M3, DType.E5M2)
         # NCW=2 because the kernel's ``is_valid`` rejects NCW=1
         # ("every other 8-row Vt group lands wrong" — see kernel.py).
-        # Without this, the launcher's fallback config is invalid and
-        # smoke / first-time-compile paths fail on every device. Apple
-        # and CUDA always go through autotune cache so their paths are
-        # unaffected; only the Intel-SPV / cold-cache path gets a
-        # working fallback now.
+        # KvTile=16 because on Battlemage SPV at the steady-state
+        # owl_360p_dense shape it bench's ~17 % faster than 32 (2308
+        # vs 2798 μs) at identical cos_sim. Apple/CUDA always go
+        # through autotune cache so their paths are unaffected; only
+        # the Intel-SPV / cold-cache path benefits from the smaller
+        # default tile.
         return cls(
-            KvTile=32,
+            KvTile=16,
             MTiles=1,
             NCW=2,
             KvPad=16 if is_fp8_compute else 8,
