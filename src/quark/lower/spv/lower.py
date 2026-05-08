@@ -41,7 +41,9 @@ from quark.ir import DType
 from quark.ir.module import Function, Module
 from quark.ir.op import (
     ArithOp,
+    AtomicRmwOp,
     BarrierOp,
+    BitcastOp,
     BlockDimOp,
     BlockIdxOp,
     CmpOp,
@@ -241,6 +243,16 @@ def _visit_const(op: ConstOp, ctx: _SpvCtx) -> None:
         ctx.text.add_type_line(f"{cid} = OpConstant {s32} {int(raw)}")
     elif dt is DType.F32:
         cid = ctx.text.const_float(float(raw))
+    elif dt is DType.PRED:
+        # Boolean literal — SPIR-V has dedicated opcodes
+        # (no OpConstant for OpTypeBool). Cache by the constant
+        # itself so ``True``/``False`` only emit once per kernel.
+        bool_t = ctx.text.type_bool()
+        kind = "true" if bool(raw) else "false"
+        cid = ctx.text._cached_type(
+            f"const_{kind}",
+            f"OpConstant{kind.title()} {bool_t}",
+        )
     else:
         raise NotImplementedError(
             f"_visit_const: dtype {dt!r} — extend SpirVLowerer per "
@@ -643,57 +655,129 @@ def _visit_cmp(op: CmpOp, ctx: _SpvCtx) -> None:
 
 
 def _visit_if_region(op: IfRegionOp, ctx: _SpvCtx) -> None:
-    """Structured if/else with no carries (the bounds-check pattern).
+    """Structured if/else, with or without loop-carried values.
 
     SPIR-V structured control flow:
-      OpSelectionMerge merge None
-      OpBranchConditional pred then_label else_label
-      then_label = OpLabel
-        ...then body ops...
-        OpBranch merge
-      else_label = OpLabel
-        ...else body ops...   (empty if no else)
-        OpBranch merge
-      merge = OpLabel
 
-    Carries (operands beyond the predicate, results from the op) need
-    OpPhi at the merge block to thread per-arm-yielded values
-    forward. Deferred — every in-tree kernel I've checked uses
-    if-without-carries today; the carry path lands when a kernel
-    needs it. ``YieldOp`` body terminators are simply walked inside
-    each region; they emit their operand into the val map, no phi.
+        OpSelectionMerge %merge None
+        OpBranchConditional %pred %then %else
+
+        %then = OpLabel
+          ;; ... then body ops ...
+          ;; (with carries) YieldOp materialises each value via
+          ;; OpCopyObject into pre-allocated then-yield ids.
+          OpBranch %then_tail
+        %then_tail = OpLabel
+          OpBranch %merge
+
+        %else = OpLabel
+          ;; mirror
+          OpBranch %else_tail
+        %else_tail = OpLabel
+          OpBranch %merge
+
+        %merge = OpLabel
+          ;; (with carries) OpPhi per result picks from
+          ;; %then_tail / %else_tail.
+
+    The dedicated ``*_tail`` blocks give OpPhi a stable predecessor
+    label even when the arm body emits its own internal control flow
+    (nested if/for-loop). Without them, the OpPhi predecessor would
+    have to be the *last* basic block of the arm at OpBranch time,
+    which the visitors don't currently track.
+
+    For the no-carries case (the bounds-check pattern), the tail
+    blocks are still emitted but there's no OpPhi at merge — they
+    cost ~3 lines of SPIR-V each, which spirv-as / the GPU optimise
+    away during compile.
+
+    Body inputs (``then_body_vars`` / ``else_body_vars``) are aliased
+    to the corresponding entry in ``op.operands`` so loads inside the
+    arm see the carried-in value's SSA id. With the simple
+    ``carried`` API on the builder, the same operand sequence appears
+    twice in ``op.operands`` (once for then, once for else); we map
+    each arm separately.
     """
-    if op.results:
-        raise NotImplementedError(
-            "_visit_if_region: result-yielding (carried) if/else "
-            "needs OpPhi merge — not yet wired. See PORTABILITY_PLAN "
-            "§3.2."
-        )
     pred_id = ctx.val_to_id[op.pred.id]
+    n_carried = int(op.attrs.get("n_carried", 0))
+
+    # Carried-in operand split: (pred, *then_in, *else_in)
+    then_in_vals = op.operands[1 : 1 + n_carried]
+    else_in_vals = op.operands[1 + n_carried : 1 + 2 * n_carried]
+
+    # Body-visible carry-in values are aliased to their corresponding
+    # input operand's SSA id — the body can read them as if they were
+    # the operand directly.
+    for body_var, src_val in zip(op.then_body_vars, then_in_vals, strict=False):
+        ctx.val_to_id[body_var.id] = ctx.val_to_id[src_val.id]
+    for body_var, src_val in zip(op.else_body_vars, else_in_vals, strict=False):
+        ctx.val_to_id[body_var.id] = ctx.val_to_id[src_val.id]
+
+    # Per-arm yield-target ids (forward-declared; defined when the
+    # arm's terminating YieldOp fires via OpCopyObject).
+    has_carries = bool(op.results)
+    then_yield_ids: list[str] = []
+    else_yield_ids: list[str] = []
+    type_ids: list[str] = []
+    for i, res in enumerate(op.results):
+        type_id = _emit_dtype(ctx.text, res.dtype, ctx)
+        type_ids.append(type_id)
+        then_yield_ids.append(ctx.text.alloc_id(f"if_then{i}"))
+        else_yield_ids.append(ctx.text.alloc_id(f"if_else{i}"))
 
     merge_label = ctx.text.alloc_id("if_merge")
-    then_label = ctx.text.alloc_id("if_then")
-    else_label = ctx.text.alloc_id("if_else")
+    then_label = ctx.text.alloc_id("if_then_lbl")
+    else_label = ctx.text.alloc_id("if_else_lbl")
+    then_tail = ctx.text.alloc_id("if_then_tail")
+    else_tail = ctx.text.alloc_id("if_else_tail")
 
     ctx.text.emit_function(f"OpSelectionMerge {merge_label} None")
     ctx.text.emit_function(
         f"OpBranchConditional {pred_id} {then_label} {else_label}"
     )
 
-    # Then arm
+    # ── Then arm ────────────────────────────────────────────────────
     ctx.text.emit_function(f"{then_label} = OpLabel")
-    for body_op in op.then_region.ops:
-        _walk_op(body_op, ctx)
+    if has_carries:
+        ctx.loop_yield_stack.append(
+            list(zip(then_yield_ids, type_ids, strict=False))
+        )
+    try:
+        for body_op in op.then_region.ops:
+            _walk_op(body_op, ctx)
+    finally:
+        if has_carries:
+            ctx.loop_yield_stack.pop()
+    ctx.text.emit_function(f"OpBranch {then_tail}")
+    ctx.text.emit_function(f"{then_tail} = OpLabel")
     ctx.text.emit_function(f"OpBranch {merge_label}")
 
-    # Else arm — may be empty.
+    # ── Else arm ────────────────────────────────────────────────────
     ctx.text.emit_function(f"{else_label} = OpLabel")
-    for body_op in op.else_region.ops:
-        _walk_op(body_op, ctx)
+    if has_carries:
+        ctx.loop_yield_stack.append(
+            list(zip(else_yield_ids, type_ids, strict=False))
+        )
+    try:
+        for body_op in op.else_region.ops:
+            _walk_op(body_op, ctx)
+    finally:
+        if has_carries:
+            ctx.loop_yield_stack.pop()
+    ctx.text.emit_function(f"OpBranch {else_tail}")
+    ctx.text.emit_function(f"{else_tail} = OpLabel")
     ctx.text.emit_function(f"OpBranch {merge_label}")
 
-    # Merge block. Subsequent ops in the parent region land here.
+    # ── Merge block ─────────────────────────────────────────────────
     ctx.text.emit_function(f"{merge_label} = OpLabel")
+    for i, res in enumerate(op.results):
+        phi_id = ctx.text.alloc_id(f"if_out{i}")
+        ctx.val_to_id[res.id] = phi_id
+        ctx.text.emit_function(
+            f"{phi_id} = OpPhi {type_ids[i]} "
+            f"{then_yield_ids[i]} {then_tail} "
+            f"{else_yield_ids[i]} {else_tail}"
+        )
 
 
 def _visit_yield(op: YieldOp, ctx: _SpvCtx) -> None:
@@ -1027,6 +1111,81 @@ def _visit_store(op: StoreOp, ctx: _SpvCtx) -> None:
     )
 
 
+# ``AtomicRmwOp.attrs['op']`` → SPIR-V atomic opcode. Splits by signed
+# vs unsigned for min/max — the IR carries the dtype on the value.
+_ATOMIC_OP_BY_KIND: dict[str, str] = {
+    "add": "OpAtomicIAdd",
+    "and": "OpAtomicAnd",
+    "or": "OpAtomicOr",
+    "xor": "OpAtomicXor",
+    "exch": "OpAtomicExchange",
+}
+
+
+def _visit_atomic_rmw(op: AtomicRmwOp, ctx: _SpvCtx) -> None:
+    """Atomic read-modify-write on a ``GlobalTensor`` slot.
+
+    SPIR-V opcode shape: ``%result = OpAtomic<Op> %T %ptr %scope
+    %semantics %value`` — except ``OpAtomicLoad`` / ``OpAtomicStore``
+    which we don't need here. Result is the *original* value at the
+    slot, matching the IR's ``atomic_rmw`` contract.
+
+    Memory scope: ``Device`` (1) — the typical compute-shader choice
+    when the atomic is meant to be visible across workgroups (the
+    moe_router pattern, where multiple WGs race for an expert slot).
+    Memory semantics: ``Relaxed`` (0) — atomics emitted from quark IR
+    don't carry an acquire/release barrier today; ordering is the
+    caller's responsibility (a ``barrier()`` op pairs with the rmw
+    when needed).
+    """
+    (out,) = op.results
+    tensor = op.attrs["tensor"]
+    kind = op.attrs["op"]
+
+    if not isinstance(tensor, GlobalTensor):
+        raise NotImplementedError(
+            f"_visit_atomic_rmw: tensor type "
+            f"{type(tensor).__name__} not wired (only GlobalTensor today)"
+        )
+
+    binding = ctx.tensor_to_binding[id(tensor)]
+    var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
+
+    value_id = ctx.val_to_id[op.operands[0].id]
+    zero = ctx.text.const_uint(0)
+    idx_id = _flatten_index(tuple(op.operands[1:]), tensor.shape, ctx)
+    chain_id = ctx.text.alloc_id("atomic_chain")
+    ctx.text.emit_function(
+        f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {idx_id}"
+    )
+
+    type_id = _emit_dtype(ctx.text, out.dtype, ctx)
+    res_id = ctx.text.alloc_id(f"atomic_{kind}")
+    ctx.val_to_id[out.id] = res_id
+
+    if kind == "min":
+        spv_op = "OpAtomicSMin" if _dtype_kind(out.dtype) == "sint" else "OpAtomicUMin"
+    elif kind == "max":
+        spv_op = "OpAtomicSMax" if _dtype_kind(out.dtype) == "sint" else "OpAtomicUMax"
+    else:
+        spv_op = _ATOMIC_OP_BY_KIND.get(kind)
+        if spv_op is None:
+            raise NotImplementedError(
+                f"_visit_atomic_rmw: op={kind!r} not yet wired"
+            )
+
+    # Scope = Device (1), Memory semantics = Relaxed (0). Both are
+    # ``OpConstant uint``; cache them so repeated atomics don't
+    # produce duplicate constants.
+    scope_id = ctx.text.const_uint(1)
+    semantics_id = ctx.text.const_uint(0)
+
+    ctx.text.emit_function(
+        f"{res_id} = {spv_op} {type_id} {chain_id} {scope_id} "
+        f"{semantics_id} {value_id}"
+    )
+
+
 # ─── Convert / Math / Select ──────────────────────────────────────
 
 
@@ -1089,6 +1248,21 @@ def _visit_convert(op: ConvertOp, ctx: _SpvCtx) -> None:
     res_id = ctx.text.alloc_id(f"cvt_{src_dt.value}_{dst_dt.value}")
     ctx.val_to_id[out.id] = res_id
     ctx.text.emit_function(f"{res_id} = {spv_op} {dst_t} {src_id}")
+
+
+def _visit_bitcast(op: BitcastOp, ctx: _SpvCtx) -> None:
+    """Reinterpret-cast: ``OpBitcast`` to the destination type. SPIR-V
+    requires src and dst to have the same total bit width; the IR's
+    own ``BitcastOp.__post_init__`` enforces that. Used by RNG /
+    layout-shuffle kernels (e.g. ``moe_router_correct`` flips between
+    S32 and U32 for shifts)."""
+    (out,) = op.results
+    dst_dt = op.attrs["dst_dtype"]
+    dst_t = _emit_dtype(ctx.text, dst_dt, ctx)
+    src_id = ctx.val_to_id[op.operands[0].id]
+    res_id = ctx.text.alloc_id(f"bitcast_{dst_dt.value}")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(f"{res_id} = OpBitcast {dst_t} {src_id}")
 
 
 def _dtype_kind(dt: DType) -> str:
@@ -1530,6 +1704,7 @@ _DISPATCH: dict[type, Any] = {
     ArithOp: _visit_arith,
     CmpOp: _visit_cmp,
     ConvertOp: _visit_convert,
+    BitcastOp: _visit_bitcast,
     MathOp: _visit_math,
     SelectOp: _visit_select,
     ThreadIdxOp: _visit_thread_idx,
@@ -1541,6 +1716,7 @@ _DISPATCH: dict[type, Any] = {
     ThreadIdInGroupOp: _visit_thread_id_in_group,
     LoadOp: _visit_load,
     StoreOp: _visit_store,
+    AtomicRmwOp: _visit_atomic_rmw,
     VecLoadOp: _visit_vec_load,
     VecStoreOp: _visit_vec_store,
     VecBuildOp: _visit_vec_build,
