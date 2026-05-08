@@ -1117,3 +1117,86 @@ class TestExistingKernelsCompile:
         )
         assert ck.module.handle != 0
         assert ck.module.n_buffers == 2  # X (in) + Out
+
+    def test_attn_runs_end_to_end_against_numpy_reference(self, spv_device):
+        """``AttnKernel`` runs E2E on Battlemage at the smallest registered
+        problem (``small_4h``: B=1, n_kv_heads=2, gqa_ratio=2, seq_len=64,
+        kv_len=64, Dh=64) with the Intel m8n16k16 bf16/f32 shape +
+        n_warps=2 (= gqa_ratio * NCW).
+
+        Acceptance gate is loose (``atol=0.2``): the per-row reduce
+        limitation documented in ``_visit_frag_reduce``'s docstring
+        means the online softmax collapses to a single-class normalisation
+        on Intel coopmat — output drifts ~1.6e-1 from the f32 numpy
+        reference. This test pins that observed-drift floor; numerical
+        regressions worse than ~0.2 (e.g. multi-warp partition broken,
+        FragApply selector wiring slipped) would fail here. Tightening
+        the bound is gated on a fix to per-row reduce — either via
+        ``SPV_NV_cooperative_matrix2`` reaching anv or breaking the
+        cd_offsets-↔-c_regs coupling at the IR layer (commit 36ef967
+        docstring).
+
+        Multi-warp partition exercise: ``n_warps=2`` forces every Frag*
+        visitor to thread the per-warp ``subgroup_id * n_per_warp``
+        scratch offset. Without that fix (commit 36ef967) cross-subgroup
+        smem races would scramble FragApply / FragReduce / FragConvert
+        outputs much worse than the bf16 + per-row drift, so this test
+        also acts as the hardware-side regression net for that fix."""
+        import ctypes
+        import numpy as np
+
+        from quark.drivers import _spv_dispatch as _sd
+        from quark.kernels.attn.kernel import AttnKernel
+        from quark.kernels.attn.config import AttnConfig
+        from quark.kernels.attn.reference import attn_reference_numpy
+        from quark.launcher import Launcher
+
+        # Smallest registered attn problem.
+        params = dict(AttnKernel.problems()[0].params)
+        # Force the Intel shape — default config's empty ``main_shape``
+        # falls back to a PTX shape via ``lookup_mma`` and would fail
+        # ``is_valid_for(intel_caps)``.
+        kernel0 = AttnKernel.from_problem(params)
+        spec = kernel0.spec
+        cfg = AttnConfig(
+            KvTile=32, MTiles=1, NCW=1, KvPad=8, n_stages=1,
+            main_shape="m8n16k16_intel_bf16_f32",
+        )
+
+        launcher = Launcher(device=spv_device)
+        ck = launcher.compile(AttnKernel, spec, cfg)
+
+        tensors = AttnKernel.make_tensors_numpy(params)
+        ref = attn_reference_numpy(spec, Q=tensors["Q"], K=tensors["K"],
+                                    V_t=tensors["V_t"])
+
+        handles: list[int] = []
+        out_ptr = 0
+        for buf in ck.param_spec.buffers:
+            arr = tensors[buf.name]
+            h, ptr = _sd.allocate_buffer(arr.nbytes)
+            if buf.name == "output":
+                out_ptr = ptr
+            else:
+                ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
+            handles.append(h)
+
+        ck.launch(buffers=handles)
+
+        got = np.empty(ref.shape, dtype=ref.dtype)
+        ctypes.memmove(got.ctypes.data, out_ptr, got.nbytes)
+
+        # Lift bf16 → f32 for numerical comparison (numpy doesn't have
+        # native bf16; ``ref`` is uint16 bit pattern of bf16).
+        def _bf16_to_f32(arr):
+            return (arr.astype("<u4") << 16).view("<f4")
+
+        got_f = _bf16_to_f32(got.view(np.uint16))
+        ref_f = _bf16_to_f32(ref.view(np.uint16))
+        max_diff = float(np.max(np.abs(got_f - ref_f)))
+        # Loose bound. See docstring for why.
+        assert max_diff < 0.2, (
+            f"attn output drift {max_diff:.4f} exceeds the "
+            f"per-row-reduce-limited floor of 0.2 — "
+            f"multi-warp partition or visitor wiring regressed?"
+        )
