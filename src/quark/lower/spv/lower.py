@@ -560,11 +560,14 @@ def _ensure_builtin_vec3_component(
     if dim not in _DIM_TO_INDEX:
         raise ValueError(f"_ensure_builtin: bad dim={dim!r}")
 
-    cached_attr = f"{cache_attr_prefix}_{dim}_loaded"
-    cached = getattr(ctx, cached_attr, "")
-    if cached:
-        return cached
-
+    # No SSA caching: caching the loaded value on the ctx breaks
+    # dominance when the helper is called from inside a region
+    # different from the one that first triggered emission. Re-emit
+    # OpLoad + OpCompositeExtract at every call site; the compiler
+    # hoists redundant Input-variable loads in optimisation. The
+    # variable declaration itself stays cached on ``ctx.<var_attr>``
+    # at module scope (no dominance issue there).
+    del cache_attr_prefix  # signature compat — no longer read
     var_id = getattr(ctx, var_attr, "")
     if not var_id:
         u32 = ctx.text.type_int(32, signed=False)
@@ -577,19 +580,12 @@ def _ensure_builtin_vec3_component(
 
     u32 = ctx.text.type_int(32, signed=False)
     v3u = ctx.text.type_vec(u32, 3)
-    # Load the vec3 once per (kernel, dim-extract) pair. Cache the
-    # vec on the ctx by stashing it under the ``_x_loaded`` slot when
-    # dim==x is the first read; subsequent dims need a fresh load
-    # only when neither ``y`` nor ``z`` was previously cached. Simple
-    # path: each dim has its own cache slot, so emit one ``OpLoad``
-    # per dim accessed (cheap — Apple/Intel's compiler folds them).
     loaded = ctx.text.alloc_id(f"{builtin_name}_{dim}_vec")
     ctx.text.emit_function(f"{loaded} = OpLoad {v3u} {var_id}")
     res_id = ctx.text.alloc_id(f"{builtin_name}_{dim}")
     ctx.text.emit_function(
         f"{res_id} = OpCompositeExtract {u32} {loaded} {_DIM_TO_INDEX[dim]}"
     )
-    setattr(ctx, cached_attr, res_id)
     return res_id
 
 
@@ -634,14 +630,27 @@ def _ensure_scalar_builtin(
     cache_attr: str,
     builtin_name: str,
 ) -> str:
-    """Lazily declare a scalar ``BuiltIn`` u32 input variable + load
-    it. Used for ``SubgroupLocalInvocationId`` (lane id within
-    subgroup) and ``SubgroupId`` (subgroup id within workgroup) —
-    each is a single u32 the kernel reads directly, no vec3 dance.
+    """Lazily declare a scalar ``BuiltIn`` u32 input variable + emit
+    a fresh ``OpLoad`` at every call site. Used for
+    ``SubgroupLocalInvocationId`` (lane id within subgroup) and
+    ``SubgroupId`` (subgroup id within workgroup).
+
+    The variable declaration is module-scope (cached on
+    ``ctx.<var_attr>``). The load was previously cached too (on
+    ``ctx.<cache_attr>``) but that breaks SPIR-V dominance: the
+    cached SSA id was emitted into whatever block first called the
+    helper, and any later call from a different block would emit
+    a reference to that local id — spirv-val rejects with
+    "id … defined in block X does not dominate its use in block Y".
+
+    Re-emitting OpLoad on every call costs one instruction per use.
+    The compiler will hoist redundant loads on Input variables to
+    the entry block during optimisation, so the SPIR-V byte cost is
+    real but the executed cost is zero. ``cache_attr`` retained for
+    signature compatibility with existing callers; the field is no
+    longer read.
     """
-    cached = getattr(ctx, cache_attr, "")
-    if cached:
-        return cached
+    del cache_attr  # see docstring — load is no longer cached.
     var_id = getattr(ctx, var_attr, "")
     if not var_id:
         u32 = ctx.text.type_int(32, signed=False)
@@ -653,7 +662,6 @@ def _ensure_scalar_builtin(
     u32 = ctx.text.type_int(32, signed=False)
     res_id = ctx.text.alloc_id(builtin_name + "_v")
     ctx.text.emit_function(f"{res_id} = OpLoad {u32} {var_id}")
-    setattr(ctx, cache_attr, res_id)
     return res_id
 
 
