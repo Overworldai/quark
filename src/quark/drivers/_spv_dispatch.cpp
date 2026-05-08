@@ -717,8 +717,18 @@ uint64_t compile_internal(
           "vkCreatePipelineLayout");
 
     // 4. Compute pipeline.
+    // PORTABILITY_PLAN §3.5: pin SubgroupSize=32 at pipeline create
+    // time so Mesa Battlemage doesn't pick SIMD16 for kernels using
+    // OpCooperativeMatrixMulAddKHR. The lowerer's hardcoded
+    // ``subgroup_width = 32`` slot-partition assumption depends on
+    // this match; without it, every smem-roundtrip frag visitor
+    // writes only half the elements (attn cols-zero pattern).
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{};
+    rss.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    rss.requiredSubgroupSize = 32;
     VkPipelineShaderStageCreateInfo ssci{};
     ssci.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ssci.pNext = &rss;
     ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ssci.module = rec.module;
     ssci.pName = entry.c_str();
