@@ -1248,36 +1248,18 @@ def _flatten_index(indices: tuple, shape: tuple, ctx: _SpvCtx) -> str:
 
 
 def _add_dyn_offset(flat: str, tensor, ctx: _SpvCtx) -> str:
-    """Append ``tensor.warp_dyn_offset`` (or warp-uniform
-    ``dyn_offset``) to a flat index when present.
+    """Append ``tensor.dyn_offset`` to a flat index when present.
 
-    SharedRegion's ``dyn_offset`` field is overloaded across two
-    use cases:
+    Used after ``_flatten_index`` for SharedRegion accesses. The
+    scalar ``dyn_offset`` is what ``view(dyn_offset=…)`` /
+    ``warp_lane_view`` set — e.g. ``store_acc(per_warp=True)`` uses
+    ``warp_id * (warp_rows * stride_elems)`` as the offset to give
+    each warp a private slice of the staging smem.
 
-      * ``view(dyn_offset=warp_id * stride)`` — warp-uniform (e.g.
-        ``store_acc(per_warp=True)`` staging).
-      * ``warp_lane_view(...)`` — sets BOTH ``dyn_offset =
-        warp_off + per_lane_offset`` AND ``warp_dyn_offset =
-        warp_off`` (warp-only).
-
-    For NON-coopmat smem accesses (regular ``OpStore`` / ``OpLoad``
-    / vec_load / vec_store), we want the warp-uniform component
-    only; per-lane PTX-style offsets are wrong here because they
-    were intended for ldmatrix and they end up zeroing half the
-    cols of attn's output (the ``group_id``-parity-looking pattern).
-    Prefer ``warp_dyn_offset`` when set; else fall back to
-    ``dyn_offset`` (warp-uniform by construction in non-warp-lane-
-    view cases).
+    Without this, multi-warp kernels write to the same staging
+    address and the last writer wins — ``attn``'s output had cols
+    4-7, 12-15, … zeroed because warp 1 overwrote warp 0's writes.
     """
-    warp_only = getattr(tensor, "warp_dyn_offset", None)
-    if warp_only is not None:
-        u32 = ctx.text.type_int(32, signed=False)
-        d_id = ctx.val_to_id[warp_only.id]
-        new_flat = ctx.text.alloc_id("flat_warp_dyn")
-        ctx.text.emit_function(
-            f"{new_flat} = OpIAdd {u32} {flat} {d_id}"
-        )
-        return new_flat
     scalar_dyn = getattr(tensor, "dyn_offset", None)
     if scalar_dyn is None:
         return flat
