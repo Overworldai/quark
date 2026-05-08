@@ -1040,36 +1040,15 @@ def _visit_for_loop(op: ForLoopOp, ctx: _SpvCtx) -> None:
     # element type id.
     carry_phi_ids: list[str] = []
     # Pre-scan the body's terminator to detect when a carry's yielded
-    # value is the result of a coopmat-typed op (``MmaOp`` /
-    # ``LoadMatrixOp``). Those carries need an opaque
+    # value resolves (transitively, through nested if/for results) to
+    # a coopmat-typed op result. Those carries need an opaque
     # ``OpTypeCooperativeMatrixKHR`` for the OpPhi at the loop
     # header — a plain vec / array type would cause an OpPhi-vs-
-    # MMA-result type mismatch (the GEMM accumulator pattern).
+    # MMA-result type mismatch (the GEMM accumulator pattern, plus
+    # owl_attn's ``if_(valid, carried=...)`` masking pattern that
+    # nests an IfRegionOp inside the for-loop body).
     body_term = op.body.terminator
     yielded_vals = list(body_term.operands) if body_term is not None else []
-
-    def _coopmat_type_for_carry_yield(v):
-        if v is None:
-            return None
-        prod = v.producer
-        # Producer is an ``MmaOp`` or ``LoadMatrixOp``: the result is
-        # a coopmat. Resolve its coopmat type id from the registry.
-        if not isinstance(prod, (MmaOp, LoadMatrixOp)):
-            return None
-        from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
-        cfg = _BY_SHAPE_ID.get(prod.attrs.get("shape_id"))
-        if cfg is None:
-            return None
-        which = "c" if isinstance(prod, MmaOp) else prod.attrs.get("which", "c")
-        rows, cols, dtype = _coop_dims_for(cfg.shape, which)
-        elem_t = _emit_dtype(ctx.text, dtype, ctx)
-        if dtype is DType.BF16:
-            ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
-        use = _COOPMAT_USE[which]
-        _ensure_coopmat_caps(ctx)
-        return ctx.text.type_coop_matrix(
-            elem_t, scope=3, rows=rows, cols=cols, use=use,
-        )
 
     carry_next_ids: list[str] = []
     carry_type_ids: list[str] = []
@@ -1079,7 +1058,7 @@ def _visit_for_loop(op: ForLoopOp, ctx: _SpvCtx) -> None:
         # type, and the init value (typically a vec_build zero pattern)
         # is splat-converted to a coopmat in the preheader below.
         coop_t = (
-            _coopmat_type_for_carry_yield(yielded_vals[i])
+            _coopmat_type_for_value(yielded_vals[i], ctx)
             if i < len(yielded_vals) else None
         )
         if coop_t is not None:
