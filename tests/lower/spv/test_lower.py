@@ -1357,7 +1357,7 @@ def test_multi_warp_frag_visitors_partition_smem_per_warp():
     src1 = SpirVLowerer(local_size=k1.block()).lower_module(ir1).source
     # Single-warp shouldn't emit any warp_base offset.
     assert "warp_base" not in src1
-    assert "warp_off" not in src1
+    assert "smem_base" not in src1
 
     # Multi-warp (n_warps=4) should emit per-warp offsets in every
     # FragForEach in the epilogue.
@@ -1370,18 +1370,14 @@ def test_multi_warp_frag_visitors_partition_smem_per_warp():
     if isinstance(ir4, Module):
         legalize(ir4, caps)
     src4 = SpirVLowerer(local_size=k4.block()).lower_module(ir4).source
-    # Per-FragForEach: one ``warp_base`` (smem-base SSA) + one
-    # ``warp_off`` (the AccessChain offset for the OpCooperativeMatrix
-    # StoreKHR base). Each FragForEach call emits both, so the total
-    # count scales with the number of frag visitors.
+    # Per-FragForEach: ``warp_base`` (= ``subgroup_id * n_per_warp``,
+    # the warp's offset into the scratch array) + ``smem_base``
+    # (= ``warp_base + lane_id``, the per-lane base inside the slice).
+    # Both ssa names come from the partition helper.
     assert "warp_base" in src4
-    assert "warp_off" in src4
+    assert "smem_base" in src4
     # SubgroupId BuiltIn must be declared (used for warp partition).
     assert "BuiltIn SubgroupId" in src4
-    # The address-compute layer must add the warp offset to lane_id.
-    # Each frag visitor emits ``smem_base = OpIAdd warp_base lane_id``
-    # once. Floor at 1 (any FragForEach in the lowered output).
-    assert src4.count("smem_base") >= 1
 
 
 @pytest.mark.parametrize(
@@ -1516,3 +1512,15 @@ def test_attn_lowers_on_spv_exercises_full_visitor_surface():
     # FragReduce / FragConvert + cp.async loads. At least 1 must
     # appear; the actual count is much higher (~32 in practice).
     assert src.count("OpControlBarrier") >= 4
+
+    # Multi-warp partition: attn's default config has n_warps =
+    # gqa_ratio * NCW = 2 * 1 = 2, so every Frag* visitor must emit
+    # the per-warp scratch partition (subgroup_id * n_per_warp). The
+    # 36ef967 fix ensures FragApply / FragReduce / FragConvert all
+    # honour the partition — attention's n_warps>1 IS the
+    # exercise-it-end-to-end test for that fix.
+    assert "BuiltIn SubgroupId" in src
+    assert src.count("warp_base") >= 1, (
+        "attn n_warps=2 must emit per-warp smem partition"
+    )
+    assert src.count("smem_base") >= 1
