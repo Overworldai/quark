@@ -51,7 +51,9 @@ from quark.ir.op import (
     ConvertOp,
     ForLoopOp,
     FragApplyOp,
+    FragConvertOp,
     FragForEachOp,
+    FragReduceOp,
     GroupIdOp,
     IfRegionOp,
     LaneIdOp,
@@ -2388,6 +2390,11 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
         ctx.val_to_id[op.body_input_var.id] = elem_id
         ctx.val_to_id[op.body_row_var.id] = row_id
         ctx.val_to_id[op.body_col_var.id] = col_id
+        if op.body_selector_var is not None:
+            slot_to_sel = op.attrs.get("slot_to_selector_idx", ())
+            sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
+            sel_v = op.operands[1 + sel_idx]
+            ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
         saved_stack = ctx.loop_yield_stack
         ctx.loop_yield_stack = []  # type: ignore[assignment]
         try:
@@ -2419,6 +2426,430 @@ def _ensure_lane_id(ctx: _SpvCtx) -> str:
     ctx.text.emit_function(f"{loaded} = OpLoad {u32} {var_id}")
     ctx.lane_id_x_loaded = loaded
     return loaded
+
+
+_FRAG_REDUCE_TO_SUBGROUP_OP: dict[tuple[str, str], str] = {
+    ("add", "float"): "OpGroupNonUniformFAdd",
+    ("add", "uint"): "OpGroupNonUniformIAdd",
+    ("add", "sint"): "OpGroupNonUniformIAdd",
+    ("max", "float"): "OpGroupNonUniformFMax",
+    ("max", "uint"): "OpGroupNonUniformUMax",
+    ("max", "sint"): "OpGroupNonUniformSMax",
+    ("min", "float"): "OpGroupNonUniformFMin",
+    ("min", "uint"): "OpGroupNonUniformUMin",
+    ("min", "sint"): "OpGroupNonUniformSMin",
+    ("mul", "float"): "OpGroupNonUniformFMul",
+    ("mul", "uint"): "OpGroupNonUniformIMul",
+    ("mul", "sint"): "OpGroupNonUniformIMul",
+}
+
+
+def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
+    """``FragReduceOp`` — reduce a coopmat fragment along an axis.
+
+    Smem-roundtrip + subgroup reduce. Stores the input coopmat to a
+    scratch region, each lane reads its slots and forms a partial
+    reduction, then ``OpGroupNonUniform<kind>`` broadcasts the
+    cross-lane reduction so every result lane sees the full scalar.
+
+    Limitation: today only handles the case where the IR's
+    ``cd_offsets`` produces a single row/col class — which matches
+    the Intel placeholder offsets (``((0,0),) * c_regs``). Per-row /
+    per-col reductions on PTX-style multi-class shapes need a smem
+    layout that respects the actual lane↔(row,col) mapping; the
+    coopmat lane mapping is implementation-private on Vulkan, so the
+    cleanest path on multi-class is to derive classes from the
+    smem layout (we wrote row-major) rather than from cd_offsets.
+    Tracked as a follow-up.
+    """
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    _ensure_coopmat_caps(ctx)
+    shape_id = op.attrs["shape_id"]
+    axis = op.attrs["axis"]
+    kind = op.attrs["kind"]
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_frag_reduce: unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+    rows, cols, dtype = _coop_dims_for(shape, "c")
+    cd_offsets = op.attrs["cd_offsets"]
+
+    # Class partition. ``axis="row"`` reduces *cols* (one scalar per
+    # row class); ``axis="col"`` reduces rows (one scalar per col
+    # class). Multi-class is not yet wired — see docstring.
+    if axis == "row":
+        classes = sorted({dr for dr, _ in cd_offsets})
+    else:
+        classes = sorted({dc for _, dc in cd_offsets})
+    if len(classes) != 1:
+        raise NotImplementedError(
+            f"_visit_frag_reduce: multi-class reduction not yet wired "
+            f"(axis={axis!r}, classes={classes})"
+        )
+
+    n_elems = rows * cols
+    subgroup_width = 32
+    if n_elems % subgroup_width != 0:
+        raise NotImplementedError(
+            f"_visit_frag_reduce: tile {rows}×{cols} not divisible "
+            f"by {subgroup_width}"
+        )
+    n_slots_per_lane = n_elems // subgroup_width
+
+    elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    if dtype is DType.BF16:
+        ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+
+    # Scratch smem for the input coopmat.
+    n_const = ctx.text.const_uint(n_elems)
+    arr_id = ctx.text.alloc_id("frag_red_arr")
+    ctx.text.add_type_line(f"{arr_id} = OpTypeArray {elem_type} {n_const}")
+    ptr_arr = ctx.text.type_pointer("Workgroup", arr_id)
+    var_id = ctx.text.alloc_id("frag_red_smem")
+    ctx.text.add_type_line(f"{var_id} = OpVariable {ptr_arr} Workgroup")
+    elem_ptr = ctx.text.type_pointer("Workgroup", elem_type)
+    ctx.smem_allocs[id(op)] = (var_id, elem_type, elem_ptr, n_elems)
+
+    zero = ctx.text.const_uint(0)
+    base_ptr = ctx.text.alloc_id("frag_red_base")
+    ctx.text.emit_function(
+        f"{base_ptr} = OpAccessChain {elem_ptr} {var_id} {zero}"
+    )
+
+    # Store input coopmat to scratch.
+    in_id = ctx.val_to_id[op.operands[0].id]
+    cols_const = ctx.text.const_uint(cols)
+    layout_id = ctx.text.const_uint(0)  # RowMajor
+    ctx.text.emit_function(
+        f"OpCooperativeMatrixStoreKHR {base_ptr} {in_id} "
+        f"{layout_id} {cols_const}"
+    )
+
+    sg_scope = ctx.text.const_uint(3)
+    sg_sem = ctx.text.const_uint(0x8 | 0x100)
+    ctx.text.emit_function(
+        f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
+    )
+
+    u32 = ctx.text.type_int(32, signed=False)
+    lane_id_ssa = _ensure_lane_id(ctx)
+
+    # Per-lane partial reduction across its slots.
+    accum: str | None = None
+    for s in range(n_slots_per_lane):
+        if s == 0:
+            idx_id = lane_id_ssa
+        else:
+            offset = ctx.text.const_uint(s * subgroup_width)
+            idx_id = ctx.text.alloc_id(f"frag_red_idx_{s}")
+            ctx.text.emit_function(
+                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
+            )
+        chain = ctx.text.alloc_id(f"frag_red_chain_{s}")
+        ctx.text.emit_function(
+            f"{chain} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
+        )
+        elem = ctx.text.alloc_id(f"frag_red_elem_{s}")
+        ctx.text.emit_function(
+            f"{elem} = OpLoad {elem_type} {chain}"
+        )
+        if accum is None:
+            accum = elem
+        else:
+            new_accum = ctx.text.alloc_id(f"frag_red_acc_{s}")
+            if kind == "add":
+                spv_op = "OpFAdd" if _dtype_kind(dtype) == "float" else "OpIAdd"
+            elif kind == "mul":
+                spv_op = "OpFMul" if _dtype_kind(dtype) == "float" else "OpIMul"
+            elif kind == "max":
+                glsl = ctx.text.import_ext_inst("GLSL.std.450")
+                if _dtype_kind(dtype) == "float":
+                    instr = "FMax"
+                elif _dtype_kind(dtype) == "sint":
+                    instr = "SMax"
+                else:
+                    instr = "UMax"
+                ctx.text.emit_function(
+                    f"{new_accum} = OpExtInst {elem_type} {glsl} "
+                    f"{instr} {accum} {elem}"
+                )
+                accum = new_accum
+                continue
+            elif kind == "min":
+                glsl = ctx.text.import_ext_inst("GLSL.std.450")
+                if _dtype_kind(dtype) == "float":
+                    instr = "FMin"
+                elif _dtype_kind(dtype) == "sint":
+                    instr = "SMin"
+                else:
+                    instr = "UMin"
+                ctx.text.emit_function(
+                    f"{new_accum} = OpExtInst {elem_type} {glsl} "
+                    f"{instr} {accum} {elem}"
+                )
+                accum = new_accum
+                continue
+            ctx.text.emit_function(
+                f"{new_accum} = {spv_op} {elem_type} {accum} {elem}"
+            )
+            accum = new_accum
+
+    # Cross-lane subgroup reduce. Result is broadcast to all lanes.
+    sub_op = _FRAG_REDUCE_TO_SUBGROUP_OP.get((kind, _dtype_kind(dtype)))
+    if sub_op is None:
+        raise NotImplementedError(
+            f"_visit_frag_reduce: kind={kind!r} dtype={dtype!r} not wired"
+        )
+    # Capability for arithmetic subgroup reduces (FMax/FMin/FAdd/etc.)
+    # — the boolean-only ``GroupNonUniform`` capability isn't enough.
+    ctx.text.add_capability("GroupNonUniformArithmetic")
+    res_id = ctx.text.alloc_id(f"frag_red_{kind}")
+    ctx.val_to_id[op.results[0].id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = {sub_op} {elem_type} {sg_scope} Reduce {accum}"
+    )
+
+
+def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
+    """``FragConvertOp`` — multi-source coopmat → coopmat dtype +
+    layout change. Smem roundtrip with per-slot body transform.
+
+    Used by attention online-softmax: ``kf`` source ACC fragments
+    (f32) merged into one A fragment (bf16) covering ``kf*src_K``
+    cols, optional body applies the per-slot scale/exp transform.
+
+    Layout: source ACCs are use=2 with dim ``M_src × N_src``;
+    destination A frag is use=0 with dim ``M_dst × K_dst`` where
+    ``K_dst = kf * N_src`` (the merge across kf source columns
+    builds the destination K axis).
+    """
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    _ensure_coopmat_caps(ctx)
+    (out,) = op.results
+    shape_id = op.attrs["shape_id"]
+    src_dtype = op.attrs["src_dtype"]
+    dst_dtype = op.attrs["dst_dtype"]
+    num_src = int(op.attrs["num_src_frags"])
+
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_frag_convert: unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+
+    # Source frag dimensions (acc).
+    src_rows, src_cols, _src_dt = _coop_dims_for(shape, "c")
+    # Destination frag dimensions (A): rows=M_dst, cols=kf*src_cols.
+    dst_rows = shape.m
+    dst_cols = num_src * src_cols
+
+    src_elem = _emit_dtype(ctx.text, src_dtype, ctx)
+    dst_elem = _emit_dtype(ctx.text, dst_dtype, ctx)
+    if src_dtype is DType.BF16 or dst_dtype is DType.BF16:
+        ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+
+    # Scratch for sources (one per source frag) + dst.
+    src_n_elems = src_rows * src_cols
+    dst_n_elems = dst_rows * dst_cols
+    subgroup_width = 32
+
+    src_n_const = ctx.text.const_uint(src_n_elems)
+    dst_n_const = ctx.text.const_uint(dst_n_elems)
+
+    src_arr_id = ctx.text.alloc_id("frag_cvt_src_arr")
+    ctx.text.add_type_line(
+        f"{src_arr_id} = OpTypeArray {src_elem} {src_n_const}"
+    )
+    src_ptr_arr = ctx.text.type_pointer("Workgroup", src_arr_id)
+    dst_arr_id = ctx.text.alloc_id("frag_cvt_dst_arr")
+    ctx.text.add_type_line(
+        f"{dst_arr_id} = OpTypeArray {dst_elem} {dst_n_const}"
+    )
+    dst_ptr_arr = ctx.text.type_pointer("Workgroup", dst_arr_id)
+
+    # One scratch var per source frag, plus one for the destination.
+    src_vars: list[str] = []
+    src_elem_ptr = ctx.text.type_pointer("Workgroup", src_elem)
+    dst_elem_ptr = ctx.text.type_pointer("Workgroup", dst_elem)
+    for i in range(num_src):
+        v = ctx.text.alloc_id(f"frag_cvt_src{i}")
+        ctx.text.add_type_line(f"{v} = OpVariable {src_ptr_arr} Workgroup")
+        src_vars.append(v)
+        ctx.smem_allocs[(id(op), "src", i)] = (
+            v, src_elem, src_elem_ptr, src_n_elems,
+        )
+    dst_var = ctx.text.alloc_id("frag_cvt_dst")
+    ctx.text.add_type_line(f"{dst_var} = OpVariable {dst_ptr_arr} Workgroup")
+    ctx.smem_allocs[(id(op), "dst")] = (
+        dst_var, dst_elem, dst_elem_ptr, dst_n_elems,
+    )
+
+    zero = ctx.text.const_uint(0)
+    src_cols_const = ctx.text.const_uint(src_cols)
+    dst_cols_const = ctx.text.const_uint(dst_cols)
+    layout_id = ctx.text.const_uint(0)  # RowMajor
+
+    # Store each source coopmat to its smem.
+    for i in range(num_src):
+        in_id = ctx.val_to_id[op.operands[i].id]
+        base = ctx.text.alloc_id(f"frag_cvt_src{i}_base")
+        ctx.text.emit_function(
+            f"{base} = OpAccessChain {src_elem_ptr} {src_vars[i]} {zero}"
+        )
+        ctx.text.emit_function(
+            f"OpCooperativeMatrixStoreKHR {base} {in_id} "
+            f"{layout_id} {src_cols_const}"
+        )
+
+    sg_scope = ctx.text.const_uint(3)
+    sg_sem = ctx.text.const_uint(0x8 | 0x100)
+    ctx.text.emit_function(
+        f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
+    )
+
+    u32 = ctx.text.type_int(32, signed=False)
+    lane_id_ssa = _ensure_lane_id(ctx)
+
+    # Per-lane: each slot owns one (row, k_col) position in the dst
+    # M×K_dst tile. k_col = src_idx*src_cols + col_within_src.
+    dst_n_slots_per_lane = dst_n_elems // subgroup_width
+    src_n_slots_per_lane = src_n_elems // subgroup_width
+
+    for s in range(dst_n_slots_per_lane):
+        if s == 0:
+            idx_id = lane_id_ssa
+        else:
+            offset = ctx.text.const_uint(s * subgroup_width)
+            idx_id = ctx.text.alloc_id(f"frag_cvt_idx_{s}")
+            ctx.text.emit_function(
+                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
+            )
+        # Determine which source frag this slot pulls from.
+        # idx in dst space: row = idx / dst_cols, col = idx % dst_cols.
+        # src_idx = col / src_cols, col_within_src = col % src_cols.
+        # In smem: src_var[row * src_cols + col_within_src].
+        # Compute via integer div/mod.
+        dst_cols_div = ctx.text.const_uint(dst_cols)
+        src_cols_div = ctx.text.const_uint(src_cols)
+        row_id = ctx.text.alloc_id(f"frag_cvt_row_{s}")
+        ctx.text.emit_function(
+            f"{row_id} = OpUDiv {u32} {idx_id} {dst_cols_div}"
+        )
+        col_id = ctx.text.alloc_id(f"frag_cvt_col_{s}")
+        ctx.text.emit_function(
+            f"{col_id} = OpUMod {u32} {idx_id} {dst_cols_div}"
+        )
+        src_idx_id = ctx.text.alloc_id(f"frag_cvt_srcidx_{s}")
+        ctx.text.emit_function(
+            f"{src_idx_id} = OpUDiv {u32} {col_id} {src_cols_div}"
+        )
+        col_in_src_id = ctx.text.alloc_id(f"frag_cvt_colinsrc_{s}")
+        ctx.text.emit_function(
+            f"{col_in_src_id} = OpUMod {u32} {col_id} {src_cols_div}"
+        )
+        # src_addr = row * src_cols + col_in_src.
+        row_mul = ctx.text.alloc_id(f"frag_cvt_rowmul_{s}")
+        ctx.text.emit_function(
+            f"{row_mul} = OpIMul {u32} {row_id} {src_cols_div}"
+        )
+        src_addr = ctx.text.alloc_id(f"frag_cvt_srcaddr_{s}")
+        ctx.text.emit_function(
+            f"{src_addr} = OpIAdd {u32} {row_mul} {col_in_src_id}"
+        )
+
+        # The source array to read from depends on src_idx_id at
+        # runtime — but since the slot iteration is Python-unrolled,
+        # if num_src > 1 we'd need per-slot dispatch. For now assume
+        # num_src=1 (the common attention path) — emit a direct load
+        # from src_vars[0]. Multi-src needs OpSelect or unrolled
+        # branching, deferred.
+        if num_src != 1:
+            raise NotImplementedError(
+                f"_visit_frag_convert: num_src={num_src} > 1 not yet wired "
+                "(needs per-slot src dispatch)"
+            )
+        chain = ctx.text.alloc_id(f"frag_cvt_chain_{s}")
+        ctx.text.emit_function(
+            f"{chain} = OpAccessChain {src_elem_ptr} {src_vars[0]} {src_addr}"
+        )
+        elem_in = ctx.text.alloc_id(f"frag_cvt_in_{s}")
+        ctx.text.emit_function(
+            f"{elem_in} = OpLoad {src_elem} {chain}"
+        )
+
+        # Walk the body (optional). If no body, the transform is
+        # identity — direct cast from src_dtype to dst_dtype.
+        if op.body is not None:
+            ctx.val_to_id[op.body_input_var.id] = elem_in
+            if op.body_selector_var is not None:
+                slot_to_sel = op.attrs.get("slot_to_selector_idx", ())
+                if s < len(slot_to_sel):
+                    sel_idx = slot_to_sel[s]
+                    sel_v = op.operands[num_src + sel_idx]
+                    ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
+            saved_stack = ctx.loop_yield_stack
+            ctx.loop_yield_stack = []  # type: ignore[assignment]
+            try:
+                for body_op in op.body.ops:
+                    if isinstance(body_op, YieldOp):
+                        continue
+                    _walk_op(body_op, ctx)
+            finally:
+                ctx.loop_yield_stack = saved_stack
+            term = op.body.terminator
+            transformed_id = ctx.val_to_id[term.operands[0].id]
+        else:
+            transformed_id = elem_in
+
+        # Cast to dst_dtype if needed.
+        if src_dtype is not dst_dtype:
+            cast_id = ctx.text.alloc_id(f"frag_cvt_cast_{s}")
+            # FConvert covers float→float across precisions; for
+            # other combos we'd add OpConvert variants.
+            if (_dtype_kind(src_dtype) == "float"
+                    and _dtype_kind(dst_dtype) == "float"):
+                ctx.text.emit_function(
+                    f"{cast_id} = OpFConvert {dst_elem} {transformed_id}"
+                )
+            else:
+                raise NotImplementedError(
+                    f"_visit_frag_convert: cast {src_dtype} → {dst_dtype} "
+                    "not yet wired"
+                )
+            transformed_id = cast_id
+
+        # Store to dst scratch at the same idx.
+        chain_out = ctx.text.alloc_id(f"frag_cvt_out_{s}")
+        ctx.text.emit_function(
+            f"{chain_out} = OpAccessChain {dst_elem_ptr} {dst_var} {idx_id}"
+        )
+        ctx.text.emit_function(
+            f"OpStore {chain_out} {transformed_id}"
+        )
+
+    ctx.text.emit_function(
+        f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
+    )
+
+    # Load dst scratch as the result coopmat (use=0, MatrixA).
+    coop_t = ctx.text.type_coop_matrix(
+        dst_elem, scope=3, rows=dst_rows, cols=dst_cols, use=0,
+    )
+    dst_base = ctx.text.alloc_id("frag_cvt_dst_base")
+    ctx.text.emit_function(
+        f"{dst_base} = OpAccessChain {dst_elem_ptr} {dst_var} {zero}"
+    )
+    res_id = ctx.text.alloc_id("frag_cvt_result")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCooperativeMatrixLoadKHR {coop_t} {dst_base} "
+        f"{layout_id} {dst_cols_const}"
+    )
 
 
 def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
@@ -2532,6 +2963,13 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
         # nested if-with-carries inside the body still works
         # (its visitor pushes its own frame onto the empty stack).
         ctx.val_to_id[op.body_input_var.id] = elem_in
+        # Bind selector if present — slot_to_selector_idx maps each
+        # slot to one of the ``selectors`` operands.
+        if op.body_selector_var is not None:
+            slot_to_sel = op.attrs.get("slot_to_selector_idx", ())
+            sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
+            sel_v = op.operands[1 + sel_idx]
+            ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
         saved_stack = ctx.loop_yield_stack
         ctx.loop_yield_stack = []  # type: ignore[assignment]
         try:
@@ -2600,7 +3038,26 @@ def _visit_mma(op: MmaOp, ctx: _SpvCtx) -> None:
     # Operand layout: (a_frag, b_frag, c_frag)
     a_id = ctx.val_to_id[op.operands[0].id]
     b_id = ctx.val_to_id[op.operands[1].id]
-    c_id = ctx.val_to_id[op.operands[2].id]
+    c_v = op.operands[2]
+    c_id = ctx.val_to_id[c_v.id]
+    # If C isn't already a coopmat (e.g. it's the kernel's
+    # ``vec_build([zero_f] * N)`` init for a non-loop-carried MMA),
+    # splat-convert it to the accumulator coopmat type. The
+    # ``OpCompositeConstruct CoopMat scalar`` idiom fills the matrix
+    # with the scalar — exactly what's needed for an all-same init.
+    c_producer = c_v.producer
+    if isinstance(c_producer, VecBuildOp):
+        elem_dtype = c_v.dtype
+        scalar_t = _emit_dtype(ctx.text, elem_dtype, ctx)
+        scalar_id = ctx.text.alloc_id("coop_mma_c_splat")
+        ctx.text.emit_function(
+            f"{scalar_id} = OpCompositeExtract {scalar_t} {c_id} 0"
+        )
+        new_c = ctx.text.alloc_id("coop_mma_c_init")
+        ctx.text.emit_function(
+            f"{new_c} = OpCompositeConstruct {coop_t} {scalar_id}"
+        )
+        c_id = new_c
 
     res_id = ctx.text.alloc_id("coop_mma")
     ctx.val_to_id[out.id] = res_id
@@ -2635,6 +3092,8 @@ _DISPATCH: dict[type, Any] = {
     MmaOp: _visit_mma,
     FragForEachOp: _visit_frag_for_each,
     FragApplyOp: _visit_frag_apply,
+    FragConvertOp: _visit_frag_convert,
+    FragReduceOp: _visit_frag_reduce,
     VecLoadOp: _visit_vec_load,
     VecStoreOp: _visit_vec_store,
     VecBuildOp: _visit_vec_build,
