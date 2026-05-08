@@ -520,11 +520,14 @@ _BF16_M32N32K16_NAX = MmaConfig(
 # ---------------------------------------------------------------------------
 
 # Placeholder per-register layout for Intel SPIR-V coopmat shapes. The
-# SPIR-V lowerer never consults this — the KHR cooperative_matrix
+# SPIR-V lowerer never consults these — the KHR cooperative_matrix
 # mapping is driver-private; per-element access uses
-# ``OpCooperativeMatrixLengthKHR`` indexing. Filled in with the same
-# byte pattern across all Intel shapes for consistency.
-_INTEL_PLACEHOLDER_OFFSETS = ((0, 0),)
+# ``OpCooperativeMatrixLengthKHR`` indexing. The IR validator
+# (``_validate_reg_offsets``) requires ``len(offsets) == fragment
+# width`` though, so the placeholders are sized to match the
+# corresponding ``MmaShape.{a,b,c}_regs`` field for each shape.
+def _intel_offsets(n: int) -> tuple[tuple[int, int], ...]:
+    return ((0, 0),) * n
 
 _BF16_M8N16K16_INTEL_F32 = MmaConfig(
     shape=MmaShape(
@@ -543,9 +546,9 @@ _BF16_M8N16K16_INTEL_F32 = MmaConfig(
         b_regs=8,  # 16n × 16k bf16 / 32 lanes = 8 elements/lane
         c_regs=4,  # 8m × 16n f32 / 32 lanes = 4 elements/lane
     ),
-    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    a_offsets=_intel_offsets(4),
+    b_offsets=_intel_offsets(8),
+    cd_offsets=_intel_offsets(4),
     lane_col_step=2,  # bf16 in b32 carrier
     min_cuda_cc=None,
     cuda=None,
@@ -568,9 +571,9 @@ _BF16_M8N16K16_INTEL_BF16 = MmaConfig(
         b_regs=8,
         c_regs=4,  # 8m × 16n bf16 / 32 lanes = 4 elements/lane
     ),
-    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    a_offsets=_intel_offsets(4),
+    b_offsets=_intel_offsets(8),
+    cd_offsets=_intel_offsets(4),
     lane_col_step=2,
     min_cuda_cc=None,
     cuda=None,
@@ -593,9 +596,9 @@ _F16_M8N16K16_INTEL_F32 = MmaConfig(
         b_regs=8,
         c_regs=4,
     ),
-    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    a_offsets=_intel_offsets(4),
+    b_offsets=_intel_offsets(8),
+    cd_offsets=_intel_offsets(4),
     lane_col_step=2,
     min_cuda_cc=None,
     cuda=None,
@@ -618,9 +621,9 @@ _F16_M8N16K16_INTEL_F16 = MmaConfig(
         b_regs=8,
         c_regs=4,
     ),
-    a_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    b_offsets=_INTEL_PLACEHOLDER_OFFSETS,
-    cd_offsets=_INTEL_PLACEHOLDER_OFFSETS,
+    a_offsets=_intel_offsets(4),
+    b_offsets=_intel_offsets(8),
+    cd_offsets=_intel_offsets(4),
     lane_col_step=2,
     min_cuda_cc=None,
     cuda=None,
