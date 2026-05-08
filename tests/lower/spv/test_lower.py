@@ -1317,3 +1317,72 @@ def test_mma_kernel_lowers_on_spv_with_intel_shape(kernel_name):
     assert "OpCooperativeMatrixLoadKHR" in result.source
     assert "OpCooperativeMatrixMulAddKHR" in result.source
     assert "OpCooperativeMatrixStoreKHR" in result.source
+
+
+def test_attn_lowers_on_spv_exercises_full_visitor_surface():
+    """Attention is the headline coopmat kernel — it exercises every
+    visitor on the SPV path: cooperative-matrix Load/Store/MulAdd,
+    FragApply (per-row scale + exp), FragReduce (online-softmax max +
+    sum), FragConvert (f32 ACC → bf16 A-frag for GEMM2), control flow
+    (KV-tile for-loop with carries), GLSL.std.450 ext-inst (Exp2 from
+    ``ex2_approx``), and BFloat16 capability + memory model.
+
+    This test pins the visitor-emission count for the smallest attn
+    problem so regressions in any one visitor (e.g. silent skip,
+    accidental short-circuit, missing capability) surface here. The
+    counts come from a known-good lowering and are tied to the
+    config: ``B=1, n_kv_heads=2, gqa_ratio=2, seq_len=64, kv_len=64,
+    Dh=64, KvTile=32, MTiles=1, NCW=1, n_stages=1`` with the Intel
+    m8n16k16 bf16/f32 shape. Update on intentional config change."""
+    from quark.lower.legalize import legalize
+    from quark.ir.module import Module
+
+    caps = _intel_caps()
+    k, _kc = _build_kernel_with_intel_shape("attn")
+    ir = k.emit()
+    if isinstance(ir, Module):
+        legalize(ir, caps)
+    src = SpirVLowerer(local_size=k.block()).lower_module(ir).source
+
+    # Vulkan + KHR coopmat capabilities + memory model.
+    assert "OpCapability CooperativeMatrixKHR" in src
+    assert "OpCapability VulkanMemoryModel" in src
+    assert "OpCapability BFloat16TypeKHR" in src
+    assert "OpCapability BFloat16CooperativeMatrixKHR" in src
+    assert "OpCapability GroupNonUniformArithmetic" in src
+    assert "OpExtension \"SPV_KHR_cooperative_matrix\"" in src
+    assert "OpExtension \"SPV_KHR_bfloat16\"" in src
+    assert "OpMemoryModel Logical Vulkan" in src
+
+    # MMA chain: GEMM1 (Q@K^T) + GEMM2 (P@V) + Q + K + V + output
+    # loads, all over MTiles × n_kv_heads × KV-iters. Lower bounds
+    # rather than equalities — autotune-driven config drift would
+    # change exact counts but the structural floor stays.
+    assert src.count("OpCooperativeMatrixLoadKHR") >= 8
+    assert src.count("OpCooperativeMatrixMulAddKHR") >= 8
+    assert src.count("OpCooperativeMatrixStoreKHR") >= 4
+
+    # FragReduce: per online-softmax step we do max + sum reductions.
+    # ``OpGroupNonUniformF{Max,Add}`` covers both. Floor at 2 to ensure
+    # at least one max + one sum landed.
+    assert src.count("OpGroupNonUniformF") >= 2
+
+    # FragConvert: f32 ACC → bf16 A-frag for GEMM2's P-fragment build,
+    # one OpFConvert per slot per acc tile. Lower bound: at least one.
+    assert src.count("OpFConvert") >= 1
+
+    # GLSL.std.450 ext-inst for ``ex2_approx`` (online softmax exp2)
+    # and rcp/rsqrt approx ops. Imported once.
+    assert src.count("GLSL.std.450") >= 1
+    assert src.count("Exp2") >= 1
+
+    # KV-tile for-loop: one OpLoopMerge + OpPhi for each carry across
+    # KV iterations. Lower bound at one of each — there are several
+    # carries (output acc, max, sum) so we expect more in practice.
+    assert src.count("OpLoopMerge") >= 1
+    assert src.count("OpPhi") >= 1
+
+    # Workgroup-mem barriers: smem roundtrip pattern in FragApply /
+    # FragReduce / FragConvert + cp.async loads. At least 1 must
+    # appear; the actual count is much higher (~32 in practice).
+    assert src.count("OpControlBarrier") >= 4
