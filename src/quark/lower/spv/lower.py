@@ -1917,29 +1917,176 @@ def _visit_vec_extract(op: VecExtractOp, ctx: _SpvCtx) -> None:
 #     opaque lane-local storage automatically.
 
 
-def _visit_load_matrix(op: LoadMatrixOp, ctx: _SpvCtx) -> None:
+def _ensure_coopmat_caps(ctx: _SpvCtx) -> None:
+    """Lazy-declare the ``CooperativeMatrixKHR`` capability +
+    ``SPV_KHR_cooperative_matrix`` extension. Idempotent — repeated
+    calls fold into the dedup'd capability list."""
+    ctx.text.add_capability("CooperativeMatrixKHR")
+    ctx.text.add_extension("SPV_KHR_cooperative_matrix")
+
+
+# IR ``which`` (a/b/c) → SPIR-V Use index. ``c`` and ``d`` both map to
+# the Accumulator slot (the IR distinguishes load (c) from store (d)
+# but coopmat doesn't — same register class).
+_COOPMAT_USE = {"a": 0, "b": 1, "c": 2, "d": 2}
+
+
+def _coop_dims_for(shape, which: str) -> tuple[int, int, "DType"]:
+    """Return (rows, cols, dtype) for the coop-matrix tile of the
+    given operand role within an ``MmaShape``."""
+    if which == "a":
+        return shape.m, shape.k, shape.a_dtype
+    if which == "b":
+        return shape.k, shape.n, shape.b_dtype
+    return shape.m, shape.n, shape.acc_dtype
+
+
+def _emit_matrix_pointer(
+    tensor, row_id: str, col_id: str, ctx: _SpvCtx,
+) -> tuple[str, str]:
+    """Build an ``OpAccessChain`` pointer to the (row, col) tile origin
+    in ``tensor`` and return ``(pointer_id, storage_class)``.
+
+    Used by both ``LoadMatrixOp`` and ``StoreMatrixOp`` — the
+    coopmat ops consume a Pointer to the start of the matrix data
+    plus a stride, and produce / consume an opaque coopmat value.
+    """
+    # Build a flat row-major offset from (row, col) using the tensor's
+    # declared shape. Both inputs are u32 SSA ids.
+    u32 = ctx.text.type_int(32, signed=False)
+    # row * stride_elems + col
+    stride_const = ctx.text.const_uint(tensor.shape[-1])
+    row_mul = ctx.text.alloc_id("coop_row_mul")
+    ctx.text.emit_function(
+        f"{row_mul} = OpIMul {u32} {row_id} {stride_const}"
+    )
+    flat = ctx.text.alloc_id("coop_flat")
+    ctx.text.emit_function(f"{flat} = OpIAdd {u32} {row_mul} {col_id}")
+
+    if isinstance(tensor, GlobalTensor):
+        binding = ctx.tensor_to_binding[id(tensor)]
+        var_id, elem_ptr = _ensure_buffer_var(tensor, binding, ctx)
+        zero = ctx.text.const_uint(0)
+        chain_id = ctx.text.alloc_id("coop_chain")
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {zero} {flat}"
+        )
+        return chain_id, "StorageBuffer"
+    if isinstance(tensor, SharedRegion):
+        rec = ctx.smem_allocs.get(tensor.alloc.id)
+        if rec is None:
+            raise RuntimeError(
+                f"_emit_matrix_pointer: SharedRegion {tensor.name!r} accessed "
+                "before its SmemAllocOp"
+            )
+        var_id, _elem_type, elem_ptr, _n = rec
+        chain_id = ctx.text.alloc_id("coop_smem_chain")
+        ctx.text.emit_function(
+            f"{chain_id} = OpAccessChain {elem_ptr} {var_id} {flat}"
+        )
+        return chain_id, "Workgroup"
     raise NotImplementedError(
-        "_visit_load_matrix: cooperative-matrix lowering not yet wired "
-        "(SPV §3.3 / v2 of PORTABILITY_PLAN). Battlemage caps already "
-        "advertise the four m8n16k16 shapes; the path needs "
-        "OpTypeCooperativeMatrixKHR + OpCooperativeMatrixLoadKHR with "
-        "Subgroup scope and a buffer-pointer + stride argument."
+        f"_emit_matrix_pointer: tensor type {type(tensor).__name__} not wired"
+    )
+
+
+def _visit_load_matrix(op: LoadMatrixOp, ctx: _SpvCtx) -> None:
+    """``LoadMatrixOp`` → ``OpCooperativeMatrixLoadKHR``.
+
+    Emits the cooperative matrix type for the (which, shape) pair,
+    builds an ``OpAccessChain`` pointer to the (row, col) tile origin,
+    and loads the tile in row-major layout with element-unit stride
+    equal to the tensor's last-dim size.
+    """
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    _ensure_coopmat_caps(ctx)
+    (out,) = op.results
+    tensor = op.attrs["src_tensor"]
+    shape_id = op.attrs["shape_id"]
+    which = op.attrs["which"]
+
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_load_matrix: unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+    rows, cols, dtype = _coop_dims_for(shape, which)
+    use = _COOPMAT_USE[which]
+
+    elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    coop_t = ctx.text.type_coop_matrix(
+        elem_type, scope=3, rows=rows, cols=cols, use=use,
+    )
+
+    row_id = ctx.val_to_id[op.operands[0].id]
+    col_id = ctx.val_to_id[op.operands[1].id]
+    ptr_id, _storage_class = _emit_matrix_pointer(tensor, row_id, col_id, ctx)
+
+    # Stride in elements between consecutive tile rows. For row-major
+    # tile loads from a 2D tensor with shape (R, C), the stride is C
+    # (the last-dim size).
+    stride_id = ctx.text.const_uint(tensor.shape[-1])
+    layout_id = ctx.text.const_uint(0)  # CooperativeMatrixLayoutRowMajorKHR
+
+    res_id = ctx.text.alloc_id(f"coop_load_{which}")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCooperativeMatrixLoadKHR {coop_t} {ptr_id} "
+        f"{layout_id} {stride_id}"
     )
 
 
 def _visit_store_matrix(op: StoreMatrixOp, ctx: _SpvCtx) -> None:
-    raise NotImplementedError(
-        "_visit_store_matrix: cooperative-matrix lowering not yet wired "
-        "(SPV §3.3 / v2). Mirror of _visit_load_matrix; emits "
-        "OpCooperativeMatrixStoreKHR."
+    """``StoreMatrixOp`` → ``OpCooperativeMatrixStoreKHR``. Mirror of
+    the load path; consumes a coopmat SSA and writes back."""
+    _ensure_coopmat_caps(ctx)
+    tensor = op.attrs["dst_tensor"]
+    # operand layout: (frag, row, col)
+    frag_v = op.operands[0]
+    frag_id = ctx.val_to_id[frag_v.id]
+    row_id = ctx.val_to_id[op.operands[1].id]
+    col_id = ctx.val_to_id[op.operands[2].id]
+    ptr_id, _storage_class = _emit_matrix_pointer(tensor, row_id, col_id, ctx)
+    stride_id = ctx.text.const_uint(tensor.shape[-1])
+    layout_id = ctx.text.const_uint(0)
+    ctx.text.emit_function(
+        f"OpCooperativeMatrixStoreKHR {ptr_id} {frag_id} "
+        f"{layout_id} {stride_id}"
     )
 
 
 def _visit_mma(op: MmaOp, ctx: _SpvCtx) -> None:
-    raise NotImplementedError(
-        "_visit_mma: cooperative-matrix MulAdd not yet wired (SPV §3.3 "
-        "/ v2). Emit OpCooperativeMatrixMulAddKHR A B C with operands "
-        "=0 (AccumulationModeNone)."
+    """``MmaOp`` → ``OpCooperativeMatrixMulAddKHR``. ``D = A * B + C``."""
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    _ensure_coopmat_caps(ctx)
+    (out,) = op.results
+    shape_id = op.attrs["shape_id"]
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_mma: unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+    # Result is the accumulator (use=2) shape with acc_dtype.
+    rows, cols, dtype = _coop_dims_for(shape, "c")
+    elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    coop_t = ctx.text.type_coop_matrix(
+        elem_type, scope=3, rows=rows, cols=cols, use=2,
+    )
+
+    # Operand layout: (a_frag, b_frag, c_frag)
+    a_id = ctx.val_to_id[op.operands[0].id]
+    b_id = ctx.val_to_id[op.operands[1].id]
+    c_id = ctx.val_to_id[op.operands[2].id]
+
+    res_id = ctx.text.alloc_id("coop_mma")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCooperativeMatrixMulAddKHR {coop_t} "
+        f"{a_id} {b_id} {c_id}"
     )
 
 
@@ -2147,6 +2294,18 @@ class SpirVLowerer:
         def walk(ops):
             for op in ops:
                 if isinstance(op, (LoadOp, StoreOp, VecLoadOp, VecStoreOp)):
+                    t = op.attrs.get("tensor")
+                    if isinstance(t, GlobalTensor):
+                        consider(t)
+                if isinstance(op, LoadMatrixOp):
+                    t = op.attrs.get("src_tensor")
+                    if isinstance(t, GlobalTensor):
+                        consider(t)
+                if isinstance(op, StoreMatrixOp):
+                    t = op.attrs.get("dst_tensor")
+                    if isinstance(t, GlobalTensor):
+                        consider(t)
+                if isinstance(op, AtomicRmwOp):
                     t = op.attrs.get("tensor")
                     if isinstance(t, GlobalTensor):
                         consider(t)

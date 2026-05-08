@@ -804,6 +804,94 @@ def test_cmp_select_runs_end_to_end(driver):
     np.testing.assert_allclose(got, expected, rtol=0, atol=0)
 
 
+def _build_coopmat_mma_ir():
+    """Synthetic m8n16k16 bf16→f32 MMA: ``D = A @ B + C`` on three
+    ``GlobalTensor`` buffers in row-major.
+
+    A is ``[8, 16] bf16``, B is ``[16, 16] bf16``, C/D is ``[8, 16] f32``.
+    Single-workgroup, single-MMA shape — proves the
+    ``LoadMatrixOp`` / ``MmaOp`` / ``StoreMatrixOp`` visitor chain
+    emits valid SPIR-V (i.e. spirv-as accepts the output)."""
+    from quark.ir.module import MmaShape
+
+    SHAPE_NAME = "m8n16k16_intel_bf16_f32"
+    b = Builder("coopmat_mma")
+    fn = b.begin_function("coopmat_mma")
+    b.param("A", BufferType(DType.BF16))
+    b.param("B", BufferType(DType.BF16))
+    b.param("C", BufferType(DType.F32))
+    b.param("D", BufferType(DType.F32))
+
+    g_a = GlobalTensor(dtype=DType.BF16, shape=(8, 16), stride=(16, 1),
+                       name="A", param=fn.params[0])
+    g_b = GlobalTensor(dtype=DType.BF16, shape=(16, 16), stride=(16, 1),
+                       name="B", param=fn.params[1])
+    g_c = GlobalTensor(dtype=DType.F32, shape=(8, 16), stride=(16, 1),
+                       name="C", param=fn.params[2])
+    g_d = GlobalTensor(dtype=DType.F32, shape=(8, 16), stride=(16, 1),
+                       name="D", param=fn.params[3])
+
+    # Register the Intel m8n16k16 shape for this kernel module so
+    # ``load_matrix`` finds it.
+    b.register_shape(
+        MmaShape(
+            name=SHAPE_NAME,
+            m=8, n=16, k=16,
+            a_dtype=DType.BF16,
+            b_dtype=DType.BF16,
+            acc_dtype=DType.F32,
+            a_regs=4, b_regs=8, c_regs=4,
+        ),
+    )
+
+    zero = b.const(DType.U32, 0)
+    a_frag = b.load_matrix(g_a, SHAPE_NAME, which="a", row=zero, col=zero)
+    b_frag = b.load_matrix(g_b, SHAPE_NAME, which="b", row=zero, col=zero)
+    c_frag = b.load_matrix(g_c, SHAPE_NAME, which="c", row=zero, col=zero)
+    d_frag = b.mma(SHAPE_NAME, a_frag, b_frag, c_frag)
+    b.store_matrix(g_d, d_frag, SHAPE_NAME, which="d", row=zero, col=zero)
+    b.end_function()
+    return b.module
+
+
+class TestCoopMatTextEmit:
+    """Tier 1 — the cooperative-matrix visitor surface emits the
+    expected SPIR-V opcodes regardless of Vulkan availability."""
+
+    def test_emits_coopmat_skeleton(self):
+        result = SpirVLowerer(local_size=(32, 1, 1)).lower_module(
+            _build_coopmat_mma_ir()
+        )
+        src = result.source
+        assert "OpCapability CooperativeMatrixKHR" in src
+        assert "OpExtension \"SPV_KHR_cooperative_matrix\"" in src
+        assert "OpTypeCooperativeMatrixKHR" in src
+        assert "OpCooperativeMatrixLoadKHR" in src
+        assert "OpCooperativeMatrixStoreKHR" in src
+        assert "OpCooperativeMatrixMulAddKHR" in src
+
+
+@pytestmark_e2e
+def test_coopmat_mma_assembles(driver):
+    """End-to-end through ``spirv-as``: build the synthetic m8n16k16
+    MMA IR, lower, assemble. Doesn't dispatch (the kernel uses
+    coordinates wired for a single workgroup at row=col=0; running
+    it requires the host-side dispatch grid + descriptor wiring the
+    smoke tests already cover).
+
+    Acceptance gate: ``spirv-as --target-env vulkan1.4`` accepts the
+    text output. Catches type-id mismatches and the
+    ``OpCooperativeMatrix*KHR`` operand orderings without needing a
+    GEMM kernel that lowers all the way through the launcher."""
+    from quark.lower.spv import text_to_binary
+
+    result = SpirVLowerer(local_size=(32, 1, 1)).lower_module(
+        _build_coopmat_mma_ir()
+    )
+    binary = text_to_binary(result.source)
+    assert len(binary) > 0
+
+
 @pytestmark_e2e
 def test_for_loop_window_sum_end_to_end(driver):
     """Sliding-window sum exercising both iv-derived loads AND a carry.
