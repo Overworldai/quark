@@ -355,9 +355,15 @@ class AttnKernel(Kernel):
         softmax = OnlineSoftmax(s_acc=s_acc, o_acc=o_acc, scale=1.0 / math.sqrt(Dh))
         mma2 = MmaBody(acc=o_acc)
 
-        # Row classes per m-tile = distinct dr values in cd_offsets.
-        # m16n8 → 2 (dr ∈ {0, 8}); m8n8k8 → 1 (dr ∈ {0}).
-        n_rc = len({dr for dr, _ in mma_cfg.cd_offsets})
+        # Row classes per m-tile:
+        #   - PTX m16n8 → 2 (dr ∈ {0, 8}); m8n8k8 → 1 (dr ∈ {0})
+        #   - Intel SPV → ``shape.m`` (full per-row, derived from smem
+        #     layout — see ``online_softmax_block`` ``is_intel_spv``)
+        is_intel_spv = "_intel_" in mma_cfg.shape_id
+        n_rc = (
+            mma_cfg.shape.m if is_intel_spv
+            else len({dr for dr, _ in mma_cfg.cd_offsets})
+        )
         n_ml = MTiles * n_rc
 
         # Typed carry: O is a vec-accumulator grid; m / l are per-(mt, rc)

@@ -119,20 +119,6 @@ def _problem_dtypes(problem_params: dict) -> set:
     return dtypes
 
 
-# Kernels with documented numerical-correctness limitations on the SPV
-# backend that should xfail rather than hard-fail in smoke. Today the
-# only entry is ``attn``: the online-softmax row-max and row-sum
-# reductions need per-row results, but Intel KHR cooperative_matrix
-# has an implementation-private lane↔(row, col) mapping that can't be
-# expressed through the per-c_reg ``cd_offsets`` convention PTX/Apple
-# share. The ``_visit_frag_reduce`` docstring tracks the path to a
-# fix (NV2 vendor extension on Mesa, OR breaking the cd_offsets-↔-
-# c_regs coupling at the IR layer); until one lands, attn output
-# drifts ~0.16 from the f32 numpy reference (single-class softmax
-# normalisation collapses rows that aren't the global max's row).
-_SPV_KNOWN_NUMERICAL_LIMITS = frozenset({"attn"})
-
-
 @pytestmark_e2e
 @pytest.mark.parametrize(
     "kernel_cls",
@@ -142,11 +128,6 @@ _SPV_KNOWN_NUMERICAL_LIMITS = frozenset({"attn"})
 def test_spv_kernel_smoke(kernel_cls):
     """One problem × default config × correctness vs reference, on SPV."""
     name = _kernel_id(kernel_cls)
-    if name in _SPV_KNOWN_NUMERICAL_LIMITS:
-        pytest.xfail(
-            f"{name}: documented per-row reduce limitation on Intel "
-            f"KHR coopmat — see _visit_frag_reduce docstring"
-        )
     problems = kernel_cls.problems()
     if not problems:
         pytest.skip(f"{name}: no problems declared")

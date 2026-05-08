@@ -1258,14 +1258,20 @@ class Builder:
             raise KeyError(f"frag_apply: shape {shape_id!r} not registered")
         selectors = tuple(selectors)
         if selectors:
-            if slot_to_selector_idx is None:
-                raise ValueError("frag_apply: selectors= given without slot_to_selector_idx")
-            n_slots = shape.c_regs
-            if len(slot_to_selector_idx) != n_slots:
-                raise ValueError(
-                    f"frag_apply: slot_to_selector_idx length {len(slot_to_selector_idx)} "
-                    f"≠ shape.c_regs {n_slots}"
-                )
+            # ``slot_to_selector_idx=None`` opts into dynamic-row-dispatch
+            # mode: the lowerer computes the row from the smem slot index
+            # at runtime and OpSelect-chains the right selector. Used by
+            # the SPV/Intel coopmat path where the lane↔(r,c) mapping is
+            # implementation-private — no compile-time per-c_reg
+            # selector index is recoverable. In dynamic mode, selectors
+            # must be ``rows``-many (one per matrix row).
+            if slot_to_selector_idx is not None:
+                n_slots = shape.c_regs
+                if len(slot_to_selector_idx) != n_slots:
+                    raise ValueError(
+                        f"frag_apply: slot_to_selector_idx length {len(slot_to_selector_idx)} "
+                        f"≠ shape.c_regs {n_slots}"
+                    )
 
         # The body sees the per-slot scalar element as a fresh Value.
         # Lower time binds this Value to a different per-slot scalar name
@@ -1299,9 +1305,9 @@ class Builder:
 
         out = self._fresh(frag.shape, name or "frag_apply")
         attrs: dict = {"shape_id": shape_id}
-        if selectors:
-            assert slot_to_selector_idx is not None
+        if selectors and slot_to_selector_idx is not None:
             attrs["slot_to_selector_idx"] = tuple(slot_to_selector_idx)
+        # else: dynamic-row-dispatch mode — slot_to_selector_idx absent.
         op = _op.FragApplyOp(
             results=(out,),
             operands=(frag, *selectors),
@@ -1556,6 +1562,7 @@ class Builder:
         kind: str,
         axis: str,
         cd_offsets: tuple[tuple[int, int], ...],
+        n_classes_override: int | None = None,
         name: str = "",
     ) -> tuple[Value, ...]:
         """Reduce an accumulator fragment along one axis.
@@ -1574,6 +1581,13 @@ class Builder:
         order of the class indices (so for cd_offsets ``((0,0),(0,1),
         (8,0),(8,1))`` with axis=row, ``result[0]`` is the row class
         dr=0 reduction and ``result[1]`` is dr=8).
+
+        ``n_classes_override`` lets a backend with an implementation-
+        private lane mapping (Intel KHR coopmat) ask for ``rows`` (or
+        ``cols``) results without fitting through the per-c_reg
+        ``cd_offsets`` convention. Set this to ``shape.m`` (axis=row)
+        on the SPV/Intel path; the lowerer derives row classes from
+        the smem layout instead of cd_offsets.
         """
         if frag.dtype is not DType.F32:
             raise TypeError(f"frag_reduce: frag must be f32 accumulator (got {frag.dtype})")
@@ -1587,19 +1601,25 @@ class Builder:
         else:
             raise ValueError(f"frag_reduce: axis must be 'row'|'col' (got {axis!r})")
 
-        results = tuple(
-            self._fresh(ValueShape(frag.dtype), name or f"frag_red{i}") for i in range(len(classes))
+        n_results = (
+            int(n_classes_override) if n_classes_override is not None else len(classes)
         )
+        results = tuple(
+            self._fresh(ValueShape(frag.dtype), name or f"frag_red{i}") for i in range(n_results)
+        )
+        attrs: dict = {
+            "shape_id": shape_id,
+            "axis": axis,
+            "kind": kind,
+            "cd_offsets": cd_offsets,
+        }
+        if n_classes_override is not None:
+            attrs["n_classes_override"] = int(n_classes_override)
         self._emit(
             _op.FragReduceOp(
                 results=results,
                 operands=(frag,),
-                attrs={
-                    "shape_id": shape_id,
-                    "axis": axis,
-                    "kind": kind,
-                    "cd_offsets": cd_offsets,
-                },
+                attrs=attrs,
             )
         )
         return results

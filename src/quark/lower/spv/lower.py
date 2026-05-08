@@ -2593,18 +2593,25 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
     shape = cfg.shape
     rows, cols, dtype = _coop_dims_for(shape, "c")
     cd_offsets = op.attrs["cd_offsets"]
+    n_classes_override = op.attrs.get("n_classes_override")
 
     # Class partition. ``axis="row"`` reduces *cols* (one scalar per
     # row class); ``axis="col"`` reduces rows (one scalar per col
-    # class). Multi-class is not yet wired — see docstring.
-    if axis == "row":
-        classes = sorted({dr for dr, _ in cd_offsets})
+    # class). ``n_classes_override`` (set on the SPV/Intel path) asks
+    # for ``rows`` results derived from the smem layout instead of
+    # cd_offsets — single source of truth for the result count.
+    if n_classes_override is not None:
+        n_results = int(n_classes_override)
     else:
-        classes = sorted({dc for _, dc in cd_offsets})
-    if len(classes) != 1:
+        if axis == "row":
+            classes = sorted({dr for dr, _ in cd_offsets})
+        else:
+            classes = sorted({dc for _, dc in cd_offsets})
+        n_results = len(classes)
+    if n_results > 1 and axis != "row":
         raise NotImplementedError(
-            f"_visit_frag_reduce: multi-class reduction not yet wired "
-            f"(axis={axis!r}, classes={classes})"
+            f"_visit_frag_reduce: multi-class reduction only wired for "
+            f"axis=row today (got axis={axis!r}, n_results={n_results})"
         )
 
     n_elems = rows * cols
@@ -2659,8 +2666,102 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
 
     u32 = ctx.text.type_int(32, signed=False)
 
-    # Per-lane partial reduction across its slots (smem-relative).
-    accum: str | None = None
+    sub_op = _FRAG_REDUCE_TO_SUBGROUP_OP.get((kind, _dtype_kind(dtype)))
+    if sub_op is None:
+        raise NotImplementedError(
+            f"_visit_frag_reduce: kind={kind!r} dtype={dtype!r} not wired"
+        )
+    # Capability for arithmetic subgroup reduces (FMax/FMin/FAdd/etc.)
+    # — the boolean-only ``GroupNonUniform`` capability isn't enough.
+    ctx.text.add_capability("GroupNonUniformArithmetic")
+
+    if n_results == 1:
+        # ── Single-class path: per-lane fold across slots, then a
+        # cross-lane reduce broadcasting the result to every lane.
+        accum: str | None = None
+        for s in range(n_slots_per_lane):
+            idx_id = _frag_scratch_slot_idx(
+                ctx, base_ssa=smem_base_ssa, s=s,
+                subgroup_width=subgroup_width, name_prefix="frag_red",
+            )
+            chain = ctx.text.alloc_id(f"frag_red_chain_{s}")
+            ctx.text.emit_function(
+                f"{chain} = OpAccessChain {elem_ptr} {var_id} {idx_id}"
+            )
+            elem = ctx.text.alloc_id(f"frag_red_elem_{s}")
+            ctx.text.emit_function(
+                f"{elem} = OpLoad {elem_type} {chain}"
+            )
+            if accum is None:
+                accum = elem
+                continue
+            new_accum = ctx.text.alloc_id(f"frag_red_acc_{s}")
+            if kind == "add":
+                spv_op = "OpFAdd" if _dtype_kind(dtype) == "float" else "OpIAdd"
+                ctx.text.emit_function(
+                    f"{new_accum} = {spv_op} {elem_type} {accum} {elem}"
+                )
+            elif kind == "mul":
+                spv_op = "OpFMul" if _dtype_kind(dtype) == "float" else "OpIMul"
+                ctx.text.emit_function(
+                    f"{new_accum} = {spv_op} {elem_type} {accum} {elem}"
+                )
+            elif kind in ("max", "min"):
+                glsl = ctx.text.import_ext_inst("GLSL.std.450")
+                instr = (
+                    ("FMax" if kind == "max" else "FMin")
+                    if _dtype_kind(dtype) == "float"
+                    else (("SMax" if kind == "max" else "SMin")
+                          if _dtype_kind(dtype) == "sint"
+                          else ("UMax" if kind == "max" else "UMin"))
+                )
+                ctx.text.emit_function(
+                    f"{new_accum} = OpExtInst {elem_type} {glsl} "
+                    f"{instr} {accum} {elem}"
+                )
+            accum = new_accum
+
+        res_id = ctx.text.alloc_id(f"frag_red_{kind}")
+        ctx.val_to_id[op.results[0].id] = res_id
+        ctx.text.emit_function(
+            f"{res_id} = {sub_op} {elem_type} {sg_scope} Reduce {accum}"
+        )
+        return
+
+    # ── Multi-class path (axis=row, n_results > 1).
+    #
+    # Smem layout after ``OpCooperativeMatrixStoreKHR`` row-major:
+    # ``scratch[r * cols + c] = M[r, c]``. Per-lane reads use
+    # ``smem_idx = warp_off + lane_id + s * 32``, so for each fixed
+    # slot ``s`` and the standard ``cols == 16`` Intel layout:
+    #
+    #   lanes 0..15  cover M[2*s,     0..15]   → row class 2*s
+    #   lanes 16..31 cover M[2*s + 1, 0..15]   → row class 2*s + 1
+    #
+    # ``ClusteredReduce`` with ``cluster_size = cols`` reduces the row
+    # contained in each cluster. With cols=16 there are
+    # ``subgroup_width / cluster_size == 2`` clusters per slot, giving
+    # ``2 * n_slots_per_lane`` row-class reductions which must equal
+    # ``n_results``. Each row's reduce is then broadcast to every lane
+    # via ``OpGroupNonUniformBroadcast`` from the leader lane of its
+    # cluster (lane 0 for cluster 0, lane 16 for cluster 1).
+    if cols == 0 or subgroup_width % cols != 0:
+        raise NotImplementedError(
+            f"_visit_frag_reduce multi-class: cols={cols} doesn't "
+            f"divide subgroup_width={subgroup_width}"
+        )
+    cluster_size = cols
+    rows_per_slot = subgroup_width // cluster_size
+    if rows_per_slot * n_slots_per_lane != n_results:
+        raise NotImplementedError(
+            f"_visit_frag_reduce multi-class: layout doesn't fit — "
+            f"rows_per_slot={rows_per_slot} * n_slots={n_slots_per_lane} "
+            f"!= n_results={n_results}"
+        )
+    ctx.text.add_capability("GroupNonUniformClustered")
+    cluster_const = ctx.text.const_uint(cluster_size)
+
+    slot_reduced: list[str] = []
     for s in range(n_slots_per_lane):
         idx_id = _frag_scratch_slot_idx(
             ctx, base_ssa=smem_base_ssa, s=s,
@@ -2674,61 +2775,25 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
         ctx.text.emit_function(
             f"{elem} = OpLoad {elem_type} {chain}"
         )
-        if accum is None:
-            accum = elem
-        else:
-            new_accum = ctx.text.alloc_id(f"frag_red_acc_{s}")
-            if kind == "add":
-                spv_op = "OpFAdd" if _dtype_kind(dtype) == "float" else "OpIAdd"
-            elif kind == "mul":
-                spv_op = "OpFMul" if _dtype_kind(dtype) == "float" else "OpIMul"
-            elif kind == "max":
-                glsl = ctx.text.import_ext_inst("GLSL.std.450")
-                if _dtype_kind(dtype) == "float":
-                    instr = "FMax"
-                elif _dtype_kind(dtype) == "sint":
-                    instr = "SMax"
-                else:
-                    instr = "UMax"
-                ctx.text.emit_function(
-                    f"{new_accum} = OpExtInst {elem_type} {glsl} "
-                    f"{instr} {accum} {elem}"
-                )
-                accum = new_accum
-                continue
-            elif kind == "min":
-                glsl = ctx.text.import_ext_inst("GLSL.std.450")
-                if _dtype_kind(dtype) == "float":
-                    instr = "FMin"
-                elif _dtype_kind(dtype) == "sint":
-                    instr = "SMin"
-                else:
-                    instr = "UMin"
-                ctx.text.emit_function(
-                    f"{new_accum} = OpExtInst {elem_type} {glsl} "
-                    f"{instr} {accum} {elem}"
-                )
-                accum = new_accum
-                continue
-            ctx.text.emit_function(
-                f"{new_accum} = {spv_op} {elem_type} {accum} {elem}"
-            )
-            accum = new_accum
-
-    # Cross-lane subgroup reduce. Result is broadcast to all lanes.
-    sub_op = _FRAG_REDUCE_TO_SUBGROUP_OP.get((kind, _dtype_kind(dtype)))
-    if sub_op is None:
-        raise NotImplementedError(
-            f"_visit_frag_reduce: kind={kind!r} dtype={dtype!r} not wired"
+        red_id = ctx.text.alloc_id(f"frag_red_clr_{s}")
+        slot_reduced.append(red_id)
+        ctx.text.emit_function(
+            f"{red_id} = {sub_op} {elem_type} {sg_scope} ClusteredReduce "
+            f"{elem} {cluster_const}"
         )
-    # Capability for arithmetic subgroup reduces (FMax/FMin/FAdd/etc.)
-    # — the boolean-only ``GroupNonUniform`` capability isn't enough.
-    ctx.text.add_capability("GroupNonUniformArithmetic")
-    res_id = ctx.text.alloc_id(f"frag_red_{kind}")
-    ctx.val_to_id[op.results[0].id] = res_id
-    ctx.text.emit_function(
-        f"{res_id} = {sub_op} {elem_type} {sg_scope} Reduce {accum}"
-    )
+
+    # Per-row broadcast: row r → slot s = r // rows_per_slot, leader
+    # lane = (r % rows_per_slot) * cluster_size.
+    for row_idx in range(n_results):
+        s = row_idx // rows_per_slot
+        leader_lane = (row_idx % rows_per_slot) * cluster_size
+        leader_const = ctx.text.const_uint(leader_lane)
+        bcast_id = ctx.text.alloc_id(f"frag_red_row{row_idx}")
+        ctx.val_to_id[op.results[row_idx].id] = bcast_id
+        ctx.text.emit_function(
+            f"{bcast_id} = OpGroupNonUniformBroadcast {elem_type} "
+            f"{sg_scope} {slot_reduced[s]} {leader_const}"
+        )
 
 
 def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
@@ -3075,7 +3140,7 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
     # Two scratch regions: one for the input fragment, one for the
     # output. Each is partitioned per-warp so multi-warp kernels don't
     # race on the same smem range — see ``_frag_scratch_warp_partition``.
-    total_elems, smem_base_ssa, _mat_base_ssa, warp_off = (
+    total_elems, smem_base_ssa, mat_base_ssa, warp_off = (
         _frag_scratch_warp_partition(ctx, n_elems, name_hint="frag_apply")
     )
     multi_warp = bool(warp_off)
@@ -3122,6 +3187,20 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
     )
 
     u32 = ctx.text.type_int(32, signed=False)
+    # ``slot_to_selector_idx`` absent + selectors present → dynamic
+    # row dispatch. Compute the matrix-relative row from
+    # ``mat_idx // cols`` per slot and OpSelect-chain the right
+    # selector. Used by the SPV/Intel coopmat path where the
+    # lane↔(row, col) mapping is implementation-private.
+    slot_to_sel_attr = op.attrs.get("slot_to_selector_idx")
+    n_selectors = len(op.operands) - 1
+    dynamic_dispatch = (
+        op.body_selector_var is not None
+        and slot_to_sel_attr is None
+        and n_selectors > 0
+    )
+    cols_const_div = ctx.text.const_uint(cols) if dynamic_dispatch else None
+    bool_t = ctx.text.type_bool() if dynamic_dispatch else None
 
     for s in range(n_slots_per_lane):
         idx_id = _frag_scratch_slot_idx(
@@ -3144,13 +3223,50 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
         # nested if-with-carries inside the body still works
         # (its visitor pushes its own frame onto the empty stack).
         ctx.val_to_id[op.body_input_var.id] = elem_in
-        # Bind selector if present — slot_to_selector_idx maps each
-        # slot to one of the ``selectors`` operands.
         if op.body_selector_var is not None:
-            slot_to_sel = op.attrs.get("slot_to_selector_idx", ())
-            sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
-            sel_v = op.operands[1 + sel_idx]
-            ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
+            if dynamic_dispatch:
+                # Compute matrix-relative idx + row at runtime, then
+                # OpSelect-chain to pick the selector for this row.
+                if multi_warp:
+                    mat_idx_id = _frag_scratch_slot_idx(
+                        ctx, base_ssa=mat_base_ssa, s=s,
+                        subgroup_width=subgroup_width,
+                        name_prefix=f"frag_apply_mat_{s}",
+                    )
+                else:
+                    mat_idx_id = idx_id
+                row_id = ctx.text.alloc_id(f"frag_apply_row_{s}")
+                ctx.text.emit_function(
+                    f"{row_id} = OpUDiv {u32} {mat_idx_id} {cols_const_div}"
+                )
+                # Selectors: operands[1 .. 1+n_selectors).
+                sel_chain = ctx.val_to_id[op.operands[1 + n_selectors - 1].id]
+                for i in range(n_selectors - 2, -1, -1):
+                    cmp_id = ctx.text.alloc_id(f"frag_apply_cmp_{s}_{i}")
+                    i_const = ctx.text.const_uint(i)
+                    ctx.text.emit_function(
+                        f"{cmp_id} = OpIEqual {bool_t} {row_id} {i_const}"
+                    )
+                    sel_lhs = ctx.val_to_id[op.operands[1 + i].id]
+                    sel_id_new = ctx.text.alloc_id(f"frag_apply_sel_{s}_{i}")
+                    sel_dtype_id = _emit_dtype(
+                        ctx.text,
+                        op.operands[1 + i].dtype,
+                        ctx,
+                    )
+                    ctx.text.emit_function(
+                        f"{sel_id_new} = OpSelect {sel_dtype_id} {cmp_id} "
+                        f"{sel_lhs} {sel_chain}"
+                    )
+                    sel_chain = sel_id_new
+                ctx.val_to_id[op.body_selector_var.id] = sel_chain
+            else:
+                # Static dispatch — slot_to_selector_idx maps each
+                # slot to one of the ``selectors`` operands.
+                slot_to_sel = slot_to_sel_attr or ()
+                sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
+                sel_v = op.operands[1 + sel_idx]
+                ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
         saved_stack = ctx.loop_yield_stack
         ctx.loop_yield_stack = []  # type: ignore[assignment]
         try:

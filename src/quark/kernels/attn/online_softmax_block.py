@@ -120,11 +120,29 @@ class OnlineSoftmax(Block):
         scale_c = b.const(DType.F32, self.scale)
         neg_inf = b.const(DType.F32, -1e30)
 
-        # Number of row classes = distinct dr values in cd_offsets.
-        # m16n8: dr ∈ {0, 8} → n_rc=2. m8n8k8: dr ∈ {0} → n_rc=1.
-        dr_vals = sorted({dr for dr, _ in cd_offsets})
-        n_rc = len(dr_vals)
-        row_class = {i: dr_vals.index(dr) for i, (dr, _) in enumerate(cd_offsets)}
+        # ``is_intel_spv``: Intel KHR cooperative_matrix has an
+        # implementation-private lane↔(row, col) mapping, so per-c_reg
+        # ``cd_offsets`` can't express the ``rows``-many row classes
+        # online softmax needs. The SPV lowerer recovers the row from
+        # the smem layout instead — kernel asks for ``shape.m``-many
+        # ``frag_reduce`` results via ``n_classes_override`` and
+        # ``frag_apply`` selectors via dynamic-row-dispatch
+        # (``slot_to_selector_idx=None``). Other backends (PTX/Apple)
+        # keep the per-c_reg path that works for their public lane
+        # layouts.
+        is_intel_spv = (
+            mma_shape_id is not None and "_intel_" in mma_shape_id
+        )
+        # Number of row classes:
+        #   - PTX/Apple: distinct dr values in cd_offsets
+        #   - Intel SPV: full row count (shape.m)
+        if is_intel_spv:
+            n_rc = cfg.shape.m
+            dr_vals = list(range(n_rc))
+        else:
+            dr_vals = sorted({dr for dr, _ in cd_offsets})
+            n_rc = len(dr_vals)
+        row_class = {i: dr_vals.index(dr) for i, (dr, _) in enumerate(cd_offsets)} if not is_intel_spv else {}
         # GEMM2 P-fragment packs ``nk_per_kstep`` acc tiles per k-step.
         # For m16n8k16 this is 2 (k=16 covers 2 nk-tiles of 8 cols each).
         # For m8n8k8 it's 1 (k=8 matches one nk-tile).
@@ -145,6 +163,9 @@ class OnlineSoftmax(Block):
         row_max: list[list[Any]] = [[None] * n_rc for _ in range(MT)]
 
         if mma_shape_id is not None:
+            reduce_kwargs = (
+                {"n_classes_override": n_rc} if is_intel_spv else {}
+            )
             for mt in range(MT):
                 for nk in range(NK):
                     idx = mt * NK + nk
@@ -159,6 +180,7 @@ class OnlineSoftmax(Block):
                         kind="max",
                         axis="row",
                         cd_offsets=cd_offsets,
+                        **reduce_kwargs,
                     )
                     for rc in range(n_rc):
                         if row_max[mt][rc] is None:
@@ -209,7 +231,13 @@ class OnlineSoftmax(Block):
         # extract+vec_build pattern produces. PTX lowers to per-reg
         # ``mul.f32``, same count as before.
         if mma_shape_id is not None:
-            slot_to_selector_idx = tuple(dr_vals.index(dr) for dr, _ in cd_offsets)
+            # Intel SPV path: pass selectors with ``slot_to_selector_idx
+            # =None`` to opt into dynamic-row-dispatch (lowerer derives
+            # row from smem layout). PTX/Apple: per-c_reg static map.
+            slot_to_selector_idx = (
+                None if is_intel_spv
+                else tuple(dr_vals.index(dr) for dr, _ in cd_offsets)
+            )
             for mt in range(MT):
                 scales_rc = tuple(rescale[mt])
                 assert all(s is not None for s in scales_rc)
@@ -251,7 +279,13 @@ class OnlineSoftmax(Block):
         GEMM2_K_STEPS = NK // nk_per_kstep
 
         if mma_shape_id is not None:
-            slot_to_selector_idx = tuple(dr_vals.index(dr) for dr, _ in cd_offsets)
+            slot_to_selector_idx = (
+                None if is_intel_spv
+                else tuple(dr_vals.index(dr) for dr, _ in cd_offsets)
+            )
+            reduce_kwargs = (
+                {"n_classes_override": n_rc} if is_intel_spv else {}
+            )
 
             # Step 4a: compute P f32 ACC fragments via frag_apply.
             p_acc: list[list[Value]] = [[None for _ in range(NK)] for _ in range(MT)]  # type: ignore
@@ -280,6 +314,7 @@ class OnlineSoftmax(Block):
                         kind="add",
                         axis="row",
                         cd_offsets=cd_offsets,
+                        **reduce_kwargs,
                     )
                     for rc in range(n_rc):
                         if local_psum_final[mt][rc] is None:

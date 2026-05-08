@@ -1213,17 +1213,20 @@ class FragApplyOp(Op):
                 raise ValueError(
                     "FragApplyOp: selector operands present but body_selector_var is None"
                 )
-            if "slot_to_selector_idx" not in self.attrs:
-                raise ValueError(
-                    "FragApplyOp: selectors present but 'slot_to_selector_idx' attr missing"
-                )
-            mapping = self.attrs["slot_to_selector_idx"]
-            for sel_idx in mapping:
-                if not (0 <= sel_idx < len(selectors)):
-                    raise ValueError(
-                        f"FragApplyOp: slot_to_selector_idx contains {sel_idx} "
-                        f"but only {len(selectors)} selectors provided"
-                    )
+            # ``slot_to_selector_idx`` is now optional. When absent the
+            # backend lowerer is expected to dynamically dispatch
+            # selectors based on the smem slot's row index — used by the
+            # SPV/Intel coopmat path (lane↔(r, c) is implementation-
+            # private). When present, it's the static per-c_reg map
+            # PTX/Apple use. Validate the mapping when given.
+            if "slot_to_selector_idx" in self.attrs:
+                mapping = self.attrs["slot_to_selector_idx"]
+                for sel_idx in mapping:
+                    if not (0 <= sel_idx < len(selectors)):
+                        raise ValueError(
+                            f"FragApplyOp: slot_to_selector_idx contains {sel_idx} "
+                            f"but only {len(selectors)} selectors provided"
+                        )
             for s in selectors:
                 if s.width != 1:
                     raise ValueError(
@@ -1554,15 +1557,27 @@ class FragReduceOp(Op):
         if len(self.operands) != 1:
             raise ValueError("FragReduceOp: expected 1 operand (in_frag)")
         (in_frag,) = self.operands
-        cd_offsets = self.attrs["cd_offsets"]
-        if axis == "row":
-            classes = sorted({dr for dr, _ in cd_offsets})
+        # ``n_classes_override`` lets backends with an implementation-
+        # private lane↔(row, col) mapping (Intel KHR coopmat) ask for
+        # ``rows`` (or ``cols``) results without fitting through the
+        # per-c_reg ``cd_offsets`` convention PTX/Apple share. When set
+        # it bypasses the ``len(distinct dr/dc)`` derivation entirely
+        # — only this attribute determines the result count.
+        n_classes_override = self.attrs.get("n_classes_override")
+        if n_classes_override is not None:
+            expected_n = int(n_classes_override)
         else:
-            classes = sorted({dc for _, dc in cd_offsets})
-        if len(self.results) != len(classes):
+            cd_offsets = self.attrs["cd_offsets"]
+            if axis == "row":
+                classes = sorted({dr for dr, _ in cd_offsets})
+            else:
+                classes = sorted({dc for _, dc in cd_offsets})
+            expected_n = len(classes)
+        if len(self.results) != expected_n:
             raise ValueError(
-                f"FragReduceOp: expected {len(classes)} results (one per "
-                f"{axis} class from cd_offsets), got {len(self.results)}"
+                f"FragReduceOp: expected {expected_n} results "
+                f"({'n_classes_override' if n_classes_override is not None else f'one per {axis} class from cd_offsets'}), "
+                f"got {len(self.results)}"
             )
         for r in self.results:
             if r.width != 1:
