@@ -50,6 +50,7 @@ from quark.ir.op import (
     ConstOp,
     ConvertOp,
     ForLoopOp,
+    FragApplyOp,
     FragForEachOp,
     GroupIdOp,
     IfRegionOp,
@@ -2381,12 +2382,19 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
             f"{elem_id} = OpLoad {elem_type} {chain_id}"
         )
 
-        # Bind body vars and walk the body ops.
+        # Bind body vars and walk the body ops. Suppress any
+        # surrounding ``loop_yield_stack`` so the body's terminating
+        # void YieldOp isn't read as a for-loop carry yield.
         ctx.val_to_id[op.body_input_var.id] = elem_id
         ctx.val_to_id[op.body_row_var.id] = row_id
         ctx.val_to_id[op.body_col_var.id] = col_id
-        for body_op in op.body.ops:
-            _walk_op(body_op, ctx)
+        saved_stack = ctx.loop_yield_stack
+        ctx.loop_yield_stack = []  # type: ignore[assignment]
+        try:
+            for body_op in op.body.ops:
+                _walk_op(body_op, ctx)
+        finally:
+            ctx.loop_yield_stack = saved_stack
 
 
 def _ensure_lane_id(ctx: _SpvCtx) -> str:
@@ -2411,6 +2419,160 @@ def _ensure_lane_id(ctx: _SpvCtx) -> str:
     ctx.text.emit_function(f"{loaded} = OpLoad {u32} {var_id}")
     ctx.lane_id_x_loaded = loaded
     return loaded
+
+
+def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
+    """``FragApplyOp`` via smem roundtrip — produces an output fragment.
+
+    Same pattern as ``_visit_frag_for_each`` but writes the per-slot
+    yielded values to an output scratch region and reloads them as
+    a fresh cooperative matrix. Used by attention's online-softmax
+    epilogue (``f32 → bf16`` cast with per-slot scale).
+
+    The body's terminating ``YieldOp`` produces one Value per slot;
+    we look up its SSA id after walking the body and store it to
+    ``out_scratch[idx]``. After all slots, ``OpCooperativeMatrix
+    LoadKHR`` from ``out_scratch`` gives us the result coopmat.
+    """
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    _ensure_coopmat_caps(ctx)
+    (out,) = op.results
+    shape_id = op.attrs["shape_id"]
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_frag_apply: unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+    rows, cols, dtype = _coop_dims_for(shape, "c")
+    n_elems = rows * cols
+    subgroup_width = 32
+    if n_elems % subgroup_width != 0:
+        raise NotImplementedError(
+            f"_visit_frag_apply: tile {rows}×{cols} not divisible by "
+            f"{subgroup_width}"
+        )
+    n_slots_per_lane = n_elems // subgroup_width
+
+    elem_type = _emit_dtype(ctx.text, dtype, ctx)
+    if dtype is DType.BF16:
+        ctx.text.add_capability("BFloat16CooperativeMatrixKHR")
+
+    # Two scratch regions: one for the input fragment, one for the
+    # output. We could reuse one but pipelining iterations risks
+    # write-vs-read hazards across lanes; the two-region split is the
+    # simplest correct shape.
+    n_const = ctx.text.const_uint(n_elems)
+    in_arr_id = ctx.text.alloc_id("frag_apply_in_arr")
+    ctx.text.add_type_line(f"{in_arr_id} = OpTypeArray {elem_type} {n_const}")
+    out_arr_id = ctx.text.alloc_id("frag_apply_out_arr")
+    ctx.text.add_type_line(f"{out_arr_id} = OpTypeArray {elem_type} {n_const}")
+    ptr_in_arr = ctx.text.type_pointer("Workgroup", in_arr_id)
+    ptr_out_arr = ctx.text.type_pointer("Workgroup", out_arr_id)
+    in_var = ctx.text.alloc_id("frag_apply_in")
+    out_var = ctx.text.alloc_id("frag_apply_out")
+    ctx.text.add_type_line(f"{in_var} = OpVariable {ptr_in_arr} Workgroup")
+    ctx.text.add_type_line(f"{out_var} = OpVariable {ptr_out_arr} Workgroup")
+    elem_ptr = ctx.text.type_pointer("Workgroup", elem_type)
+    ctx.smem_allocs[id(op)] = (in_var, elem_type, elem_ptr, n_elems)
+    ctx.smem_allocs[(id(op), "out")] = (out_var, elem_type, elem_ptr, n_elems)
+
+    zero = ctx.text.const_uint(0)
+    base_ptr_in = ctx.text.alloc_id("frag_apply_base_in")
+    ctx.text.emit_function(
+        f"{base_ptr_in} = OpAccessChain {elem_ptr} {in_var} {zero}"
+    )
+    base_ptr_out = ctx.text.alloc_id("frag_apply_base_out")
+    ctx.text.emit_function(
+        f"{base_ptr_out} = OpAccessChain {elem_ptr} {out_var} {zero}"
+    )
+
+    cols_const = ctx.text.const_uint(cols)
+    layout_id = ctx.text.const_uint(0)
+
+    # Store input coopmat → in_scratch.
+    in_id = ctx.val_to_id[op.operands[0].id]
+    ctx.text.emit_function(
+        f"OpCooperativeMatrixStoreKHR {base_ptr_in} {in_id} "
+        f"{layout_id} {cols_const}"
+    )
+
+    sg_scope = ctx.text.const_uint(3)
+    sg_sem = ctx.text.const_uint(0x8 | 0x100)
+    ctx.text.emit_function(
+        f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
+    )
+
+    u32 = ctx.text.type_int(32, signed=False)
+    lane_id_ssa = _ensure_lane_id(ctx)
+
+    for s in range(n_slots_per_lane):
+        if s == 0:
+            idx_id = lane_id_ssa
+        else:
+            offset = ctx.text.const_uint(s * subgroup_width)
+            idx_id = ctx.text.alloc_id(f"frag_apply_idx_{s}")
+            ctx.text.emit_function(
+                f"{idx_id} = OpIAdd {u32} {lane_id_ssa} {offset}"
+            )
+
+        chain_in = ctx.text.alloc_id(f"frag_apply_in_chain_{s}")
+        ctx.text.emit_function(
+            f"{chain_in} = OpAccessChain {elem_ptr} {in_var} {idx_id}"
+        )
+        elem_in = ctx.text.alloc_id(f"frag_apply_elem_{s}")
+        ctx.text.emit_function(
+            f"{elem_in} = OpLoad {elem_type} {chain_in}"
+        )
+
+        # Bind body input + walk body. Skip the terminating YieldOp
+        # — its operand is the per-slot result, captured below.
+        # Suppress any surrounding ``loop_yield_stack`` frame so a
+        # nested if-with-carries inside the body still works
+        # (its visitor pushes its own frame onto the empty stack).
+        ctx.val_to_id[op.body_input_var.id] = elem_in
+        saved_stack = ctx.loop_yield_stack
+        ctx.loop_yield_stack = []  # type: ignore[assignment]
+        try:
+            for body_op in op.body.ops:
+                if isinstance(body_op, YieldOp):
+                    continue  # captured via body.terminator below
+                _walk_op(body_op, ctx)
+        finally:
+            ctx.loop_yield_stack = saved_stack
+        # Capture the yielded value's SSA id from the body's
+        # terminator and store to out_scratch[idx].
+        body_term = op.body.terminator
+        if body_term is None or not body_term.operands:
+            raise RuntimeError(
+                "_visit_frag_apply: body must yield exactly one value"
+            )
+        yielded_id = ctx.val_to_id[body_term.operands[0].id]
+        chain_out = ctx.text.alloc_id(f"frag_apply_out_chain_{s}")
+        ctx.text.emit_function(
+            f"{chain_out} = OpAccessChain {elem_ptr} {out_var} {idx_id}"
+        )
+        ctx.text.emit_function(
+            f"OpStore {chain_out} {yielded_id}"
+        )
+
+    # Subgroup barrier so all lanes' writes to out_scratch are
+    # visible to the upcoming coop-matrix load.
+    ctx.text.emit_function(
+        f"OpControlBarrier {sg_scope} {sg_scope} {sg_sem}"
+    )
+
+    # Load out_scratch back as a coopmat — the result of FragApplyOp.
+    coop_t = ctx.text.type_coop_matrix(
+        elem_type, scope=3, rows=rows, cols=cols, use=2,
+    )
+    res_id = ctx.text.alloc_id("frag_apply_result")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCooperativeMatrixLoadKHR {coop_t} {base_ptr_out} "
+        f"{layout_id} {cols_const}"
+    )
 
 
 def _visit_mma(op: MmaOp, ctx: _SpvCtx) -> None:
@@ -2472,6 +2634,7 @@ _DISPATCH: dict[type, Any] = {
     StoreMatrixOp: _visit_store_matrix,
     MmaOp: _visit_mma,
     FragForEachOp: _visit_frag_for_each,
+    FragApplyOp: _visit_frag_apply,
     VecLoadOp: _visit_vec_load,
     VecStoreOp: _visit_vec_store,
     VecBuildOp: _visit_vec_build,
