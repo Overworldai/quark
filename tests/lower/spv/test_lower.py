@@ -858,6 +858,79 @@ def _build_coopmat_mma_ir():
     return b.module
 
 
+def _build_frag_convert_multi_src_ir():
+    """Two MMAs producing two ACC fragments → one ``frag_convert``
+    merging both into a single A-fragment (kf=2). Just lowers and
+    drops the result on the floor — the test only asserts that the
+    multi-source dispatch path emits the OpSelect chain.
+
+    Single workgroup, single warp, no dispatch grid math; exists
+    purely to exercise the lowerer's ``num_src=2`` branch."""
+    from quark.ir.module import MmaShape
+
+    SHAPE_NAME = "m8n16k16_intel_bf16_f32"
+    b = Builder("frag_cvt_multi")
+    fn = b.begin_function("frag_cvt_multi")
+    b.param("A0", BufferType(DType.BF16))
+    b.param("B0", BufferType(DType.BF16))
+    b.param("A1", BufferType(DType.BF16))
+    b.param("B1", BufferType(DType.BF16))
+    b.param("Out", BufferType(DType.U32))
+
+    g_a0 = GlobalTensor(dtype=DType.BF16, shape=(8, 16), stride=(16, 1),
+                        name="A0", param=fn.params[0])
+    g_b0 = GlobalTensor(dtype=DType.BF16, shape=(16, 16), stride=(16, 1),
+                        name="B0", param=fn.params[1])
+    g_a1 = GlobalTensor(dtype=DType.BF16, shape=(8, 16), stride=(16, 1),
+                        name="A1", param=fn.params[2])
+    g_b1 = GlobalTensor(dtype=DType.BF16, shape=(16, 16), stride=(16, 1),
+                        name="B1", param=fn.params[3])
+    g_out = GlobalTensor(dtype=DType.U32, shape=(8, 16), stride=(16, 1),
+                         name="Out", param=fn.params[4])
+
+    b.register_shape(
+        MmaShape(
+            name=SHAPE_NAME,
+            m=8, n=16, k=16,
+            a_dtype=DType.BF16,
+            b_dtype=DType.BF16,
+            acc_dtype=DType.F32,
+            a_regs=4, b_regs=8, c_regs=4,
+        ),
+    )
+
+    zero = b.const(DType.U32, 0)
+    zero_f = b.const(DType.F32, 0.0)
+    c_init = b.vec_build([zero_f] * 4)
+
+    a0 = b.load_matrix(g_a0, SHAPE_NAME, which="a", row=zero, col=zero)
+    b0 = b.load_matrix(g_b0, SHAPE_NAME, which="b", row=zero, col=zero)
+    src0 = b.mma(SHAPE_NAME, a0, b0, c_init)
+
+    a1 = b.load_matrix(g_a1, SHAPE_NAME, which="a", row=zero, col=zero)
+    b1 = b.load_matrix(g_b1, SHAPE_NAME, which="b", row=zero, col=zero)
+    src1 = b.mma(SHAPE_NAME, a1, b1, c_init)
+
+    # Merge two ACC frags into one A-fragment of bf16. cd_offsets is
+    # the Intel placeholder; the lowerer's slot iteration is driven
+    # by tile dimensions, not cd_offsets.
+    b.frag_convert(
+        SHAPE_NAME,
+        [src0, src1],
+        src_layout="acc",
+        dst_layout="a_frag",
+        src_dtype=DType.F32,
+        dst_dtype=DType.BF16,
+        cd_offsets=((0, 0),) * 4,
+    )
+    # Sink something to keep the function non-empty after frag_convert
+    # (the result is unused; we don't store it anywhere — but we still
+    # need the entry-point interface to advertise Out).
+    b.store(g_out, b.const(DType.U32, 0), zero, zero)
+    b.end_function()
+    return b.module
+
+
 class TestCoopMatTextEmit:
     """Tier 1 — the cooperative-matrix visitor surface emits the
     expected SPIR-V opcodes regardless of Vulkan availability."""
@@ -873,6 +946,25 @@ class TestCoopMatTextEmit:
         assert "OpCooperativeMatrixLoadKHR" in src
         assert "OpCooperativeMatrixStoreKHR" in src
         assert "OpCooperativeMatrixMulAddKHR" in src
+
+    def test_frag_convert_multi_src_emits_opselect_chain(self):
+        """num_src=2 FragConvert lowers to an OpSelect chain — one
+        OpIEqual + OpSelect per source-1 — instead of a single direct
+        load. Locks in the multi-src dispatch path that the kf>1 GEMM2
+        P-fragment build needs (e.g. PTX m16n8k16 attention)."""
+        result = SpirVLowerer(local_size=(32, 1, 1)).lower_module(
+            _build_frag_convert_multi_src_ir()
+        )
+        src = result.source
+        # Per-slot OpSelect chain: with num_src=2 there's one OpIEqual
+        # + one OpSelect per slot. With dst_n_elems=8*32=256 elements
+        # over 32 lanes → 8 slots → exactly 8 OpSelects (one per slot,
+        # selecting between src0 and src1 loads on src_idx==0).
+        assert src.count("OpIEqual") == 8
+        assert src.count("OpSelect ") == 8
+        # Three Workgroup smem regions: src0 + src1 scratch (one each)
+        # plus the dst scratch.
+        assert src.count("OpVariable") >= 3
 
 
 @pytestmark_e2e

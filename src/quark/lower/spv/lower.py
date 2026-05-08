@@ -2452,15 +2452,27 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
     reduction, then ``OpGroupNonUniform<kind>`` broadcasts the
     cross-lane reduction so every result lane sees the full scalar.
 
-    Limitation: today only handles the case where the IR's
-    ``cd_offsets`` produces a single row/col class — which matches
-    the Intel placeholder offsets (``((0,0),) * c_regs``). Per-row /
-    per-col reductions on PTX-style multi-class shapes need a smem
-    layout that respects the actual lane↔(row,col) mapping; the
-    coopmat lane mapping is implementation-private on Vulkan, so the
-    cleanest path on multi-class is to derive classes from the
-    smem layout (we wrote row-major) rather than from cd_offsets.
-    Tracked as a follow-up.
+    Known limitation (per-row reduce on Intel coopmat):
+
+      Intel ``cd_offsets`` is ``((0,0),) * c_regs`` because the
+      lane↔(row,col) mapping inside an Intel cooperative matrix is
+      implementation-private (Vulkan KHR coopmat does not expose it).
+      With those placeholders, ``len({dr})`` is 1, so the IR-level
+      contract collapses to a single class — i.e. one full-tile
+      reduction. The lowerer below honours that contract (single
+      cross-lane reduce, broadcast result).
+
+      For online softmax, the *correct* reduction is per-row across
+      the full tile (e.g. 8 maxes for an 8×16 fragment). Achieving
+      that on KHR-only coopmat requires either (a) a vendor extension
+      like ``SPV_NV_cooperative_matrix2``'s ``OpCooperativeMatrix
+      ReduceNV`` (Mesa/anv does not expose this on Battlemage as of
+      mid-2026), or (b) breaking the cd_offsets-↔-c_regs coupling
+      (multiple results per FragReduce on Intel) which spans the IR
+      contract, kernel-side derivation, and lowerer. Without that
+      change attention output drifts ~1.6e-1 from the numpy reference
+      (single-class softmax normalisation). GEMM and other coopmat
+      kernels that don't depend on per-row reduce remain correct.
     """
     from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
 
@@ -2762,25 +2774,45 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
             f"{src_addr} = OpIAdd {u32} {row_mul} {col_in_src_id}"
         )
 
-        # The source array to read from depends on src_idx_id at
-        # runtime — but since the slot iteration is Python-unrolled,
-        # if num_src > 1 we'd need per-slot dispatch. For now assume
-        # num_src=1 (the common attention path) — emit a direct load
-        # from src_vars[0]. Multi-src needs OpSelect or unrolled
-        # branching, deferred.
-        if num_src != 1:
-            raise NotImplementedError(
-                f"_visit_frag_convert: num_src={num_src} > 1 not yet wired "
-                "(needs per-slot src dispatch)"
+        # The source array to read from depends on ``src_idx_id`` at
+        # runtime. We unconditionally load from each source scratch
+        # (all live in workgroup smem so any address is well-defined,
+        # just stale-data for the wrong source), then OpSelect a chain
+        # on ``src_idx_id`` to pick the right value. This avoids
+        # OpSelectionMerge / OpBranchConditional clutter in the body
+        # path; spilled redundant loads are smem hits that the GPU
+        # coalesces, and the lowerer keeps a single straight-line
+        # body — much easier for the back-end to schedule.
+        loads: list[str] = []
+        for i in range(num_src):
+            chain = ctx.text.alloc_id(f"frag_cvt_chain_{s}_{i}")
+            ctx.text.emit_function(
+                f"{chain} = OpAccessChain {src_elem_ptr} {src_vars[i]} {src_addr}"
             )
-        chain = ctx.text.alloc_id(f"frag_cvt_chain_{s}")
-        ctx.text.emit_function(
-            f"{chain} = OpAccessChain {src_elem_ptr} {src_vars[0]} {src_addr}"
-        )
-        elem_in = ctx.text.alloc_id(f"frag_cvt_in_{s}")
-        ctx.text.emit_function(
-            f"{elem_in} = OpLoad {src_elem} {chain}"
-        )
+            elem_i = ctx.text.alloc_id(f"frag_cvt_in_{s}_{i}")
+            ctx.text.emit_function(
+                f"{elem_i} = OpLoad {src_elem} {chain}"
+            )
+            loads.append(elem_i)
+        if num_src == 1:
+            elem_in = loads[0]
+        else:
+            # OpSelect chain — fold from highest src index downward so
+            # the default tail is loads[num_src-1] (matches the kernel
+            # invariant that ``src_idx`` ∈ [0, num_src)).
+            bool_t = ctx.text.type_bool()
+            elem_in = loads[num_src - 1]
+            for i in range(num_src - 2, -1, -1):
+                cmp_id = ctx.text.alloc_id(f"frag_cvt_cmp_{s}_{i}")
+                i_const = ctx.text.const_uint(i)
+                ctx.text.emit_function(
+                    f"{cmp_id} = OpIEqual {bool_t} {src_idx_id} {i_const}"
+                )
+                sel_id = ctx.text.alloc_id(f"frag_cvt_sel_{s}_{i}")
+                ctx.text.emit_function(
+                    f"{sel_id} = OpSelect {src_elem} {cmp_id} {loads[i]} {elem_in}"
+                )
+                elem_in = sel_id
 
         # Walk the body (optional). If no body, the transform is
         # identity — direct cast from src_dtype to dst_dtype.
