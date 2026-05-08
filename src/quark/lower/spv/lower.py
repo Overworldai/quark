@@ -2291,17 +2291,9 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _SpvCtx) -> None:
     # column-major matrix, so ``b`` loads emit
     # ``MemoryLayout = ColumnMajor``. ``a`` and ``c`` use row-major
     # since their tensors are stored in M-contiguous form.
-    #
-    # Stride must be the ELEMENT stride between consecutive rows of
-    # the OUTERMOST dim (``tensor.stride[0]``), NOT ``shape[-1]`` —
-    # those differ when the SharedRegion was padded for bank-conflict
-    # avoidance (e.g. attn's V smem has ``shape=(Dh, KvTile=32)`` but
-    # ``stride[0] = KvTile + KvPad = 40``). Using shape[-1]=32 read
-    # the wrong elements for k > 0 and zeroed cols 4-7 / 12-15 / …
-    # of the attn output (the ``group_id``-parity-looking pattern).
-    stride_val = int(tensor.stride[0]) if hasattr(tensor, "stride") and tensor.stride else int(tensor.shape[-1])
+    last_dim = tensor.shape[-1]
     layout_id = ctx.text.const_uint(1 if which == "b" else 0)
-    stride_id = ctx.text.const_uint(stride_val)
+    stride_id = ctx.text.const_uint(last_dim)
 
     res_id = ctx.text.alloc_id(f"coop_load_{which}")
     ctx.val_to_id[out.id] = res_id
@@ -2322,10 +2314,7 @@ def _visit_store_matrix(op: StoreMatrixOp, ctx: _SpvCtx) -> None:
     row_id = ctx.val_to_id[op.operands[1].id]
     col_id = ctx.val_to_id[op.operands[2].id]
     ptr_id, _storage_class = _emit_matrix_pointer(tensor, row_id, col_id, ctx)
-    # Same padding-aware stride as the load path — see
-    # ``_visit_load_matrix`` for the fix rationale.
-    stride_val = int(tensor.stride[0]) if hasattr(tensor, "stride") and tensor.stride else int(tensor.shape[-1])
-    stride_id = ctx.text.const_uint(stride_val)
+    stride_id = ctx.text.const_uint(tensor.shape[-1])
     layout_id = ctx.text.const_uint(0)
     ctx.text.emit_function(
         f"OpCooperativeMatrixStoreKHR {ptr_id} {frag_id} "
