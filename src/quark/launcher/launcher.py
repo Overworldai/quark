@@ -311,11 +311,14 @@ class CompiledKernel:
         scalars: tuple = (),
         stream: int | None = None,
         persistent_outs: set | None = None,
+        sync: bool = True,
     ) -> list | None:
         """Validate, extract pointers, pack scalars, and dispatch.
 
         On CUDA: writes into preallocated output buffers, returns None.
         On Metal: returns list of numpy array outputs (driver allocates them).
+        On SPV: ``sync=False`` skips the per-launch fence wait —
+        caller must ``driver.sync()`` before reading outputs.
         """
         if len(buffers) != len(self.param_spec.buffers):
             raise ValueError(
@@ -330,7 +333,7 @@ class CompiledKernel:
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.METAL:
             return self._launch_metal(buffers, scalars, persistent_outs=persistent_outs)
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.INTEL_GPU:
-            return self._launch_spv(buffers, scalars)
+            return self._launch_spv(buffers, scalars, sync=sync)
 
         return self._launch_cuda(buffers, scalars, stream)
 
@@ -494,7 +497,7 @@ class CompiledKernel:
             self.driver.sync(None)
         return results
 
-    def _launch_spv(self, buffers: list, scalars: tuple) -> None:
+    def _launch_spv(self, buffers: list, scalars: tuple, *, sync: bool = True) -> None:
         """SPIR-V / Vulkan launch path.
 
         Per-buffer policy:
@@ -557,6 +560,7 @@ class CompiledKernel:
             grid=self.grid_fn(*self.grid_args),
             buffer_handles=handles,
             push_bytes=push_bytes,
+            sync=sync,
         )
         return None
 
