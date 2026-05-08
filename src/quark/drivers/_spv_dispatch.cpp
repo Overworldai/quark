@@ -490,10 +490,19 @@ void bind_device_internal(uint32_t index) {
     coopmat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
     coopmat.cooperativeMatrix = VK_TRUE;
     coopmat.pNext = &bf16;
+    // PORTABILITY_PLAN §3.5: pin SIMD32 via subgroupSizeControl so the
+    // lowerer's hardcoded ``subgroup_width = 32`` matches what the
+    // driver actually dispatches at. Required for the ``OpExecutionMode
+    // SubgroupSize 32`` decoration the lowerer emits to take effect.
+    VkPhysicalDeviceSubgroupSizeControlFeatures sgsc{};
+    sgsc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+    sgsc.subgroupSizeControl = VK_TRUE;
+    sgsc.computeFullSubgroups = VK_TRUE;
+    sgsc.pNext = &coopmat;
     VkPhysicalDeviceVulkan12Features v12{};
     v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     v12.shaderBufferInt64Atomics = VK_FALSE;
-    v12.pNext = &coopmat;
+    v12.pNext = &sgsc;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -510,6 +519,7 @@ void bind_device_internal(uint32_t index) {
     std::vector<const char*> ext_names = {
         "VK_KHR_cooperative_matrix",
         "VK_KHR_shader_bfloat16",
+        "VK_EXT_subgroup_size_control",
     };
     uint32_t n_ext = 0;
     vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &n_ext, nullptr);

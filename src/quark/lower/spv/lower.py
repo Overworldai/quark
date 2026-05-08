@@ -3591,6 +3591,17 @@ class SpirVLowerer:
         text.add_execution_mode(
             f"OpExecutionMode {fn_id} LocalSize {local_size[0]} {local_size[1]} {local_size[2]}"
         )
+        # Pin the subgroup width to 32 (PORTABILITY_PLAN §3.5 v1 policy).
+        # Without this, Mesa Battlemage picks SIMD16 for kernels using
+        # OpCooperativeMatrixMulAddKHR, which makes the lowerer's
+        # ``subgroup_width = 32`` slot-partition assumption write only
+        # half the elements through smem-roundtrip frag visitors —
+        # surfaces as the attn cols-zero pattern.
+        text.add_capability("SubgroupSizeControl")
+        text.add_extension("SPV_KHR_subgroup_size_control")
+        text.add_execution_mode(
+            f"OpExecutionMode {fn_id} SubgroupSize 32"
+        )
 
         return LoweredSpirVKernel(
             source=text.serialize(),
