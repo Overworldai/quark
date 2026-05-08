@@ -1192,3 +1192,128 @@ def test_known_kernel_lowers_on_spv(kernel_name):
     assert result.n_buffers > 0
     assert "OpEntryPoint" in result.source
     assert "LocalSize" in result.source
+
+
+# ── Additional MMA-using kernels that lower with an explicit Intel
+# shape (their default ``main_shape=""`` resolves to a PTX-only shape
+# via ``lookup_mma`` and fails ``is_valid_for`` on Intel caps). These
+# need a small kernel-side shim — device-aware default shape — but in
+# the meantime the lock-in test threads the Intel shape in via an
+# explicit config.
+_INTEL_SHAPE = "m8n16k16_intel_bf16_f32"
+
+
+def _build_kernel_with_intel_shape(kernel_name):
+    """Construct ``(kernel, kernel_cls)`` for a kernel that needs an
+    explicit Intel ``main_shape`` to validate. Returns the
+    instantiated kernel + class; raises ``KeyError`` for an unknown
+    name. Kept as a small dispatch table here rather than per-kernel
+    helpers so the test stays grouped."""
+    if kernel_name == "gemm":
+        from quark.kernels.gemm.kernel import GemmKernel
+        from quark.kernels.gemm.config import GemmConfig
+        from quark.kernels.gemm.spec import GemmSpec
+        # gemm's default problems use e4m3 (fp8) which Intel doesn't
+        # support; build a bf16/bf16 spec instead.
+        spec = GemmSpec(
+            M=128, N=128, K=128,
+            a_dtype=DType.BF16, b_dtype=DType.BF16,
+            acc_dtype=DType.F32, out_dtype=DType.BF16,
+            compute_dtype=DType.BF16,
+        )
+        cfg = GemmConfig(
+            BM=32, BN=32, BK=16, n_warps=1, n_stages=1,
+            main_shape=_INTEL_SHAPE, impl="ws",
+        )
+        return GemmKernel(spec, cfg), GemmKernel
+    if kernel_name == "attn":
+        from quark.kernels.attn.kernel import AttnKernel
+        from quark.kernels.attn.config import AttnConfig
+        p = AttnKernel.problems()[0]
+        k0 = AttnKernel.from_problem(p.params)
+        cfg = AttnConfig(
+            KvTile=32, MTiles=1, NCW=1, KvPad=8, n_stages=1,
+            main_shape=_INTEL_SHAPE,
+        )
+        return AttnKernel(k0.spec, cfg), AttnKernel
+    if kernel_name == "moe_inproj":
+        from quark.kernels.moe_inproj.kernel import MoeInprojKernel
+        from quark.kernels.moe_inproj.config import MoeInprojConfig
+        p = MoeInprojKernel.problems()[0]
+        k0 = MoeInprojKernel.from_problem(p.params)
+        cfg = MoeInprojConfig(
+            BM=32, BN=64, BK=16, n_warps=1, n_stages=1,
+            main_shape=_INTEL_SHAPE,
+        )
+        return MoeInprojKernel(k0.spec, cfg), MoeInprojKernel
+    if kernel_name == "moe_outproj":
+        from quark.kernels.moe_outproj.kernel import MoeOutprojKernel
+        from quark.kernels.moe_outproj.config import MoeOutprojConfig
+        p = MoeOutprojKernel.problems()[0]
+        k0 = MoeOutprojKernel.from_problem(p.params)
+        cfg = MoeOutprojConfig(
+            BM=32, BN=64, BK=16, n_warps=1, n_stages=1,
+            main_shape=_INTEL_SHAPE,
+        )
+        return MoeOutprojKernel(k0.spec, cfg), MoeOutprojKernel
+    if kernel_name == "patchify":
+        from quark.kernels.patchify.kernel import PatchifyKernel
+        from quark.kernels.patchify.config import PatchifyConfig
+        p = PatchifyKernel.problems()[0]
+        k0 = PatchifyKernel.from_problem(p.params)
+        cfg = PatchifyConfig(
+            BM=8, BN=16, BK=16, n_warps=1, n_stages=1,
+            main_shape=_INTEL_SHAPE,
+        )
+        return PatchifyKernel(k0.spec, cfg), PatchifyKernel
+    if kernel_name == "unpatchify":
+        from quark.kernels.unpatchify.kernel import UnpatchifyKernel
+        from quark.kernels.unpatchify.config import UnpatchifyConfig
+        p = UnpatchifyKernel.problems()[0]
+        k0 = UnpatchifyKernel.from_problem(p.params)
+        cfg = UnpatchifyConfig(
+            BM=8, BN=16, BK=16, n_warps=1, n_stages=1,
+            main_shape=_INTEL_SHAPE,
+        )
+        return UnpatchifyKernel(k0.spec, cfg), UnpatchifyKernel
+    raise KeyError(f"unknown kernel: {kernel_name}")
+
+
+_MMA_KERNELS_WITH_FORCED_INTEL_SHAPE = (
+    "gemm", "attn", "moe_inproj", "moe_outproj", "patchify", "unpatchify",
+)
+
+
+@pytest.mark.parametrize("kernel_name", _MMA_KERNELS_WITH_FORCED_INTEL_SHAPE)
+def test_mma_kernel_lowers_on_spv_with_intel_shape(kernel_name):
+    """Cooperative-matrix kernels that compile on Intel SPV when the
+    Intel ``main_shape`` is threaded in via config. The reason they're
+    not in ``_KNOWN_LOWERS_ON_SPV`` is that their default
+    ``main_shape=""`` resolves to a PTX-only shape (``lookup_mma`` is
+    not yet device-aware), so ``is_valid_for(intel_caps)`` rejects
+    them. This test pins forward progress on the visitor surface
+    (``LoadMatrixKHR``, ``MmaOp``, ``StoreMatrixKHR``, ``FragForEach``,
+    ``FragApply``, ``FragReduce``, ``FragConvert``) — every visitor
+    that the cooperative-matrix path needs."""
+    from quark.lower.legalize import legalize
+    from quark.ir.module import Module
+
+    caps = _intel_caps()
+    k, _kc = _build_kernel_with_intel_shape(kernel_name)
+    assert k.is_valid_for(caps), (
+        f"{kernel_name}: not valid for Intel caps even with explicit "
+        f"main_shape={_INTEL_SHAPE}"
+    )
+    ir = k.emit()
+    if isinstance(ir, Module):
+        legalize(ir, caps)
+    lowerer = SpirVLowerer(local_size=k.block())
+    result = lowerer.lower_module(ir)
+    assert result.n_buffers > 0
+    assert "OpEntryPoint" in result.source
+    # Every MMA kernel must declare ``CooperativeMatrixKHR`` and emit
+    # the load/mma/store triple.
+    assert "OpCapability CooperativeMatrixKHR" in result.source
+    assert "OpCooperativeMatrixLoadKHR" in result.source
+    assert "OpCooperativeMatrixMulAddKHR" in result.source
+    assert "OpCooperativeMatrixStoreKHR" in result.source
