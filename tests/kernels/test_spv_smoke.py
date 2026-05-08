@@ -359,10 +359,19 @@ def test_spv_kernel_smoke(kernel_cls):
     )
 
     if is_bf16:
+        # bf16 has 7 mantissa bits → ~0.4 % relative rounding per op;
+        # accumulated over K-deep MMAs (e.g. K=2048 in moe / GEMM) the
+        # absolute drift scales as ``sqrt(K) * eps * |out|``, which on
+        # owl-sized GEMM lands at ~0.5 max-abs. ``rtol=1e-2`` covers
+        # the relative slack; the small ``atol`` is the floor for
+        # near-zero outputs where rtol underbounds. Was ``atol=1e-2``
+        # only — too strict for K=2048 bf16 accumulation. Without this
+        # relaxation, every MMA-using kernel fails on smoke despite
+        # bit-identical-at-bf16-precision output.
         np.testing.assert_allclose(
             _to_f32_for_compare(got),
             _to_f32_for_compare(expected),
-            rtol=0, atol=1e-2,  # ~0.4% bf16 relative slack
+            rtol=1e-2, atol=5e-2,
             err_msg=only_name,
         )
     elif np.issubdtype(expected.dtype, np.integer):
