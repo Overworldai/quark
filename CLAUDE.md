@@ -1,10 +1,21 @@
 # quark
 
-GPU kernel compiler. Typed IR → PTX (CUDA) / MSL (Metal) → GPU binary.
-Runtime inference path uses `QuarkTensor` (ctypes → libcuda) on CUDA
-and `mx.array` (MLX) on Metal — no torch dependency in the hot path.
-`quark.backend.PT` still exists as the polymorphic wrapper for
-kernel `reference.py` / `baselines.py` (torch optional dev extra).
+GPU kernel compiler. Typed IR → PTX (CUDA) / MSL (Metal) /
+SPIR-V (Intel Vulkan) → GPU binary. Runtime inference path uses
+`QuarkTensor` (ctypes → libcuda) on CUDA and `mx.array` (MLX) on
+Metal; the SPIR-V backend dispatches via Vulkan compute through
+the `_spv_dispatch` C extension and accepts numpy ndarrays
+end-to-end (QuarkTensor-on-SPV pool is pending). No torch
+dependency in the hot path. `quark.backend.PT` still exists as
+the polymorphic wrapper for kernel `reference.py` / `baselines.
+py` (torch optional dev extra).
+
+Backends: see `docs/PORTABILITY_PLAN.md` for the SPIR-V backend
+roadmap. v1 (smoke pass on Battlemage) and v3 (real flash-
+attention on SPIR-V) are both landed on the `spirv-integration`
+branch — every framework kernel that has a smoke fixture
+(rmsnorm, gemm, attn, owl_attn, moe_*, value_residual, …)
+runs correctly on Intel Battlemage at the default config.
 
 ## Orientation
 
