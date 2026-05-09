@@ -533,27 +533,34 @@ class CompiledKernel:
         """
         from quark.drivers import _spv_dispatch as _sd
 
-        # Fast cache: identity-keyed on the buffers list. Production
-        # callers (functional._dispatch.call_with_bindings) reuse the
-        # same per-kernel buffer-list instance across calls in the
-        # hot loop, so id() is a reliable hit indicator.
-        cache = getattr(self, "_spv_fast_cache", None)
-        if cache is not None and cache[0] is buffers and not scalars:
-            _sd.launch(self.module.handle, cache[1], cache[2], cache[3], sync=sync)
-            return
-
+        # Fast path: resolve buffers → handle-tuple, then check cache
+        # keyed on (id-tuple-of-buffers, len(scalars)). The functional
+        # dispatch layer rebuilds the buffer list each call but the
+        # buffer OBJECTS (QuarkTensor instances bound to module
+        # parameters / persistent state) are stable, so id-tuple
+        # matches across calls. ``spv_handle`` lookup is fast (one
+        # isinstance + attribute access on _SpvStorage).
         import numpy as np
         from quark.runtime.tensor import QuarkTensor
+
+        # Build the id-tuple in a tight loop — avoids constructing
+        # the full handle list when the cache hits.
+        n = len(buffers)
+        id_key = tuple(id(b) for b in buffers)
+        cache = getattr(self, "_spv_fast_cache", None)
+        if (
+            cache is not None
+            and not scalars
+            and cache[0] == id_key
+        ):
+            _sd.launch(self.module.handle, cache[1], cache[2], cache[3], sync=sync)
+            return
 
         handles: list[int] = []
         for buf in buffers:
             if isinstance(buf, int):
                 handles.append(buf)
             elif isinstance(buf, QuarkTensor):
-                # QuarkTensor with SPV-backed storage: zero-copy via the
-                # backing Vulkan buffer handle. Other-family QuarkTensors
-                # raise below. ``spv_handle`` lookup beats isinstance check
-                # for the common case so we hit it first.
                 h = buf.spv_handle
                 if h is None:
                     raise TypeError(
@@ -576,8 +583,6 @@ class CompiledKernel:
                     "int handle / (handle, ptr) / numpy.ndarray / QuarkTensor."
                 )
 
-        # ``pack_scalars`` returns one bytes object per scalar param.
-        # SPIR-V push-constants want a single contiguous blob — flatten.
         if scalars:
             scalar_blobs = self.param_spec.pack_scalars(tuple(scalars))
             push_bytes = b"".join(scalar_blobs)
@@ -586,12 +591,10 @@ class CompiledKernel:
 
         grid = self.grid_fn(*self.grid_args)
 
-        # Cache the resolved tuple if buffers are stable; subsequent
-        # calls with the same list-identity skip everything above.
-        # Only cache the no-scalars case — push_bytes for non-empty
-        # scalars varies per call.
+        # Cache resolved tuple keyed on the id-tuple. Non-empty
+        # scalars skip caching (push_bytes varies).
         if not scalars:
-            self._spv_fast_cache = (buffers, grid, handles, push_bytes)
+            self._spv_fast_cache = (id_key, grid, handles, push_bytes)
 
         # The driver's launch signature wants the SpvCompiledModule
         # dataclass (with the pipeline handle + n_buffers + push
