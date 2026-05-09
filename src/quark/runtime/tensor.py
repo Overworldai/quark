@@ -1023,7 +1023,9 @@ class QuarkTensor:
     def zero_(self) -> QuarkTensor:
         """Zero this tensor in-place (async). Returns self."""
         nbytes = self.numel() * PC_BYTES[self._dtype]
-        if _IS_METAL:
+        if _IS_METAL or isinstance(self._storage, _SpvStorage):
+            # Both Metal pool buffers and Vulkan host-coherent storage
+            # expose a writable mapped pointer at ``data_ptr``.
             ctypes.memset(self.data_ptr(), 0, nbytes)
         else:
             from quark.runtime.cuda import CudaRuntime
