@@ -524,6 +524,7 @@ class CompiledKernel:
         """
         import numpy as np
         from quark.drivers import _spv_dispatch as _sd
+        from quark.runtime.tensor import QuarkTensor
 
         handles: list[int] = []
         for buf, pspec in zip(buffers, self.param_spec.buffers, strict=False):
@@ -533,6 +534,19 @@ class CompiledKernel:
                 handles.append(buf)
             elif isinstance(buf, tuple) and len(buf) == 2 and isinstance(buf[0], int):
                 handles.append(buf[0])
+            elif isinstance(buf, QuarkTensor):
+                # QuarkTensor with SPV-backed storage: zero-copy via the
+                # backing Vulkan buffer handle. The QuarkTensor on a
+                # different storage family (CUDA / Metal) falls through
+                # to the type error below — backends don't share buffers.
+                h = buf.spv_handle
+                if h is None:
+                    raise TypeError(
+                        f"_launch_spv: QuarkTensor uses non-SPV storage "
+                        f"({type(buf._storage).__name__}); set QUARK_BACKEND="
+                        "spv before allocating tensors that feed SPV launches."
+                    )
+                handles.append(h)
             elif isinstance(buf, np.ndarray):
                 arr = np.ascontiguousarray(buf)
                 h, ptr = _sd.allocate_buffer(arr.nbytes)
@@ -542,8 +556,7 @@ class CompiledKernel:
             else:
                 raise TypeError(
                     f"_launch_spv: buffer is {type(buf).__name__}; expected "
-                    "int handle / (handle, ptr) / numpy.ndarray. QuarkTensor "
-                    "support pending pool integration."
+                    "int handle / (handle, ptr) / numpy.ndarray / QuarkTensor."
                 )
 
         # ``pack_scalars`` returns one bytes object per scalar param.

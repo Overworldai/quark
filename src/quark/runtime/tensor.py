@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os as _os
 import sys as _sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -166,6 +167,12 @@ class _BorrowedStorage:
 # ── Metal storage ────────────────────────────────────────────
 
 _IS_METAL = _sys.platform == "darwin"
+# SPV / Intel storage selection. Opt-in for now — the SPV backend lives
+# on Linux alongside CUDA, so we can't fall through "Linux → CUDA"
+# unconditionally. Set ``QUARK_BACKEND=spv`` (or ``=intel``) to route
+# ``QuarkTensor.empty`` / ``zeros`` / ``from_bytes`` through the
+# Vulkan storage path; otherwise CUDA is the default on non-Apple.
+_IS_SPV = _os.environ.get("QUARK_BACKEND", "").lower() in ("spv", "intel")
 
 
 class _MetalStorage:
@@ -237,6 +244,69 @@ class _MetalStorage:
             pass
 
 
+# ── SPV / Intel Vulkan storage ────────────────────────────────
+
+
+class _SpvStorage:
+    """SPV/Vulkan-backed buffer for ``QuarkTensor`` on Intel.
+
+    The buffer lives in the C extension's internal table, indexed by
+    ``handle`` (the same handle ``_sd.allocate_buffer`` returns).
+    ``ptr`` is the host-coherent mapped pointer the buffer was created
+    with; CPU reads / writes go through it directly (Vulkan's
+    ``HOST_VISIBLE | HOST_COHERENT`` memory type makes them visible to
+    the GPU on the next dispatch without an explicit flush).
+
+    Lifecycle today: buffers persist until ``teardown_device_state``
+    runs at module shutdown. ``_spv_dispatch`` doesn't expose a
+    ``free_buffer`` yet — production callers should keep a per-tensor
+    pool and reuse handles. Adding free-on-release is a follow-up
+    (mirrors the Metal pool-recycle pattern).
+
+    Created via ``_SpvStorage.alloc`` (uninit) or
+    ``_SpvStorage.from_host`` (alloc + ctypes.memmove).
+    """
+
+    __slots__ = ("_refcount", "handle", "nbytes", "ptr")
+
+    def __init__(self, handle: int, ptr: int, nbytes: int):
+        self.handle = handle
+        self.ptr = ptr
+        self.nbytes = nbytes
+        self._refcount = 1
+
+    @staticmethod
+    def alloc(nbytes: int) -> _SpvStorage:
+        """Allocate an uninitialised Vulkan host-coherent buffer."""
+        from quark.drivers import _spv_dispatch as _sd
+
+        h, p = _sd.allocate_buffer(max(nbytes, 1))
+        return _SpvStorage(h, p, max(nbytes, 1))
+
+    @staticmethod
+    def from_host(ptr: int, nbytes: int) -> _SpvStorage:
+        """Copy host bytes into a new Vulkan buffer."""
+        import ctypes as _ctypes
+        from quark.drivers import _spv_dispatch as _sd
+
+        h, p = _sd.allocate_buffer(max(nbytes, 1))
+        if nbytes > 0:
+            _ctypes.memmove(p, ptr, nbytes)
+        return _SpvStorage(h, p, max(nbytes, 1))
+
+    def retain(self) -> _SpvStorage:
+        self._refcount += 1
+        return self
+
+    def release(self) -> None:
+        self._refcount -= 1
+        # No free-buffer API on the dispatch side yet; the buffer
+        # persists for the device's lifetime. Track refcount for
+        # parity with the other Storage classes.
+        if self._refcount <= 0:
+            self.ptr = 0
+
+
 # ── Stride helpers ────────────────────────────────────────────
 
 
@@ -270,7 +340,7 @@ class QuarkTensor:
 
     def __init__(
         self,
-        storage: _CudaStorage | _BorrowedStorage | _MetalStorage,
+        storage: _CudaStorage | _BorrowedStorage | _MetalStorage | _SpvStorage,
         shape: tuple[int, ...],
         strides: tuple[int, ...],
         offset: int,
@@ -281,7 +351,13 @@ class QuarkTensor:
         self._strides = strides
         self._offset = offset  # element offset into storage
         self._dtype = dtype
-        self._device = DeviceSpec("metal" if isinstance(storage, _MetalStorage) else "cuda", 0)
+        if isinstance(storage, _MetalStorage):
+            dev_family = "metal"
+        elif isinstance(storage, _SpvStorage):
+            dev_family = "spv"
+        else:
+            dev_family = "cuda"
+        self._device = DeviceSpec(dev_family, 0)
 
     # ── Metal-specific accessors ──
 
@@ -290,6 +366,15 @@ class QuarkTensor:
         """Handle into ``g_lazy_buffers`` for zero-copy ``queue_launch``.
         Returns ``None`` on CUDA."""
         if isinstance(self._storage, _MetalStorage):
+            return self._storage.handle
+        return None
+
+    @property
+    def spv_handle(self) -> int | None:
+        """Handle into the Vulkan dispatch's buffer table for
+        zero-copy ``compiled.launch``. Returns ``None`` on
+        non-SPV storage."""
+        if isinstance(self._storage, _SpvStorage):
             return self._storage.handle
         return None
 
@@ -325,11 +410,14 @@ class QuarkTensor:
             dtype = _NP_TO_PC.get(name, str(dtype))
         numel = math.prod(shape) if shape else 1
         nbytes = numel * PC_BYTES[dtype]
+        storage: _CudaStorage | _MetalStorage | _SpvStorage
         if _IS_METAL:
             from quark.drivers import _metal_dispatch as _md
 
             h, p = _md.pin_buffer(0, max(nbytes, 1))
             storage = _MetalStorage(h, p, nbytes)
+        elif _IS_SPV:
+            storage = _SpvStorage.alloc(nbytes)
         else:
             storage = _CudaStorage.alloc(nbytes)
         return QuarkTensor(storage, tuple(shape), _contiguous_strides(tuple(shape)), 0, dtype)
@@ -338,7 +426,10 @@ class QuarkTensor:
     def zeros(*shape: int, dtype: str = "bf16") -> QuarkTensor:
         t = QuarkTensor.empty(*shape, dtype=dtype)
         if t._storage.nbytes > 0:
-            if _IS_METAL:
+            if _IS_METAL or _IS_SPV:
+                # Both Metal pool buffers and Vulkan host-coherent
+                # buffers expose the host-mapped pointer at
+                # ``storage.ptr`` — memset directly.
                 ctypes.memset(t._storage.ptr, 0, t._storage.nbytes)
             else:
                 _runtime().memset_d8(t._storage.ptr, 0, t._storage.nbytes)
@@ -365,17 +456,17 @@ class QuarkTensor:
             import numpy as _np
 
             arr = _np.frombuffer(buf, dtype=_np.uint8, count=expected)
-            if _IS_METAL:
-                # Apple unified memory — Metal pool buffers are host-
-                # readable. ctypes.memmove the bytes straight into the
-                # device pointer; the GPU sees them after Metal's
-                # implicit cache-flush on the next dispatch.
+            if _IS_METAL or _IS_SPV:
+                # Host-coherent (Metal pool buffers + Vulkan
+                # ``HOST_VISIBLE | HOST_COHERENT``) memory — the
+                # mapped pointer is writable directly. GPU sees it on
+                # the next dispatch's implicit cache-flush.
                 ctypes.memmove(t._storage.ptr, arr.ctypes.data, expected)
             else:
                 _runtime().memcpy_htod(t._storage.ptr, arr.ctypes.data, expected)
         else:
             host_arr = (ctypes.c_ubyte * len(buf)).from_buffer_copy(buf)
-            if _IS_METAL:
+            if _IS_METAL or _IS_SPV:
                 ctypes.memmove(t._storage.ptr, ctypes.addressof(host_arr), expected)
             else:
                 _runtime().memcpy_htod(t._storage.ptr, ctypes.addressof(host_arr), expected)
@@ -398,6 +489,15 @@ class QuarkTensor:
             from quark.runtime.sync import synchronize
 
             synchronize()
+            ctypes.memmove(ctypes.addressof(host_buf), t.data_ptr(), nbytes)
+        elif _IS_SPV:
+            # Vulkan host-coherent buffers: drain any in-flight
+            # dispatches via ``_sd.sync()`` so the GPU's writes are
+            # visible to the host pointer, then memmove from the
+            # mapped ``ptr``.
+            from quark.drivers import _spv_dispatch as _sd
+
+            _sd.sync()
             ctypes.memmove(ctypes.addressof(host_buf), t.data_ptr(), nbytes)
         else:
             _runtime().memcpy_dtoh(ctypes.addressof(host_buf), t.data_ptr(), nbytes)
@@ -447,6 +547,9 @@ class QuarkTensor:
         if _IS_METAL:
             storage = _MetalStorage.from_host(arr.ctypes.data, int(arr.nbytes))
             return QuarkTensor(storage, shape, _contiguous_strides(shape), 0, dtype)
+        if _IS_SPV:
+            storage = _SpvStorage.from_host(arr.ctypes.data, int(arr.nbytes))
+            return QuarkTensor(storage, shape, _contiguous_strides(shape), 0, dtype)
         raw = arr.tobytes()
         return QuarkTensor.from_bytes(raw, shape, dtype)
 
@@ -482,6 +585,20 @@ class QuarkTensor:
             total = math.prod(self._shape) * elem_size
             # ctypes char arrays implement the buffer protocol; ty's stubs
             # for np.frombuffer don't list it as a buffer-protocol overload.
+            return (
+                np.frombuffer(  # ty: ignore[no-matching-overload]
+                    (ctypes.c_char * total).from_address(buf_ptr), dtype=np_dt
+                )
+                .reshape(self._shape)
+                .copy()
+            )
+        if isinstance(self._storage, _SpvStorage):
+            from quark.drivers import _spv_dispatch as _sd
+
+            _sd.sync()
+            elem_size = np_dt.itemsize
+            buf_ptr = self._storage.ptr + self._offset * elem_size
+            total = math.prod(self._shape) * elem_size
             return (
                 np.frombuffer(  # ty: ignore[no-matching-overload]
                     (ctypes.c_char * total).from_address(buf_ptr), dtype=np_dt
