@@ -167,12 +167,54 @@ class _BorrowedStorage:
 # ── Metal storage ────────────────────────────────────────────
 
 _IS_METAL = _sys.platform == "darwin"
-# SPV / Intel storage selection. Opt-in for now — the SPV backend lives
-# on Linux alongside CUDA, so we can't fall through "Linux → CUDA"
-# unconditionally. Set ``QUARK_BACKEND=spv`` (or ``=intel``) to route
-# ``QuarkTensor.empty`` / ``zeros`` / ``from_bytes`` through the
-# Vulkan storage path; otherwise CUDA is the default on non-Apple.
-_IS_SPV = _os.environ.get("QUARK_BACKEND", "").lower() in ("spv", "intel")
+
+
+def _detect_is_spv() -> bool:
+    """Decide whether ``QuarkTensor`` factories should route to
+    ``_SpvStorage`` instead of CUDA storage.
+
+    Resolution order:
+      1. ``QUARK_BACKEND`` env var set to ``spv`` / ``intel`` —
+         explicit override, even on dual-driver hosts.
+      2. ``QUARK_FORCE_BACKEND=intel_gpu`` — same path that
+         ``device.current_device`` honours, kept consistent so
+         tensor-side and dispatch-side detection agree.
+      3. Auto-detect: only fall through to SPV when CUDA is
+         genuinely unavailable AND the Vulkan probe finds an
+         Intel device. On NVIDIA workstations CUDA wins; on
+         Linux + Intel-only hosts we route to SPV without env
+         twiddling.
+
+    Cached on first call — the import-time eager probe was a
+    cycle hazard (``quark.drivers.spv`` pulls in ``quark.ir``
+    which used to back-import ``quark.runtime.tensor``). Lazy
+    via this helper avoids that.
+    """
+    backend = _os.environ.get("QUARK_BACKEND", "").lower()
+    if backend in ("spv", "intel"):
+        return True
+    if _os.environ.get("QUARK_FORCE_BACKEND", "").lower() == "intel_gpu":
+        return True
+    if _IS_METAL:
+        return False
+    # CUDA-first: if libcuda loads, leave CUDA the default.
+    try:
+        from quark.runtime.cuda import CudaRuntime
+
+        if CudaRuntime.instance().device_count() > 0:
+            return False
+    except Exception:
+        pass
+    # CUDA unavailable — try the Vulkan probe.
+    try:
+        from quark.drivers import spv as _spv_drivers
+
+        return _spv_drivers.is_available()
+    except Exception:
+        return False
+
+
+_IS_SPV = _detect_is_spv()
 
 
 class _MetalStorage:

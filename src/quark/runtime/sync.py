@@ -16,7 +16,34 @@ from quark.ir import DType
 import os as _os
 
 _IS_METAL = sys.platform == "darwin"
-_IS_SPV = _os.environ.get("QUARK_BACKEND", "").lower() in ("spv", "intel")
+
+
+def _detect_is_spv() -> bool:
+    """Match ``runtime.tensor._detect_is_spv``: env-var override
+    first, then auto-detect (CUDA wins if available, else Vulkan)."""
+    backend = _os.environ.get("QUARK_BACKEND", "").lower()
+    if backend in ("spv", "intel"):
+        return True
+    if _os.environ.get("QUARK_FORCE_BACKEND", "").lower() == "intel_gpu":
+        return True
+    if _IS_METAL:
+        return False
+    try:
+        from quark.runtime.cuda import CudaRuntime
+
+        if CudaRuntime.instance().device_count() > 0:
+            return False
+    except Exception:
+        pass
+    try:
+        from quark.drivers import spv as _spv_drivers
+
+        return _spv_drivers.is_available()
+    except Exception:
+        return False
+
+
+_IS_SPV = _detect_is_spv()
 
 
 def synchronize() -> None:
