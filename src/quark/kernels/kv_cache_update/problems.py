@@ -29,6 +29,28 @@ def kv_cache_update_problems() -> list[Problem]:
             },
             tags={"smoke", "small", "dense"},
         ),
+        # ``packed_qkv=True`` — the production model invocation. Q,
+        # K, V live as column slabs of one fused buffer; the kernel
+        # reads K + V at column offsets and rotates them into the
+        # ring. Adding this here so smoke catches Intel-SPV (and
+        # whichever other backend regresses on this path) at the
+        # kernel level instead of only when a multi-layer model
+        # forward trips Mesa DEVICE_LOST. ``n_q_heads = gqa_ratio
+        # * n_kv_heads`` mirrors the Waypoint-1.5-1B layer config.
+        Problem(
+            "smoke_packed_qkv",
+            {
+                **common,
+                "n_kv_heads": 2,
+                "H_spatial": 8,
+                "W_spatial": 8,
+                "num_buckets": 4,
+                "pinned_dilation": 1,
+                "packed_qkv": True,
+                "n_q_heads": 4,
+            },
+            tags={"smoke", "small", "dense", "packed_qkv"},
+        ),
         # bf16 KV cache — Metal production path.
         Problem(
             "owl_360p_dense",
