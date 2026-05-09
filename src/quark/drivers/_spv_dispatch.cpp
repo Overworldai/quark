@@ -582,17 +582,23 @@ void bind_device_internal(uint32_t index) {
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     check(vkCreateFence(g.device, &fci, nullptr, &g.fence), "vkCreateFence");
 
-    // Descriptor pool — sized for ~64 unique pipeline launches
-    // before reset; 8 storage-buffer slots per launch is plenty
-    // for the kernels in tree (qkv_proj at 5 buffers is the upper
-    // bound today). Resize on demand later.
+    // Descriptor pool — sized to fit one descriptor set per
+    // (pipeline, buffer-tuple) combination across an entire
+    // Waypoint-sized model. The previous 64-set ceiling was fine
+    // for kernel smoke tests but ran out the moment a multi-layer
+    // model started compiling distinct pipelines for every (layer,
+    // op) pair (e.g. ~24 layers × ~10 ops × multiple pipelines per
+    // op variant easily exceeds 64). 4096 sets × 16 storage-buffer
+    // slots/set covers Waypoint-1.5-1B comfortably. Vulkan accepts
+    // generous pool sizes; the cost is a one-time virtual-address
+    // reservation, not committed memory.
     VkDescriptorPoolSize ps{};
     ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps.descriptorCount = 64 * 8;
+    ps.descriptorCount = 4096 * 16;
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = 64;
+    dpci.maxSets = 4096;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &ps;
     check(vkCreateDescriptorPool(g.device, &dpci, nullptr, &g.desc_pool),
