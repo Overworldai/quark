@@ -17,26 +17,15 @@ _CUDA = {"cuda", "cuda-dense", "cuda-moe", "production"}
 def kv_cache_update_problems() -> list[Problem]:
     common = {"B": 1, "n_kv_heads": 16, "Dh": 64}
     return [
-        Problem(
-            "smoke_dense",
-            {
-                **common,
-                "n_kv_heads": 2,
-                "H_spatial": 8,
-                "W_spatial": 8,
-                "num_buckets": 4,
-                "pinned_dilation": 1,
-            },
-            tags={"smoke", "small", "dense"},
-        ),
         # ``packed_qkv=True`` — the production model invocation. Q,
         # K, V live as column slabs of one fused buffer; the kernel
         # reads K + V at column offsets and rotates them into the
-        # ring. Adding this here so smoke catches Intel-SPV (and
-        # whichever other backend regresses on this path) at the
-        # kernel level instead of only when a multi-layer model
-        # forward trips Mesa DEVICE_LOST. ``n_q_heads = gqa_ratio
-        # * n_kv_heads`` mirrors the Waypoint-1.5-1B layer config.
+        # ring. Listed FIRST so the smoke harness picks it up via
+        # its "first valid problem" probe — otherwise the legacy
+        # ``smoke_dense`` (packed_qkv=False) hides any regression
+        # along the column-offset path (which is the path the
+        # Waypoint forward exercises). ``n_q_heads = gqa_ratio *
+        # n_kv_heads`` mirrors the Waypoint-1.5-1B layer config.
         Problem(
             "smoke_packed_qkv",
             {
@@ -50,6 +39,18 @@ def kv_cache_update_problems() -> list[Problem]:
                 "n_q_heads": 4,
             },
             tags={"smoke", "small", "dense", "packed_qkv"},
+        ),
+        Problem(
+            "smoke_dense",
+            {
+                **common,
+                "n_kv_heads": 2,
+                "H_spatial": 8,
+                "W_spatial": 8,
+                "num_buckets": 4,
+                "pinned_dilation": 1,
+            },
+            tags={"smoke", "small", "dense"},
         ),
         # bf16 KV cache — Metal production path.
         Problem(
