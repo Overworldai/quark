@@ -87,18 +87,32 @@ def lazy(*, sync: bool = True):
         yield
     finally:
         _LAZY.reset(token)
-        # Drain lazy queue first (graph-node ops), then eager ops.
-        from quark.drivers import _metal_dispatch as _md
+        # Backend-aware drain. Metal has a separate lazy queue
+        # (graph-node ops) plus an eager encoder; SPV / Vulkan just
+        # accumulates submitted-but-unwaited dispatches in the
+        # compute queue and ``vkDeviceWaitIdle`` drains everything.
+        # CUDA's per-call sync is unaffected by ``_LAZY``.
+        import sys as _sys
 
-        if _md.has_lazy_pending():
-            _md.eval_queue()
-        from quark.functional._dispatch import clear_strided_copy_meta
+        if _sys.platform == "darwin":
+            from quark.drivers import _metal_dispatch as _md
 
-        clear_strided_copy_meta()
-        if sync:
-            launcher().driver.sync(None)
+            if _md.has_lazy_pending():
+                _md.eval_queue()
+            from quark.functional._dispatch import clear_strided_copy_meta
+
+            clear_strided_copy_meta()
+            if sync:
+                launcher().driver.sync(None)
+            else:
+                _md.commit_no_wait()
         else:
-            _md.commit_no_wait()
+            # Linux / SPV (or CUDA — no-op there since per-call
+            # sync is enforced regardless of _LAZY).
+            if sync:
+                from quark.runtime.sync import synchronize as _sync
+
+                _sync()
 
 
 def eval():
