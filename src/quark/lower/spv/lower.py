@@ -238,6 +238,15 @@ def _emit_dtype(text: SpvText, dt: DType, ctx: "_SpvCtx | None" = None) -> str:
     )
 
 
+# Battlemage subgroup width — pinned to 32 via the
+# ``VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`` mechanism in
+# ``_spv_dispatch.cpp`` (PORTABILITY_PLAN §3.5 v1 policy). Every
+# Frag* visitor and lane-slot partition assumes this value; lifting it
+# means threading caps through the lowerer + supporting per-shape
+# multi-variant compile (Xe-LPG SIMD8/16 territory in v3).
+_SUBGROUP_WIDTH = 32
+
+
 def _dtype_byte_width(dt: DType) -> int:
     if dt in (DType.F32, DType.U32, DType.S32):
         return 4
@@ -2615,7 +2624,7 @@ def _visit_frag_for_each(op: FragForEachOp, ctx: _SpvCtx) -> None:
     shape = cfg.shape
     rows, cols, dtype = _coop_dims_for(shape, "c")
     n_elems = rows * cols
-    subgroup_width = 32  # Battlemage. TODO: pull from caps when Xe-LPG lands.
+    subgroup_width = _SUBGROUP_WIDTH
     if n_elems % subgroup_width != 0:
         raise NotImplementedError(
             f"_visit_frag_for_each: tile {rows}×{cols}={n_elems} not "
@@ -2944,7 +2953,7 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _SpvCtx) -> None:
         )
 
     n_elems = rows * cols
-    subgroup_width = 32
+    subgroup_width = _SUBGROUP_WIDTH
     if n_elems % subgroup_width != 0:
         raise NotImplementedError(
             f"_visit_frag_reduce: tile {rows}×{cols} not divisible "
@@ -3175,7 +3184,7 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _SpvCtx) -> None:
     # per-warp so multi-warp kernels don't race on the same range.
     src_n_elems = src_rows * src_cols
     dst_n_elems = dst_rows * dst_cols
-    subgroup_width = 32
+    subgroup_width = _SUBGROUP_WIDTH
     n_warps = max(1, (
         ctx.local_size[0] * ctx.local_size[1] * ctx.local_size[2]
     ) // 32)
@@ -3460,7 +3469,7 @@ def _visit_frag_apply(op: FragApplyOp, ctx: _SpvCtx) -> None:
     shape = cfg.shape
     rows, cols, dtype = _coop_dims_for(shape, "c")
     n_elems = rows * cols
-    subgroup_width = 32
+    subgroup_width = _SUBGROUP_WIDTH
     if n_elems % subgroup_width != 0:
         raise NotImplementedError(
             f"_visit_frag_apply: tile {rows}×{cols} not divisible by "
