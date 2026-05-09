@@ -333,7 +333,17 @@ class CompiledKernel:
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.METAL:
             return self._launch_metal(buffers, scalars, persistent_outs=persistent_outs)
         if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.INTEL_GPU:
-            return self._launch_spv(buffers, scalars, sync=sync)
+            # ``quark.lazy()`` flips ``_LAZY`` to True; under it, the
+            # SPV launch skips the per-call ``vkWaitForFences`` so
+            # dispatches accumulate in the queue. Caller must
+            # ``synchronize()`` before reading outputs (the same
+            # contract the Metal lazy mode uses). Saves ~70 μs per
+            # launch on the steady-state cmd_buf-cache hit, which
+            # dominates the per-frame cost on dispatch-bound stacks
+            # like Waypoint forward (24 layers × ~10 ops/layer ×
+            # 5 sigmas = ~1200 launches/frame).
+            spv_sync = sync and not _LAZY.get()
+            return self._launch_spv(buffers, scalars, sync=spv_sync)
 
         return self._launch_cuda(buffers, scalars, stream)
 
