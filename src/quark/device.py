@@ -392,9 +392,15 @@ def _detect_family() -> DeviceFamily:
     """Auto-detect the active backend.
 
     Detection order (first match wins):
-      1. CUDA   (libcuda probe finds a device)
-      2. Metal  (metal-cpp driver detects a device)
-      3. CPU    (always available as a fallback)
+      1. CUDA      (libcuda probe finds a device)
+      2. Metal     (metal-cpp driver detects a device)
+      3. INTEL_GPU (Vulkan / SPV probe finds a device — Linux iGPU)
+      4. CPU       (always available as a fallback)
+
+    Intel SPV is below CUDA in the auto-detect order so a CUDA box
+    with both libcuda and Vulkan available stays on CUDA. Force
+    via ``QUARK_FORCE_BACKEND=intel_gpu`` to override on dual-driver
+    machines (or any other family).
 
     ROCm / OpenCL aren't auto-detected; force via ``QUARK_FORCE_BACKEND``
     and plug a dedicated probe when a user lands on that path.
@@ -415,6 +421,13 @@ def _detect_family() -> DeviceFamily:
 
         if is_available():
             return DeviceFamily.METAL
+    except Exception:
+        pass
+    try:
+        from quark.drivers import spv as _spv_drivers
+
+        if _spv_drivers.is_available():
+            return DeviceFamily.INTEL_GPU
     except Exception:
         pass
     return DeviceFamily.CPU
@@ -438,6 +451,12 @@ def current_device() -> Device:
         return _probe_cuda_via_libcuda(index=0)
     if family is DeviceFamily.METAL:
         return _probe_metal(index=0)
+    if family is DeviceFamily.INTEL_GPU:
+        # SpvDriver.__init__ runs ``ensure_device`` and populates a
+        # full DeviceCaps via ``_spv_dispatch.probe`` — reuse it.
+        from quark.drivers import spv as _spv_drivers
+
+        return _spv_drivers.SpvDriver().device
     raise NotImplementedError(
         f"current_device(): family {family.value!r} not yet implemented. "
         f"Set {_FORCE_BACKEND_ENV}=cuda or {_FORCE_BACKEND_ENV}=metal."
