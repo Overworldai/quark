@@ -13,7 +13,10 @@ from typing import Any
 
 from quark.ir import DType
 
+import os as _os
+
 _IS_METAL = sys.platform == "darwin"
+_IS_SPV = _os.environ.get("QUARK_BACKEND", "").lower() in ("spv", "intel")
 
 
 def synchronize() -> None:
@@ -27,6 +30,10 @@ def synchronize() -> None:
     ``quark.lazy()`` block (e.g. the bench's seed commit) silently
     leave their dispatches sitting in the queue, and later phases
     (warmup, generation) execute them out-of-order with stale state.
+
+    On SPV: ``_sd.sync`` calls ``vkDeviceWaitIdle`` which drains
+    everything in flight on the compute queue. Async-mode launches
+    (``sync=False``) accumulate in the queue until this fires.
     """
     if _IS_METAL:
         from quark.drivers import _metal_dispatch as _md
@@ -35,6 +42,11 @@ def synchronize() -> None:
             _md.eval_queue()
         if _md.has_pending():
             _md.eval()
+        return
+    if _IS_SPV:
+        from quark.drivers import _spv_dispatch as _sd
+
+        _sd.sync()
         return
     from quark.runtime.cuda import CudaRuntime
 
