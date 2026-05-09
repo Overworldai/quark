@@ -524,29 +524,12 @@ class CompiledKernel:
         plus the lengths of the resolved handles. Mutating the
         buffers list itself (rare) or rebinding to a different list
         misses the cache; the slow path then refills it.
-        """
 
-        Per-buffer policy:
-          * ``int`` — opaque buffer handle previously returned by
-            ``SpvDriver.allocate_buffer``. Passed through as-is.
-          * ``(handle, mapped_ptr)`` tuple — same shape
-            ``allocate_buffer`` returns; the handle is the first
-            element, mapped_ptr is the host-visible mapping the
-            caller writes / reads through (already used by the
-            test harness; the launcher just consumes the handle).
-          * ``QuarkTensor`` — TODO. The pool of Vulkan-backed
-            QuarkTensor allocations isn't wired today; once it is,
-            zero-copy via ``buffer_handle`` mirrors the Metal
-            ``metal_handle`` path. For v1, callers route through
-            ``SpvDriver.allocate_buffer`` directly.
-          * ``numpy.ndarray`` — copied into a fresh Vulkan buffer
-            allocated on the fly and the handle is passed. Cheaper
-            for tests; production code should reuse pinned buffers.
-
-        Scalars are packed into push constants via
-        ``param_spec.pack_scalars``. The compiled module's
-        ``push_size`` validation in ``SpvDriver.launch`` catches
-        size mismatches.
+        Per-buffer policy on the slow path: ``int`` handle,
+        ``(handle, mapped_ptr)`` tuple, ``QuarkTensor`` with SPV
+        storage, or ``numpy.ndarray`` (copied into a fresh Vulkan
+        buffer per call — production code should pin tensors via
+        QuarkTensor instead).
         """
         from quark.drivers import _spv_dispatch as _sd
 
