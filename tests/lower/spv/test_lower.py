@@ -1249,6 +1249,14 @@ def _build_kernel_with_intel_shape(kernel_name):
 
 _MMA_KERNELS_WITH_FORCED_INTEL_SHAPE = (
     "gemm", "attn", "moe_inproj", "moe_outproj", "patchify", "unpatchify",
+    # owl_attn lands here once the lowerer fixes from this branch
+    # (eb859f2 / 4d05c73 — shared coopmat-trace helper for if/for
+    # carries; 10b695b / f69dfe7 — re-emit builtin OpLoads to fix
+    # cross-block dominance) make the binary spirv-val clean and Mesa
+    # dispatch correctly. Default config is now NCW=2 KvTile=16
+    # (commit 63be11f) which produces cos_sim=0.9935 vs the numpy
+    # reference at owl_360p_dense.
+    "owl_attn",
 )
 
 
