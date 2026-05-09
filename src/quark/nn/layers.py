@@ -18,7 +18,11 @@ from quark.nn.module import (
     _zeros,
 )
 
+import os as _os
+
 _IS_METAL = sys.platform == "darwin"
+_IS_SPV = _os.environ.get("QUARK_BACKEND", "").lower() in ("spv", "intel")
+_IS_HOST_COHERENT = _IS_METAL or _IS_SPV  # mapped device pointers — memmove works in place
 
 
 def _quark_dtype(t) -> str:
@@ -74,13 +78,15 @@ def _tag_carrier(arr, dtype: str):
 
 
 def _set_s32(t, value: int) -> None:
-    """Write a single-element s32 tensor to ``value`` (Metal-aware)."""
-    if _IS_METAL:
-        # Numpy carrier — write directly via ctypes.
+    """Write a single-element s32 tensor to ``value`` (Metal- + SPV-aware)."""
+    if _IS_HOST_COHERENT:
+        # Mapped pointer — write directly via ctypes. Metal pool
+        # buffers and Vulkan ``HOST_VISIBLE | HOST_COHERENT`` memory
+        # both expose the device pointer as a host-writable address.
         import ctypes
 
         bits = (int(value) & 0xFFFFFFFF).to_bytes(4, "little")
-        if hasattr(t, "metal_handle") or hasattr(t, "data_ptr"):
+        if hasattr(t, "metal_handle") or hasattr(t, "spv_handle") or hasattr(t, "data_ptr"):
             ctypes.memmove(t.data_ptr(), bits, 4)
         else:
             # Plain numpy carrier — overwrite in place.
