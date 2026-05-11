@@ -1,0 +1,15 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+
+)
+{
+    .reg .f32 %f0;
+    .reg .s32 %rs0;
+
+    mov.f32 %f0, 0f3fc00000;
+    cvt.s32.f32 %rs0, %f0;
+    ret;
+}

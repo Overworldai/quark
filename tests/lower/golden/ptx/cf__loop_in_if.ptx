@@ -1,0 +1,32 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+
+)
+{
+    .reg .f32 %f0, %f1;
+    .reg .pred %p0, %p1, %p2;
+    .reg .u32 %r0, %r1, %r2, %r3;
+
+    mov.f32 %f0, 0f3f800000;
+    mov.f32 %f1, 0f00000000;
+    setp.lt.f32 %p0, %f1, %f0;
+    mov.u32 %r0, 0;
+    mov.u32 %r1, 4;
+    mov.u32 %r2, 1;
+    @!%p0 bra $ELSE_1;
+    mov.u32 %r3, %r0;
+    setp.lt.u32 %p1, %r3, %r1;
+    @!%p1 bra $LEND_3;
+$L_4:
+    add.u32 %r3, %r3, %r2;
+    setp.lt.u32 %p2, %r3, %r1;
+    @%p2 bra $L_4;
+$LEND_3:
+    bra $ENDIF_2;
+$ELSE_1:
+$ENDIF_2:
+    ret;
+}

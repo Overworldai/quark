@@ -1,0 +1,1 @@
+    uint _pc_u32_0 = threadgroup_position_in_grid.x;

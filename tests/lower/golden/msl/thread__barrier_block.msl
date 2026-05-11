@@ -1,0 +1,1 @@
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);

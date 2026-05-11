@@ -1,0 +1,67 @@
+"""GemmConfig — tunable parameters for the universal GEMM.
+
+The config controls the block tiling, warp count, pipeline depth,
+and which mma shape the kernel uses. The autotune search walks the
+cartesian product of `tune_space()` and picks the fastest valid
+config per problem × device.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from quark.kernels.base import KernelConfig
+
+
+@dataclass(frozen=True)
+class GemmConfig(KernelConfig):
+    """Tunable GEMM knobs.
+
+    BM / BN / BK are the tile dimensions the proposal calls
+    MTile / NTile / KChunk. n_stages is NStages (cp.async pipeline
+    depth: 1 = synchronous, 2 = double buffer, 3 = triple).
+
+    ``impl`` tags which implementation executes the config. ``"ptx"``
+    (default) uses the in-repo PTX kernel and all the tiling knobs
+    below. ``"cublas"`` routes to cublasLtMatmul — the knobs are
+    don't-care in that case (cublasLt picks its own algorithm
+    internally). Keeping both variants under one dataclass keeps the
+    autotune cache schema stable: on-disk records carry the same
+    field set regardless of implementation, with ``impl`` distinguishing
+    the two paths at dispatch time. Existing cached configs without
+    the ``impl`` field deserialize with the default ``"ptx"``.
+    """
+
+    BM: int = 64
+    BN: int = 64
+    BK: int = 16  # must be a multiple of the mma inner-K dimension
+    n_warps: int = 4
+    n_stages: int = 2
+    a_pad: int = 0  # smem row padding for A (bank-conflict avoidance)
+    b_pad: int = 0  # smem row padding for B
+    # Per-MMA-site shape (MMA_SHAPES M3). Autotune fills this from
+    # device.caps.matmul_shapes filtered by mma_sites(). Empty string
+    # falls back to the kernel's compute-dtype default (k=16).
+    main_shape: str = ""
+    # Split-K: partition the K dimension across split_k blocks.
+    # Each block computes K // split_k iterations and atomically
+    # adds its partial sum to the output. Requires out_dtype=F32
+    # (atomic add is only supported for f32).
+    split_k: int = 1
+    # Which implementation executes this config. Default ``"ptx"``
+    # matches pre-existing cached configs (missing field deserializes
+    # to the default). ``"cublas"`` routes to ``CublasRuntime.matmul``;
+    # all PTX knobs above are ignored.
+    impl: str = "ptx"
+
+    @classmethod
+    def default_for(cls, spec) -> GemmConfig:
+        # Pad granule follows compute dtype (16 for 1-byte fp8, 8 for
+        # 2-byte bf16/fp16). n_stages=2 needs an even K-iter count.
+        # Shape selection is now the autotuner's job via ``main_shape``
+        # (MMA_SHAPES M3) — default_for leaves it empty; ``_mma_cfg``
+        # resolves empty to the compute-dtype default.
+        fp8 = spec.compute_dtype_resolved.bytes == 1
+        pad = 16 if fp8 else 8
+        n_stages = 2 if (spec.K % (2 * 32) == 0) else 1
+        return cls(BM=64, BN=64, BK=32, n_warps=4, n_stages=n_stages, a_pad=pad)

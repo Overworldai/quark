@@ -1,0 +1,17 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+    .param .u64 X
+)
+{
+    .reg .u32 %r0, %r1, %r2;
+    .reg .u64 %rd0;
+
+    ld.param.u64 %rd0, [X];
+    mov.u32 %r0, 0;
+    mov.u32 %r1, 1;
+    atom.global.add.u32 %r2, [%rd0], %r1;
+    ret;
+}

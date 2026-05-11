@@ -1,0 +1,9 @@
+    uint _pc_u32_0 = 0u;
+    uint _pc_u32_1 = 2u;
+    uint _pc_u32_2 = 1u;
+    for (uint _pc_u32_3 = _pc_u32_0; _pc_u32_3 < _pc_u32_1; _pc_u32_3 += _pc_u32_2) {
+        for (uint _pc_u32_4 = _pc_u32_0; _pc_u32_4 < _pc_u32_1; _pc_u32_4 += _pc_u32_2) {
+            for (uint _pc_u32_5 = _pc_u32_0; _pc_u32_5 < _pc_u32_1; _pc_u32_5 += _pc_u32_2) {
+            }
+        }
+    }

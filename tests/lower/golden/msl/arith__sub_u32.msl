@@ -1,0 +1,3 @@
+    uint _pc_u32_0 = 3u;
+    uint _pc_u32_1 = 4u;
+    uint _pc_u32_2 = _pc_u32_0 - _pc_u32_1;

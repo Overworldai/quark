@@ -1,0 +1,221 @@
+[project]
+name = "quark"
+version = "0.1.0"
+description = "Typed-IR GPU kernel compiler with PTX (CUDA) and MSL (Apple Metal) backends."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Overworld" },
+]
+maintainers = [
+    { name = "Overworld" },
+]
+keywords = ["gpu", "kernel", "cuda", "metal", "ptx", "msl", "compiler", "ir", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# Runtime deps: numpy only. The Metal backend is a built-in C++
+# extension (_metal_dispatch) compiled from metal-cpp headers —
+# no PyObjC, no MLX, no torch. The extension is only built on
+# macOS. The model path consumes raw safetensors via
+# ``huggingface_hub``.
+dependencies = [
+    "huggingface-hub>=1.12.2",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/Overworldai/quark"
+Repository = "https://github.com/Overworldai/quark"
+Issues = "https://github.com/Overworldai/quark/issues"
+Changelog = "https://github.com/Overworldai/quark/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# ``pip install .[dev]`` pulls the test runner.
+dev = [
+    "pytest",
+]
+# ``pip install .[taehv]`` enables the ANE TAEHV decoder via
+# CoreML at runtime. Pure-numpy: coremltools loads the
+# ``.mlpackage`` artifacts and ``predict()`` runs on the Apple
+# Neural Engine; Pillow handles the bilinear resizes that the
+# torch path used to do via ``F.interpolate``. NO torch, NO MLX.
+# Use ``python -m quark.taehv.export`` (with the ``[export]``
+# extras below) once per resolution to generate the ``.mlpackage``
+# artifacts the runtime reads.
+taehv = [
+    "coremltools>=8.0",
+    "Pillow",
+]
+# ``pip install .[export]`` pulls the torch + taehv deps needed
+# only for the one-time CoreML export of TAEHV encoder/decoder
+# (run by maintainers / when adding a new resolution). The runtime
+# ``quark.taehv`` package never imports either.
+export = [
+    "torch>=2.0",
+    "taehv",
+    "coremltools>=8.0",
+    "huggingface-hub>=1.12.2",
+]
+# ``pip install .[engine]`` enables ``quark.Engine`` — the standalone
+# Waypoint-1.5 inference wrapper that matches the ``world_engine``
+# API. Needs torch (for the vendored TAEHV VAE in
+# ``quark.models.vae``), Pillow (image IO), PyYAML (config loader
+# transitive via ``huggingface_hub``), and einops (TAEHV layers).
+# Quark's runtime DiT path is torch-free; the dependency surface
+# here is for the VAE side only.
+#
+# On Apple Silicon, ``Engine`` uses ``quark.taehv`` (CoreML/ANE)
+# for the VAE instead of the torch ChunkedStreamingTAEHV — pull
+# in the ``[taehv]`` extra so ``coremltools`` is present at
+# runtime. Self-referential pin via ``quark[taehv]`` rather than
+# duplicating the dep list, so any future changes to ``[taehv]``
+# propagate.
+engine = [
+    "torch>=2.0",
+    "Pillow",
+    "PyYAML",
+    "einops",
+    "quark[taehv] ; sys_platform == 'darwin'",
+]
+
+[tool.uv.sources]
+# ``taehv`` ships only on the upstream GitHub; pulled in by the
+# ``[export]`` extras for the one-time CoreML export of the encoder /
+# decoder ``.mlpackage`` artifacts. Runtime never imports it.
+taehv = { url = "https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip" }
+
+[build-system]
+requires = ["setuptools>=68", "nanobind>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+
+# ── ruff: format + lint config ──
+# Pinned via uvx in tools/hooks/pre-commit (RUFF_PIN). Bumping the
+# pin without updating these knobs is fine; ruff is backward-
+# compatible across minors.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort (import order)
+    "UP",          # pyupgrade
+    "B",           # bugbear
+    "C4",          # comprehensions
+    "SIM",         # simplifications
+    "RUF",         # ruff-specific
+]
+ignore = [
+    "E501",        # line too long — formatter handles it
+    "E731",        # lambda assigned to a variable — explicitly allowed
+    "B008",        # function call in default arg — common in dataclass field=factory()
+    "B904",        # `raise from` — opt in case-by-case
+    "SIM102",      # nested if/if — readability call
+    "SIM103",      # return condition directly — awkward in is_valid chains
+    "SIM108",      # ternary instead of if/else — readability call
+    "SIM117",      # combine `with` statements — readability call
+    "UP007",       # X | Y vs Optional[X] — both fine
+    "UP045",       # X | None — same
+    "C408",        # dict() vs {} — readability call when keys are dynamic
+    # Ambiguous-unicode: we use ×, –, —, ✓, ✗, ✱ in docstrings,
+    # comments, and shell help text on purpose — they're load-bearing
+    # for human-readable output. Ruff's default is paranoid.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # Tuple-concat style: `(a, *b)` vs `a + b`. Both are fine; the
+    # explicit form is often more readable when one side is a single
+    # element being prepended.
+    "RUF005",
+    # Unpacked variable never used — we use _ prefixing where it
+    # matters but a lot of test cases unpack `(a, _)` and ruff
+    # flags it anyway.
+    "RUF059",
+    # match= patterns with metacharacters: we want substring matches,
+    # not regex semantics, but rewriting every test to use re.escape
+    # is noise.
+    "RUF043",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "SIM", "RUF012"]   # tests can be messier
+"tools/ci/**" = ["B"]                  # ci scripts can import freely
+"tools/**" = ["B"]                     # ditto for top-level tools
+"proposals/**" = ["E", "F", "W"]       # markdown-embedded snippets
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+
+# ── ty: type checker config (Astral, Rust-based, mypy successor) ──
+# Pinned via uvx in tools/hooks/pre-commit (TY_PIN). ty is in
+# preview as of early 2026; if the version goes bad, bump TY_PIN
+# or fall back to mypy via the same hook.
+#
+# ty's config schema is `[tool.ty.rules]` (rule severities) and
+# `[[tool.ty.overrides]]` (array of include/exclude tables, NOT a
+# map). The environment (python version, src dirs) is auto-detected
+# from `[project] requires-python` and the venv at `.venv/`. The
+# cleanup proposal §8.3 wanted strict on the IR layer and looser on
+# tests/tools — the override table below pins that, with lambdas
+# and other dynamic patterns explicitly allowed everywhere.
+
+[tool.ty.rules]
+# Tighten what we care about: undefined references, bad assignments,
+# calls to non-callables. These are real bugs, not style.
+possibly-unresolved-reference = "error"
+invalid-assignment = "error"
+call-non-callable = "error"
+# Lambdas, dynamic attribute access, and **kwargs spreading are
+# all common in the test fixtures and the IR builder API. Don't
+# warn on them.
+unresolved-attribute = "warn"
+unresolved-import = "warn"
+# NumPy's type stubs are incomplete in spots (lazy attribute
+# exposure, overload gaps). Ignore missing-attr noise so lint stays
+# actionable on real bugs.
+possibly-missing-attribute = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/**", "tools/**"]
+[tool.ty.overrides.rules]
+possibly-unresolved-reference = "warn"
+unresolved-attribute = "ignore"
+unresolved-import = "ignore"
+# Test fixtures and tool scripts routinely build kwargs dicts that
+# flow into dataclass constructors; ty can't narrow per-key types
+# through dict.update() and flags every field. These are real-typed
+# inputs at runtime — silence across tests/tools only.
+invalid-argument-type = "ignore"
+# Test monkey-patches to module globals (for isolation) are
+# intentional, not shadowing bugs.
+invalid-assignment = "ignore"
+

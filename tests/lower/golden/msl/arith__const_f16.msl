@@ -1,0 +1,1 @@
+    half _pc_f16_0 = static_cast<half>(1.0f);

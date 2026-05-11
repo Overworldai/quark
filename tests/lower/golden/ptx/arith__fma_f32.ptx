@@ -1,0 +1,16 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+
+)
+{
+    .reg .f32 %f0, %f1, %f2, %f3;
+
+    mov.f32 %f0, 0f3f800000;
+    mov.f32 %f1, 0f40000000;
+    mov.f32 %f2, 0f40400000;
+    fma.rn.f32 %f3, %f0, %f1, %f2;
+    ret;
+}

@@ -1,0 +1,23 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.extern .shared .align 16 .b8 _smem_pool[];
+
+.visible .entry f(
+
+)
+{
+    .reg .f32 %f0;
+    .reg .u32 %r0, %r1, %r2, %r3, %r4;
+    .reg .u64 %rd0;
+
+    mov.u32 %r0, _smem_pool;
+    cvt.u64.u32 %rd0, %r0;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, 0;
+    mul.lo.u32 %r3, %r1, 64;
+    add.u32 %r4, %r0, %r3;
+    ld.shared.f32 %f0, [%r4];
+    ret;
+}

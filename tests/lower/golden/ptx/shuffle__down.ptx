@@ -1,0 +1,14 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+
+)
+{
+    .reg .f32 %f0, %f1;
+
+    mov.f32 %f0, 0f3f800000;
+    shfl.sync.down.b32 %f1, %f0, 1, 31, -1;
+    ret;
+}

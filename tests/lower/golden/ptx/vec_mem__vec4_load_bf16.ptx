@@ -1,0 +1,17 @@
+.version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry f(
+    .param .u64 X
+)
+{
+    .reg .b16 %h0, %h1, %h2, %h3;
+    .reg .u32 %r0;
+    .reg .u64 %rd0;
+
+    ld.param.u64 %rd0, [X];
+    mov.u32 %r0, 0;
+    ld.global.v4.b16 {%h0, %h1, %h2, %h3}, [%rd0];
+    ret;
+}

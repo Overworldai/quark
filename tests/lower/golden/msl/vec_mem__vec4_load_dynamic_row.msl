@@ -1,0 +1,7 @@
+    uint _pc_u32_0 = thread_position_in_threadgroup.x;
+    uint _pc_u32_1 = 0u;
+    float4 v0 = *reinterpret_cast<const device float4*>(&X[(_pc_u32_0 * 64u) + _pc_u32_1]);
+    float _pc_f32_0_0 = v0[0];
+    float _pc_f32_0_1 = v0[1];
+    float _pc_f32_0_2 = v0[2];
+    float _pc_f32_0_3 = v0[3];

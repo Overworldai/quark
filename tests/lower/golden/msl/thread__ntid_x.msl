@@ -1,0 +1,1 @@
+    uint _pc_u32_0 = threads_per_threadgroup.x;
