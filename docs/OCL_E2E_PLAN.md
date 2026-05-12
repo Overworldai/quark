@@ -97,14 +97,14 @@ deliverable.
 Goal: an authoritative status table of every kernel Waypoint
 forward emits, and which ones the OCL lowerer handles today.
 
-- [ ] **1.1** Stand up `scripts/dump_kernel_calls.py`: instantiate
+- [x] **1.1** Stand up `scripts/dump_kernel_calls.py`: instantiate
   `Waypoint15` (no weight load), run one synthetic forward under
   a monkeypatched `Launcher.compile` that records every
   `(kernel_cls.__name__, spec, config)`, then dumps unique tuples
   to `docs/ocl_kernel_status.md` as a markdown table with columns:
   `kernel | spec_summary | config_summary | OCL status | notes`.
   Done: file exists with full kernel list.
-  notes:
+  notes: script wraps BOTH `Launcher.compile` and `AutotuneCache.lookup_or_search` (the latter is where Mac dies on `OwlAttnKernel` autotune — no valid MMA without NAX). Mac run captures 8 unique kernels (AdaRMSNorm / GemmKernel ×3 specs / HeadRMSNorm / KVCacheUpdate / OwlAttn / Patchify); 3 kernels emitted later in the forward (AdaGateResidual / Unpatchify / ValueResidualPacked) are missed — Phase 1.3 [DEVKIT] completes the inventory.
 
 - [ ] **1.2** Fill the `OCL status` column. For each kernel, grep
   for visitor coverage in `quark/lower/ocl/lower.py`; classify as
@@ -284,6 +284,6 @@ hardware. Run as one ssh batch when convenient.
 
 ## Status snapshot
 
-Last loop iteration: 0.5 done — Phase 0 complete. EngineIntel constructs on Mac under `QUARK_FORCE_ENGINE=intel` + `QUARK_SKIP_VAE=1` with a tiny synthetic config. 24 engine tests pass.
+Last loop iteration: 1.1 done — kernel inventory captured to `docs/ocl_kernel_status.md`. 8 unique kernels on Mac (partial; 3 more deferred to 1.3 [DEVKIT]).
 Active phase: 1.
-Next task: 1.1.
+Next task: 1.2.
