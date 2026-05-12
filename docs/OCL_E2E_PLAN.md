@@ -54,12 +54,12 @@ deliverable.
   Done: `tests/engine/` passes on Mac; `metal.py` is shorter.
   notes: lifted verbatim; metal.py imports from `engine._pin`; 7 engine tests pass. No external callers — bench scripts have their own `_move_params_to_device` copy (parallel name, untouched).
 
-- [ ] **0.2** Add `_resolve_quant_for_family(quant, family)` to
+- [x] **0.2** Add `_resolve_quant_for_family(quant, family)` to
   `engine/base.py`. Encodes the bf16-force policy (Metal) and the
   bf16+s8-allowed policy (Intel — no fp8 in IGC today).
   Done: `metal.py`'s inline quant-force is one call; new
   `tests/engine/test_quant_policy.py` covers both families.
-  notes:
+  notes: implementation simpler than the plan suggested — `QuantConfig` only has fp8/bf16 fields, so "bf16+s8-allowed" reduces to "force bf16" (the s8 path on Intel is `gemm_int`/`owl_attn_int8`, a separate kernel family, not a `QuantConfig` knob). Metal and Intel share the same all-bf16 force; CUDA passes through unchanged. 9 new tests + 7 existing = 16 pass.
 
 - [ ] **0.3** Create `engine/intel.py` by copy of `metal.py` +
   surgical edits per the parallel table:
@@ -284,6 +284,6 @@ hardware. Run as one ssh batch when convenient.
 
 ## Status snapshot
 
-Last loop iteration: 0.1 done — `_pin_params_to_device` lifted to `engine/_pin.py`.
+Last loop iteration: 0.2 done — `_resolve_quant_for_family` added; Metal force-bf16 now one call. QuantConfig has no s8 field, so Intel uses the same all-bf16 force.
 Active phase: 0.
-Next task: 0.2.
+Next task: 0.3.

@@ -37,7 +37,7 @@ from typing import Any
 import torch
 
 from quark.engine._pin import _pin_params_to_device
-from quark.engine.base import Engine, _resolve_quant
+from quark.engine.base import Engine, _resolve_quant_for_family
 from quark.models.config import _resolve_path, load_yaml_config
 from quark.models.waypoint_15 import (
     CtrlInput,
@@ -96,29 +96,9 @@ class EngineMetal(Engine):
                 stacklevel=2,
             )
 
-        # Force all-bf16 quant on Apple Silicon — Metal has no native
-        # fp8 (no e4m3 type in MSL). Caller-supplied ``quant`` can
-        # still override fields individually if e.g. they want a
-        # custom QuantConfig with ``moe="bf16"`` only.
-        resolved_quant = _resolve_quant(quant)
-        if resolved_quant != QuantConfig.all_bf16():
-            from dataclasses import replace as _dc_replace
+        from quark.device import DeviceFamily
 
-            resolved_quant = _dc_replace(
-                resolved_quant,
-                linear="bf16",
-                kv_cache="bf16",
-                attn_compute="bf16",
-                moe="bf16",
-            )
-            warnings.warn(
-                "quark.Engine: forcing QuantConfig.all_bf16() on Apple Silicon "
-                "(Metal has no native fp8). Pass quant=QuantConfig.all_bf16() "
-                "explicitly to silence this warning.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-
+        resolved_quant = _resolve_quant_for_family(quant, DeviceFamily.METAL)
         cfg = Waypoint15Config.from_dict(raw_cfg, quant=resolved_quant)
         self.cfg = cfg
         self.model = Waypoint15(cfg)

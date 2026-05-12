@@ -140,6 +140,57 @@ def _resolve_quant(quant: str | QuantConfig | None) -> QuantConfig:
     )
 
 
+
+def _resolve_quant_for_family(quant, family) -> QuantConfig:
+    """Resolve ``quant`` and constrain it to what the active device
+    family can actually run.
+
+    Today the only constraint is **no native fp8** on backends that
+    don't expose an e4m3 MMA path: Metal (no e4m3 type in MSL) and
+    Intel iGPU/Arc (IGC doesn't expose fp8 dpas). Both fall back to
+    all-bf16. Caller-supplied ``QuantConfig`` instances are honoured
+    field-by-field; only fields explicitly set to ``"fp8"`` get
+    rewritten.
+
+    The int8 path on Intel (``gemm_int`` / ``owl_attn_int8``) is not
+    part of ``QuantConfig`` — it lives in separate kernel families
+    selected at model-construction time. This helper only governs
+    the fp8/bf16 split.
+
+    Emits a single ``RuntimeWarning`` when the requested config gets
+    rewritten, so callers can ``pytest.warns`` on the policy.
+    """
+    import warnings as _warnings
+    from dataclasses import replace as _dc_replace
+
+    from quark.device import DeviceFamily
+
+    resolved = _resolve_quant(quant)
+    no_fp8_families = (DeviceFamily.METAL, DeviceFamily.INTEL_GPU)
+    if family not in no_fp8_families:
+        return resolved
+    if resolved == QuantConfig.all_bf16():
+        return resolved
+    rewritten = _dc_replace(
+        resolved,
+        linear="bf16",
+        kv_cache="bf16",
+        attn_compute="bf16",
+        moe="bf16",
+    )
+    backend_name = {
+        DeviceFamily.METAL: "Apple Silicon (Metal has no native fp8)",
+        DeviceFamily.INTEL_GPU: "Intel iGPU/Arc (IGC has no fp8 dpas)",
+    }[family]
+    _warnings.warn(
+        f"quark.Engine: forcing QuantConfig.all_bf16() on {backend_name}. "
+        "Pass quant=QuantConfig.all_bf16() explicitly to silence this warning.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return rewritten
+
+
 class Engine:
     """Standalone inference engine for a Waypoint-1.5 checkpoint.
 
