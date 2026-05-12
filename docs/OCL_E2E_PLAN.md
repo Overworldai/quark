@@ -81,14 +81,14 @@ deliverable.
   test_detect_intel_on_linux_ocl).
   notes: auto-detect probes `_IS_OCL` (not the old `QUARK_PROBE_INTEL_FIRST` envvar). 19 tests pass — added `test_linux_default_is_cuda_when_no_ocl`, `test_linux_default_is_intel_when_ocl_available`, `test_construct_intel_subclass_via_force`, restored `test_subclass_construction_skips_factory`.
 
-- [ ] **0.5** Engine construction smoke on Mac under
+- [x] **0.5** Engine construction smoke on Mac under
   `QUARK_FORCE_ENGINE=intel`: model build + weight pin should
   finish without raising. The VAE load will fail (no OpenVINO
   GPU plugin on Mac); guard with `QUARK_SKIP_VAE=1` so the smoke
   doesn't depend on it.
   Done: smoke runs in <30s, `engine.model` exists, all params
   are `QuarkTensor` (no numpy carriers left).
-  notes:
+  notes: added `QUARK_SKIP_VAE=1` env to EngineIntel (skips VAE + pipeline construction; leaves `_taehv`/`_pipe`/`_vae_compute_units = None`). Refactored frame plumbing block to come before VAE so the skip can early-return cleanly. 5 smoke tests in `tests/engine/test_intel_smoke.py`: factory-dispatch, model-build, vae-skipped, params-pinned, scratch-buffers. First run ~17s (import cost), rerun 0.4s. 24 engine tests total pass.
 
 ---
 
@@ -284,6 +284,6 @@ hardware. Run as one ssh batch when convenient.
 
 ## Status snapshot
 
-Last loop iteration: 0.4 done — EngineIntel wired into the factory; auto-detect via `_IS_OCL` on Linux. 19 engine tests pass.
-Active phase: 0.
-Next task: 0.5.
+Last loop iteration: 0.5 done — Phase 0 complete. EngineIntel constructs on Mac under `QUARK_FORCE_ENGINE=intel` + `QUARK_SKIP_VAE=1` with a tiny synthetic config. 24 engine tests pass.
+Active phase: 1.
+Next task: 1.1.

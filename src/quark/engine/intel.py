@@ -141,7 +141,49 @@ class EngineIntel(Engine):
         # Persistent ctrl input — same helper the CUDA path uses.
         self._ctrl_dev, self._ctrl_fill = self.model.make_ctrl_buffer()
 
+        # ── Frame plumbing ──────────────────────────────────────
+        pH, pW = cfg.patch
+        pixel_h, pixel_w = cfg.height * pH, cfg.width * pW
+        self._pixel_shape = (1, cfg.channels, pixel_h, pixel_w)
+        self._flat_shape = (1, cfg.channels * pixel_h * pixel_w)
+        self.frm_shape = (1, 1, cfg.channels, pixel_h, pixel_w)
+        self._half_dt = "bf16"
+
+        latent_fps = raw_cfg["inference_fps"] / raw_cfg["temporal_compression"]
+        assert raw_cfg["base_fps"] % latent_fps == 0
+        self.ts_mult = int(raw_cfg["base_fps"] // latent_fps)
+        self._frame_counter = 0
+
+        # Pre-allocate the per-frame scratch tensors as STABLE OCL pool
+        # buffers. Re-creating these each frame via
+        # ``QuarkTensor.from_numpy`` / ``_qk_tensor`` would leak the
+        # dispatcher's handle table over long-running sessions (same
+        # shape as the Metal stability bug). Holding stable buffers +
+        # writing new bytes via ``ctypes.memmove`` keeps the per-frame
+        # allocation surface zero.
+        import numpy as _np_init
+
+        from quark.runtime.tensor import QuarkTensor as _QT
+
+        self._noise_qt = _QT.zeros(*self._flat_shape, dtype="bf16")
+        self._noise_staged = _np_init.zeros(self._flat_shape, dtype=_np_init.uint16)
+        self._frame_t_qt = _QT.zeros(1, dtype="s32")
+
         # ── VAE (OpenVINO — Intel GPU plugin preferred) ─────────
+        # ``QUARK_SKIP_VAE=1`` skips VAE load + pipeline construction.
+        # Intended for tests / smoke runs on hosts without OpenVINO
+        # (Mac CI). The engine is unusable for gen_frame in that mode;
+        # ``self._taehv`` and ``self._pipe`` stay ``None``.
+        import os as _os_skip
+
+        if _os_skip.environ.get("QUARK_SKIP_VAE") == "1":
+            self._taehv = None
+            self.vae = None
+            self._pipe = None
+            self._vae_compute_units = None
+            self._submit_in_flight = False
+            return
+
         if not raw_cfg.get("taehv_ae", False):
             raise NotImplementedError(
                 "quark.Engine on Intel currently supports the TAEHV VAE only. "
@@ -217,34 +259,6 @@ class EngineIntel(Engine):
         # the torch ``ChunkedStreamingTAEHV`` API but the attribute
         # exists for parity).
         self.vae = self._taehv
-
-        # ── Frame plumbing ──────────────────────────────────────
-        pH, pW = cfg.patch
-        pixel_h, pixel_w = cfg.height * pH, cfg.width * pW
-        self._pixel_shape = (1, cfg.channels, pixel_h, pixel_w)
-        self._flat_shape = (1, cfg.channels * pixel_h * pixel_w)
-        self.frm_shape = (1, 1, cfg.channels, pixel_h, pixel_w)
-        self._half_dt = "bf16"
-
-        latent_fps = raw_cfg["inference_fps"] / raw_cfg["temporal_compression"]
-        assert raw_cfg["base_fps"] % latent_fps == 0
-        self.ts_mult = int(raw_cfg["base_fps"] // latent_fps)
-        self._frame_counter = 0
-
-        # Pre-allocate the per-frame scratch tensors as STABLE OCL pool
-        # buffers. Re-creating these each frame via
-        # ``QuarkTensor.from_numpy`` / ``_qk_tensor`` would leak the
-        # dispatcher's handle table over long-running sessions (same
-        # shape as the Metal stability bug that surfaced in Biome's hot
-        # loop). Holding stable buffers + writing new bytes via
-        # ``ctypes.memmove`` keeps the per-frame allocation surface zero.
-        import numpy as _np_init
-
-        from quark.runtime.tensor import QuarkTensor as _QT
-
-        self._noise_qt = _QT.zeros(*self._flat_shape, dtype="bf16")
-        self._noise_staged = _np_init.zeros(self._flat_shape, dtype=_np_init.uint16)
-        self._frame_t_qt = _QT.zeros(1, dtype="s32")
 
         # Pipelined decoder — single-worker thread that runs the
         # OpenVINO decode while the main thread is encoding the next
