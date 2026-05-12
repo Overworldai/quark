@@ -10,10 +10,6 @@ instance with default-init state; we just check the type.
 
 from __future__ import annotations
 
-import sys
-
-import pytest
-
 from quark.engine import Engine, EngineCUDA, EngineIntel, EngineMetal
 from quark.engine.base import _detect_engine_family
 
@@ -21,17 +17,25 @@ from quark.engine.base import _detect_engine_family
 class TestDetectEngineFamily:
     def test_darwin_default_is_metal(self, monkeypatch):
         monkeypatch.delenv("QUARK_FORCE_ENGINE", raising=False)
-        monkeypatch.delenv("QUARK_PROBE_INTEL_FIRST", raising=False)
         monkeypatch.setattr("quark.engine.base._IS_METAL", True)
         monkeypatch.setattr("quark.engine.base._IS_LINUX", False)
         assert _detect_engine_family() == "metal"
 
-    def test_linux_default_is_cuda(self, monkeypatch):
+    def test_linux_default_is_cuda_when_no_ocl(self, monkeypatch):
         monkeypatch.delenv("QUARK_FORCE_ENGINE", raising=False)
-        monkeypatch.delenv("QUARK_PROBE_INTEL_FIRST", raising=False)
         monkeypatch.setattr("quark.engine.base._IS_METAL", False)
         monkeypatch.setattr("quark.engine.base._IS_LINUX", True)
+        monkeypatch.setattr("quark.runtime.sync._IS_OCL", False)
         assert _detect_engine_family() == "cuda"
+
+    def test_linux_default_is_intel_when_ocl_available(self, monkeypatch):
+        """``_IS_OCL=True`` on Linux flips the default from cuda to
+        intel — the OCL backend probed and found a device."""
+        monkeypatch.delenv("QUARK_FORCE_ENGINE", raising=False)
+        monkeypatch.setattr("quark.engine.base._IS_METAL", False)
+        monkeypatch.setattr("quark.engine.base._IS_LINUX", True)
+        monkeypatch.setattr("quark.runtime.sync._IS_OCL", True)
+        assert _detect_engine_family() == "intel"
 
     def test_force_env_overrides_platform_detection(self, monkeypatch):
         monkeypatch.setattr("quark.engine.base._IS_METAL", True)
@@ -41,14 +45,16 @@ class TestDetectEngineFamily:
 
     def test_force_env_uppercase_normalised(self, monkeypatch):
         monkeypatch.setattr("quark.engine.base._IS_METAL", False)
-        monkeypatch.setenv("QUARK_FORCE_ENGINE", "INTEL")
-        assert _detect_engine_family() == "intel"
+        monkeypatch.setattr("quark.engine.base._IS_LINUX", False)
+        monkeypatch.setenv("QUARK_FORCE_ENGINE", "CUDA")
+        assert _detect_engine_family() == "cuda"
 
     def test_force_env_unknown_value_falls_through(self, monkeypatch):
         # Garbage values fall back to platform detection rather than
         # erroring — preserves the "set it and forget it" property of
         # downstream test harnesses that pin QUARK_FORCE_ENGINE.
         monkeypatch.setattr("quark.engine.base._IS_METAL", True)
+        monkeypatch.setattr("quark.engine.base._IS_LINUX", False)
         monkeypatch.setenv("QUARK_FORCE_ENGINE", "rocm")
         assert _detect_engine_family() == "metal"
 
@@ -82,57 +88,3 @@ class TestEngineNew:
         instance = EngineIntel.__new__(EngineIntel)
         assert type(instance) is EngineIntel
         assert isinstance(instance, Engine)
-
-
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="EngineIntel construction needs Vulkan, Linux-only",
-)
-class TestEngineIntelConstruction:
-    """End-to-end EngineIntel construction — runs ONLY when Vulkan is
-    actually available. Skipped on Mac CI; on Linux without an ICD,
-    construction itself raises a clear RuntimeError that the rest of
-    the suite asserts."""
-
-    def test_raises_when_vulkan_unavailable(self, monkeypatch):
-        # Stub `is_available()` False to simulate a Vulkan-less Linux
-        # host (CI runner with no ICD installed).
-        from quark.drivers import spv
-        monkeypatch.setattr(spv, "is_available", lambda: False)
-        with pytest.raises(RuntimeError, match="Vulkan is not available"):
-            EngineIntel(model_uri="dummy", load_weights=False)
-
-    def test_caps_after_construct(self, monkeypatch):
-        from quark.drivers import spv
-        if not spv.is_available():
-            pytest.skip("no Vulkan device on this host")
-        # Stub the YAML loader so we don't need a real model URI on disk.
-        monkeypatch.setattr(
-            "quark.models.config._resolve_path",
-            lambda uri: uri,
-        )
-        monkeypatch.setattr(
-            "quark.models.config.load_yaml_config",
-            lambda path: {
-                "model_type": "test",
-                "channels": 32,
-                "patch": [2, 2],
-                "height": 8,
-                "width": 16,
-                "d_model": 2048,
-                "n_layers": 24,
-                "n_heads": 32,
-                "n_kv_heads": 16,
-                "fourier_dim": 512,
-                "ae_uri": "dummy/dummy",
-                "scheduler_sigmas": [1.0, 0.9, 0.75, 0.3, 0.0],
-                "ctrl_conditioning": False,
-            },
-        )
-        engine = EngineIntel(model_uri="dummy", load_weights=False)
-        # Caps should reflect the actual Battlemage probe.
-        from quark.device import DeviceFamily
-        assert engine.caps.family is DeviceFamily.INTEL_GPU
-        # And the inference methods should still raise — stub mode.
-        with pytest.raises(NotImplementedError, match="PORTABILITY_PLAN"):
-            engine.gen_frame()

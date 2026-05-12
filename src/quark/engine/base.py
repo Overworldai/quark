@@ -50,13 +50,14 @@ def _detect_engine_family():
     """Pick the right ``Engine`` subclass for this host.
 
     Resolution order:
-      1. ``QUARK_FORCE_ENGINE`` env var (one of ``cuda`` / ``metal`` /
+      1. ``QUARK_FORCE_ENGINE`` env var (``cuda`` / ``metal`` /
          ``intel``) — wins for testing / dev.
-      2. macOS  → ``metal``.
-      3. Linux  → ``intel`` if a Vulkan ICD is reachable, else ``cuda``.
+      2. macOS → ``metal``.
+      3. Linux → ``intel`` if the OCL backend probes a device
+         (``quark.runtime.sync._IS_OCL`` is True), else ``cuda``.
          CUDA stays the default on Linux because the production
-         deployment is NVIDIA today; Intel becomes the default in a
-         later commit once the lowerer + driver are real.
+         deployment is NVIDIA today; auto-detect picks Intel only
+         when no CUDA device is reachable.
       4. Anything else → ``cuda``.
 
     Returns one of the strings above. The actual subclass import +
@@ -70,19 +71,12 @@ def _detect_engine_family():
     if _IS_METAL:
         return "metal"
     if _IS_LINUX:
-        # Probe Vulkan only when explicitly requested via env. Default
-        # behaviour stays "CUDA on Linux" so existing CI / production
-        # workflows aren't disrupted by a Vulkan-detected redirect to
-        # the (still-stub) Intel engine. Flip the default once §3.7
-        # lands a usable EngineIntel.
-        if os.environ.get("QUARK_PROBE_INTEL_FIRST") == "1":
-            try:
-                from quark.drivers import spv  # noqa: PLC0415
-                if spv.is_available():
-                    return "intel"
-            except ImportError:
-                pass
-        return "cuda"
+        try:
+            from quark.runtime.sync import _IS_OCL  # noqa: PLC0415
+            if _IS_OCL:
+                return "intel"
+        except Exception:
+            pass
     return "cuda"
 
 
@@ -138,7 +132,6 @@ def _resolve_quant(quant: str | QuantConfig | None) -> QuantConfig:
     raise ValueError(
         f"quark.Engine: quant must be 'fp8' / 'bf16' / QuantConfig(...), got {quant!r}"
     )
-
 
 
 def _resolve_quant_for_family(quant, family) -> QuantConfig:

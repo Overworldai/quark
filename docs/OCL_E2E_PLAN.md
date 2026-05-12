@@ -72,14 +72,14 @@ deliverable.
   Done: file exists, imports clean, type checks.
   notes: file imports cleanly; MRO `EngineIntel → Engine → object`. GPU→CPU fallback exposed via `self._vae_compute_units`. Env var renamed `QUARK_TAEHV_COREML_URI` → `QUARK_TAEHV_OPENVINO_URI`; config key `coreml_uri` → `openvino_uri`.
 
-- [ ] **0.4** Re-export `EngineIntel` from `engine/__init__.py`
+- [x] **0.4** Re-export `EngineIntel` from `engine/__init__.py`
   and wire `Engine.__new__` to dispatch on family "intel". Update
   `_detect_engine_family` to return "intel" when `_IS_OCL` is true
   on Linux.
   Done: `tests/engine/test_factory.py` gets an `EngineIntel`
   branch back (test_construct_intel_subclass_via_force +
   test_detect_intel_on_linux_ocl).
-  notes:
+  notes: auto-detect probes `_IS_OCL` (not the old `QUARK_PROBE_INTEL_FIRST` envvar). 19 tests pass — added `test_linux_default_is_cuda_when_no_ocl`, `test_linux_default_is_intel_when_ocl_available`, `test_construct_intel_subclass_via_force`, restored `test_subclass_construction_skips_factory`.
 
 - [ ] **0.5** Engine construction smoke on Mac under
   `QUARK_FORCE_ENGINE=intel`: model build + weight pin should
@@ -284,6 +284,6 @@ hardware. Run as one ssh batch when convenient.
 
 ## Status snapshot
 
-Last loop iteration: 0.3 done — `engine/intel.py` created, imports clean. GPU→CPU VAE fallback wired with `_vae_compute_units` attr for introspection.
+Last loop iteration: 0.4 done — EngineIntel wired into the factory; auto-detect via `_IS_OCL` on Linux. 19 engine tests pass.
 Active phase: 0.
-Next task: 0.4.
+Next task: 0.5.

@@ -4,9 +4,8 @@ The engine is a package: this ``__init__.py`` is just the public-
 import shim. ``Engine(model_uri, ...)`` constructs a platform-
 appropriate concrete subclass via the ``__new__`` factory in
 :mod:`quark.engine.base` — :class:`EngineCUDA` on Linux / Windows /
-CUDA Macs, :class:`EngineMetal` on Apple Silicon, :class:`EngineIntel`
-on Linux + Vulkan when ``QUARK_FORCE_ENGINE=intel`` (or Vulkan probing
-is opted into).
+CUDA Macs, :class:`EngineMetal` on Apple Silicon,
+:class:`EngineIntel` on Linux with an Intel iGPU/Arc (OpenCL + IGC).
 
 Backend modules:
 
@@ -20,11 +19,9 @@ Backend modules:
     eagerly under ``quark.lazy()`` (Metal has no graph capture), VAE
     runs on the Apple Neural Engine via ``quark.taehv``, latent
     boundary is plain numpy.
-  * :mod:`quark.engine.intel` — :class:`EngineIntel`. Stub today —
-    construction + caps are wired against ``drivers.spv.SpvDriver``,
-    inference methods raise ``NotImplementedError`` until the
-    PORTABILITY_PLAN §3.2 SpirVLowerer + §3.4 OpenVINO-TAEHV path
-    land.
+  * :mod:`quark.engine.intel` — :class:`EngineIntel`. DiT runs on the
+    OCL/IGC backend; VAE on OpenVINO (GPU plugin, CPU fallback);
+    latent boundary is plain numpy.
 
 Adding a new backend is one new ``EngineX(Engine)`` subclass plus a
 branch in :meth:`Engine.__new__`; nothing in :class:`Engine` itself
