@@ -61,7 +61,7 @@ deliverable.
   `tests/engine/test_quant_policy.py` covers both families.
   notes: implementation simpler than the plan suggested — `QuantConfig` only has fp8/bf16 fields, so "bf16+s8-allowed" reduces to "force bf16" (the s8 path on Intel is `gemm_int`/`owl_attn_int8`, a separate kernel family, not a `QuantConfig` knob). Metal and Intel share the same all-bf16 force; CUDA passes through unchanged. 9 new tests + 7 existing = 16 pass.
 
-- [ ] **0.3** Create `engine/intel.py` by copy of `metal.py` +
+- [x] **0.3** Create `engine/intel.py` by copy of `metal.py` +
   surgical edits per the parallel table:
   - `torch.device` → always cpu
   - quant → call `_resolve_quant_for_family(_, INTEL_GPU)`
@@ -70,7 +70,7 @@ deliverable.
     introspect)
   - URI default → `<ae_uri>-openvino`
   Done: file exists, imports clean, type checks.
-  notes:
+  notes: file imports cleanly; MRO `EngineIntel → Engine → object`. GPU→CPU fallback exposed via `self._vae_compute_units`. Env var renamed `QUARK_TAEHV_COREML_URI` → `QUARK_TAEHV_OPENVINO_URI`; config key `coreml_uri` → `openvino_uri`.
 
 - [ ] **0.4** Re-export `EngineIntel` from `engine/__init__.py`
   and wire `Engine.__new__` to dispatch on family "intel". Update
@@ -284,6 +284,6 @@ hardware. Run as one ssh batch when convenient.
 
 ## Status snapshot
 
-Last loop iteration: 0.2 done — `_resolve_quant_for_family` added; Metal force-bf16 now one call. QuantConfig has no s8 field, so Intel uses the same all-bf16 force.
+Last loop iteration: 0.3 done — `engine/intel.py` created, imports clean. GPU→CPU VAE fallback wired with `_vae_compute_units` attr for introspection.
 Active phase: 0.
-Next task: 0.3.
+Next task: 0.4.
