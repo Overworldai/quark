@@ -503,9 +503,14 @@ owl_attn SPV OpPhi count: 60 → 28 → 12 → 4 (just iv phis). IGC accepts.
 
 **Open issue — owl_attn standalone numeric smoke:** `tests/kernels/owl_attn/test_ocl_smoke.py` now runs (was blocked at IGC ICE before) but reports cos_sim=0.706922 vs numpy reference. The cos_sim is stable across multiple smem-refactor revisions, so this is a pre-existing bug — the test was added (commit 3ca3f7d) as a WIP before the kernel actually compiled on Intel. With the smem refactor + frag_convert visitor + RoPE select now in place, the kernel runs end-to-end for the first time and exposes this earlier bug.
 
-Plausible roots (in suspicion order):
-1. `bctx.lane_id` (SubgroupLocalInvocationId, 0..15 on Intel) vs the kernel's `lane_id = tid % sgs` (0..31 when sgs=32 from config default) confusion in some intermediate computation that lands in K/V address math.
-2. OCL frag_apply / frag_reduce on Intel dispatching slot_to_selector_idx with the wrong slot↔row mapping (the Intel placeholder cd_offsets `((0,0),)*8` mean each backend infers per-slot row differently).
-3. The Q-RoPE pass writing to smem with the wrong lane convention (the `lane_id = tid % sgs` path).
-
 Phase 3.1 stub-VAE smoke passes the sanity gate (no NaN/Inf, max|x| < 1e3) but doesn't compare against a reference. Phase 3.2 (DiT correctness vs CUDA) is the natural next correctness check but needs CUDA hardware. Next loop step: bisect with the owl_attn smoke as the test fixture — instrument intermediate values via a debug buffer and compare against the numpy reference's intermediate.
+
+**Bug pattern characterised (2026-05-14):** Per-row cos_sim breakdown on owl_attn smoke:
+- Output rows {0..3, 12..15, 16..19, 28..31, ...} per 16-row block: cos≈1.
+- Output rows {4..11, 20..27, ...} per 16-row block: out_norm=0 (zeros).
+
+Mapping: warp 0 (m_idx=0) writes m=0..3 of its 8-row m-tile (slots s=0..3), drops m=4..7. Warp 1 (m_idx=1) writes m=4..7 (slots s=4..7), drops m=0..3. Each warp drops OPPOSITE halves of its 8-row tile.
+
+The 1:2 slot split (4 slots per warp instead of 8) strongly suggests `frag_for_each` is iterating only 4 slots per warp in the staged-store epilogue (`_emit_staged_store` for `per_warp=True, staging_smem=q_in_smem`). The store_acc visitor for Intel reads `c_width` from `_intel_mma_layout()` which is 8 — but maybe the cd_offsets `((0,0),)*c_regs` placeholder is being interpreted somewhere as only the FIRST 4 slots... or the per-warp staging dispatches differently than per-block.
+
+Independent of the smem refactor: PTX/Metal use a different store_acc path and pass owl_attn correctness. So the bug is OCL-specific and somewhere in the staged-store + frag_for_each composition for Intel cd_offsets placeholder shape.
