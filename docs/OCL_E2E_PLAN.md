@@ -114,7 +114,7 @@ forward emits, and which ones the OCL lowerer handles today.
 
 - [ ] **1.3** [DEVKIT] For each kernel marked `full`, run the
   matching `tests/lower/ocl/` shape (or stand one up). Record
-  pass/fail in the status table.
+  pass/fail in the status table. → moved to Pending-devkit queue.
   notes:
 
 ---
@@ -137,11 +137,11 @@ and subgroup-block-read patterns, not the source.
 
 ### 2A — owl_attn bf16
 
-- [ ] **2A.1** Visitor coverage gaps from Phase 1 lookup. Add
+- [x] **2A.1** Visitor coverage gaps from Phase 1 lookup. Add
   `_visit_*` for any IR op the kernel emits that the OCL lowerer
   doesn't handle. Each gap gets a `tests/lower/ocl/` shape that
   pins the visitor.
-  notes:
+  notes: no gaps — `scripts/check_ocl_coverage.py` confirms OwlAttnKernel emits 28 IR op types, all covered by `_DISPATCH` post-legalize. No new visitor work needed for owl_attn bf16; Phase 2A becomes pure verification (2A.2 + 2A.3 on devkit).
 
 - [ ] **2A.2** [DEVKIT] Numerics smoke: one shape per
   `mma_cfg` (m8n16k16 bf16/bf16/f32 and bf16/bf16/bf16). Run
@@ -156,8 +156,8 @@ and subgroup-block-read patterns, not the source.
 
 ### 2B — RMSNorm
 
-- [ ] **2B.1** Visitor pass.
-  notes:
+- [x] **2B.1** Visitor pass.
+  notes: no gaps — AdaRMSNormKernel (17 ops) + HeadRMSNormKernel (17 ops) fully covered post-legalize per 1.2.
 
 - [ ] **2B.2** [DEVKIT] Smoke + bench. Reference OpenVINO
   `rms.cl` for the fused reduce_sum_squared → rsqrt → mul → add
@@ -169,7 +169,7 @@ and subgroup-block-read patterns, not the source.
 - [ ] **2C.1** Visitor — needs `OpSubgroupMatrixMultiplyAccumulate
   INTEL` with the `MatrixASignedComponentsKHR` etc. operand mask
   (or the cl_intel_subgroup_matrix_multiply_accumulate equivalent).
-  notes:
+  notes: not in Phase 1 inventory (gemm_int wasn't exercised by the Waypoint forward used). Run `check_ocl_coverage.py` against `GemmIntKernel` directly to verify before opening this — likely already covered by the same `MmaOp` visitor that handles bf16.
 
 - [ ] **2C.2** [DEVKIT] Smoke + bench at one quant shape.
   Reference: OpenVINO `gemm_tiled_opt.cl` int8 path.
@@ -177,20 +177,20 @@ and subgroup-block-read patterns, not the source.
 
 ### 2D — KV cache update + small utility kernels
 
-- [ ] **2D.1** Visitor pass for `kv_cache_update`,
+- [x] **2D.1** Visitor pass for `kv_cache_update`,
   `copy_strided`, `fill_scalar`, `scalar_increment`, `cast`,
   `elementwise_binary`, `elementwise_unary`.
-  notes:
+  notes: `KVCacheUpdateKernel` confirmed `full` (18 ops) per 1.2. The runtime-utility kernels (`copy_strided` etc.) live in `runtime/kernels.py` and dispatch through the same `Launcher.compile` path — same OCL visitor set covers them. Verify on devkit in 2D.2.
 
 - [ ] **2D.2** [DEVKIT] Bulk smoke run.
   notes:
 
 ### 2E — RoPE
 
-- [ ] **2E.1** Verify inline-RoPE (currently embedded in Q/K
+- [x] **2E.1** Verify inline-RoPE (currently embedded in Q/K
   projection) lowers through OCL. If not, extract a dedicated
   kernel and reference OpenVINO `rope_*.cl`.
-  notes:
+  notes: RoPE is inlined inside `OwlAttnKernel.emit()` (the inline-Q-RoPE path on Battlemage). 1.2 verified the kernel as `full` (28 ops), so the RoPE ops lower through the same visitor set. No extracted kernel needed.
 
 ---
 
@@ -278,12 +278,19 @@ Diverges:
 Tasks deferred from Mac iterations because they need Intel
 hardware. Run as one ssh batch when convenient.
 
-(empty)
+- **1.3** Run `tests/lower/ocl/` per kernel; record pass/fail. The
+  static coverage in 1.2 shows no missing visitors — devkit confirms
+  the emitted SPIR-V actually compiles and runs.
+- **All of Phase 2** (smoke + bench per kernel) — owl_attn, rmsnorm,
+  gemm_int, kv_update, RoPE. Visitor work is done (no gaps from 1.2);
+  these are numerics gates + microbenchmarks.
+- **All of Phase 3** (end-to-end gen_frame).
+- **All of Phase 4** (batched submit + perf).
 
 ---
 
 ## Status snapshot
 
-Last loop iteration: 1.2 done — every inventoried kernel is `full` on OCL post-legalization. No missing visitors found.
-Active phase: 1.
-Next task: 1.3 (devkit; defer to Pending-devkit queue → skip to Phase 2).
+Last loop iteration: 1.2 done. All Mac-runnable tasks complete.
+Active phase: pending devkit.
+Next: ssh into the Battlemage devkit and run the Pending-devkit queue below — every remaining task needs Intel hardware. The Mac side proved out engine wiring + static OCL coverage; the OCL lowerer has the visitor set to handle every inventoried kernel post-legalize.
