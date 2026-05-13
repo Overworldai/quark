@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from quark.ir import DType
+from quark.ir.types import _DTYPE_BYTES
 from quark.ir.module import Function, Module
 from quark.ir.op import (
     ArithOp,
@@ -1871,11 +1872,21 @@ def _visit_vec_load(op: VecLoadOp, ctx: _OclCtx) -> None:
     indices = list(op.operands)
     if op.attrs.get("pred") is not None:
         indices = indices[:-1]
+
+    # bf16-as-b32 packing path: source bf16 (or u16-class), output
+    # b32 (or u32). Each output element packs 2 source elements
+    # along the inner-most index (low half = idx 2i, high half =
+    # idx 2i+1). Mirrors the packed-K path in _visit_load_matrix.
+    pack_ratio = 1
     if out.dtype is not tensor.dtype:
-        raise NotImplementedError(
-            f"_visit_vec_load(ocl): dtype mix ({tensor.dtype!r} → "
-            f"{out.dtype!r}) not yet wired in OCL first cut"
-        )
+        src_bytes = _DTYPE_BYTES.get(tensor.dtype, 0)
+        dst_bytes = _DTYPE_BYTES.get(out.dtype, 0)
+        if src_bytes == 0 or dst_bytes == 0 or dst_bytes % src_bytes != 0:
+            raise NotImplementedError(
+                f"_visit_vec_load(ocl): dtype mix ({tensor.dtype!r} → "
+                f"{out.dtype!r}) not yet wired in OCL first cut"
+            )
+        pack_ratio = dst_bytes // src_bytes
 
     if isinstance(tensor, GlobalTensor):
         arg_id = ctx.param_to_arg[id(tensor.param)]
@@ -1904,23 +1915,71 @@ def _visit_vec_load(op: VecLoadOp, ctx: _OclCtx) -> None:
         )
 
     u32 = ctx.text.type_int(32, signed=False)
+    out_elem_type = _emit_dtype(ctx.text, out.dtype, ctx)
     loaded: list[str] = []
     for i in range(width):
-        if i == 0:
-            idx_id = base_id
-        else:
-            inc = ctx.text.const_uint(i)
-            idx_id = ctx.text.alloc_id(f"vec_idx_{i}")
-            ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_id} {inc}")
-        chain_id = ctx.text.alloc_id(f"vec_chain_{i}")
-        ctx.text.emit_function(
-            f"{chain_id} = {chain_op} {elem_ptr} {chain_base} {idx_id}"
-        )
-        ld_id = ctx.text.alloc_id(f"vec_ld_{i}")
-        ctx.text.emit_function(f"{ld_id} = OpLoad {elem_type} {chain_id}")
-        loaded.append(ld_id)
+        if pack_ratio == 1:
+            if i == 0:
+                idx_id = base_id
+            else:
+                inc = ctx.text.const_uint(i)
+                idx_id = ctx.text.alloc_id(f"vec_idx_{i}")
+                ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_id} {inc}")
+            chain_id = ctx.text.alloc_id(f"vec_chain_{i}")
+            ctx.text.emit_function(
+                f"{chain_id} = {chain_op} {elem_ptr} {chain_base} {idx_id}"
+            )
+            ld_id = ctx.text.alloc_id(f"vec_ld_{i}")
+            ctx.text.emit_function(f"{ld_id} = OpLoad {elem_type} {chain_id}")
+            loaded.append(ld_id)
+            continue
 
-    out_elem_type = _emit_dtype(ctx.text, out.dtype, ctx)
+        # Packed: read pack_ratio source elements at consecutive
+        # offsets, widen + shift + OR into one out-elem.
+        packed_id = None
+        src_bits = _DTYPE_BYTES[tensor.dtype] * 8
+        for k in range(pack_ratio):
+            inc = ctx.text.const_uint(i * pack_ratio + k)
+            idx_id = ctx.text.alloc_id(f"vec_idx_{i}_{k}")
+            ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_id} {inc}")
+            chain_id = ctx.text.alloc_id(f"vec_chain_{i}_{k}")
+            ctx.text.emit_function(
+                f"{chain_id} = {chain_op} {elem_ptr} {chain_base} {idx_id}"
+            )
+            ld_id = ctx.text.alloc_id(f"vec_ld_{i}_{k}")
+            ctx.text.emit_function(f"{ld_id} = OpLoad {elem_type} {chain_id}")
+            # Reinterpret the source element to its unsigned-int
+            # carrier (bf16 → u16) so we can widen + shift cleanly.
+            src_uint_t = ctx.text.type_int(src_bits, signed=False)
+            carrier = ld_id
+            if elem_type != src_uint_t:
+                rb = ctx.text.alloc_id(f"vec_rcast_{i}_{k}")
+                ctx.text.emit_function(
+                    f"{rb} = OpBitcast {src_uint_t} {ld_id}"
+                )
+                carrier = rb
+            widened = ctx.text.alloc_id(f"vec_wid_{i}_{k}")
+            ctx.text.emit_function(
+                f"{widened} = OpUConvert {out_elem_type} {carrier}"
+            )
+            if k == 0:
+                packed_id = widened
+            else:
+                shift_amt = ctx.text.const_uint(k * src_bits)
+                shifted = ctx.text.alloc_id(f"vec_shift_{i}_{k}")
+                ctx.text.emit_function(
+                    f"{shifted} = OpShiftLeftLogical {out_elem_type} "
+                    f"{widened} {shift_amt}"
+                )
+                new_packed = ctx.text.alloc_id(f"vec_packed_{i}_{k}")
+                ctx.text.emit_function(
+                    f"{new_packed} = OpBitwiseOr {out_elem_type} "
+                    f"{packed_id} {shifted}"
+                )
+                packed_id = new_packed
+        assert packed_id is not None
+        loaded.append(packed_id)
+
     vec_type = _ocl_type_vec(ctx.text, out_elem_type, width)
     res_id = ctx.text.alloc_id(f"vec_w{width}")
     ctx.val_to_id[out.id] = res_id
