@@ -477,3 +477,7 @@ Workaround options:
 3. Skip owl_attn entirely on OCL until IGC patch lands; fall back to a per-token CPU softmax wrapper for Phase 3.
 
 Pragmatic call: option (3) is the fastest unblocker for Phase 3 — the rest of DiT (HeadRMSNorm, AdaRMSNorm, KV cache update, gemm, etc.) all build through IGC. owl_attn was always going to need separate verification anyway (the SPV_INTEL_2d_block_io path documented as the future direction). For now: add an env-var-gated OCL backend opt-out for owl_attn that routes those layers through a numpy reference.
+
+Additional bisects (2026-05-14 cont.): replacing OpLoads from `smem_kv_off_table` with a constant `%u_0` still crashes IGC at the same offset. So it's NOT the iv-indexed smem-indirect read pattern. The "1345 boundary" in the line bisect is an artefact of appending `OpReturn` at a structured-CF block boundary — IGC just optimises the trailing pipeline open + OpReturn away when truncation lands inside dead code (≤1340 lines), but when it lands at the first instruction inside the loop body it tries to lower the partial loop and ICEs.
+
+Net conclusion: the IGC bug is structural (large kernel + structured CF + many OpPhi carries) and not pinpointable via SPV instruction-level substitution. The fallback at option (3) is the pragmatic next step.
