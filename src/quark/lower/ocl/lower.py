@@ -394,10 +394,14 @@ _INTEL_MMA_LAYOUTS: dict[tuple, tuple] = {
     #      the bf16/f32 form's C (just signed-int element type).
     #
     # MatrixOperands flag: 0x10 | 0x20 | 0x100 | 0x200 = 0x330.
-    #   ASignedComponentsINTEL  (0x10) — A values are signed s8
-    #   BSignedComponentsINTEL  (0x20) — B values are signed s8
-    #   APackedInt8ComponentsINTEL (0x100) — A is i32-packed 4-quartets
-    #   BPackedInt8ComponentsINTEL (0x200) — B is i32-packed 4-quartets
+    #   MatrixASignedComponentsINTEL (0x10) — A values are signed s8
+    #   MatrixBSignedComponentsINTEL (0x20) — B values are signed s8
+    #   MatrixAPackedInt8INTEL       (0x100) — A is i32-packed 4-quartets
+    #   MatrixBPackedInt8INTEL       (0x200) — B is i32-packed 4-quartets
+    #
+    # Note: the "Packed" operands DON'T carry the ``Components``
+    # suffix — only the signedness operands do. spirv-as rejects the
+    # "PackedInt8ComponentsINTEL" form.
     #
     # Mirrors the bf16 entry's ``MatrixA/BPackedBFloat16INTEL`` shape
     # — the operands flag tells IGC the integer-carrier register lanes
@@ -409,7 +413,7 @@ _INTEL_MMA_LAYOUTS: dict[tuple, tuple] = {
         DType.S32, 8,   # C: v8 of s32 (column n=L, rows m=0..7)
         32,             # K-Dim operand
         "MatrixASignedComponentsINTEL|MatrixBSignedComponentsINTEL"
-        "|MatrixAPackedInt8ComponentsINTEL|MatrixBPackedInt8ComponentsINTEL",
+        "|MatrixAPackedInt8INTEL|MatrixBPackedInt8INTEL",
     ),
 }
 
