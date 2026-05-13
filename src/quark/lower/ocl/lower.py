@@ -127,6 +127,7 @@ class _OclCtx:
     has_bf16_cap: bool = False
     has_int16_cap: bool = False
     has_int8_cap: bool = False
+    has_int64_cap: bool = False
     # Workgroup-class smem allocations: SmemAllocOp result Value.id →
     # (var_id, elem_type, elem_pointer_id, total_elements). Visitors
     # that load/store on a ``SharedRegion`` look up by the SharedRegion's
@@ -215,6 +216,21 @@ def _emit_dtype(text: SpvText, dt: DType, ctx: "_OclCtx | None" = None) -> str:
         return text.type_int(8, signed=True)
     if dt is DType.PRED:
         return text.type_bool()
+    # Bit-typed variants: B16/B32/B64 are raw storage with no
+    # numeric interpretation. Lower them to OpTypeInt<width> 0
+    # (unsigned int carrier) — matches how the SPV side handled them.
+    if dt is DType.B32:
+        return text.type_int(32, signed=False)
+    if dt is DType.B16:
+        if ctx is not None and not ctx.has_int16_cap:
+            text.add_capability("Int16")
+            ctx.has_int16_cap = True
+        return text.type_int(16, signed=False)
+    if dt is DType.B64:
+        if ctx is not None and not ctx.has_int64_cap:
+            text.add_capability("Int64")
+            ctx.has_int64_cap = True
+        return text.type_int(64, signed=False)
     raise NotImplementedError(
         f"OclSpirVLowerer: dtype {dt!r} not yet supported in Phase 3 "
         "first cut. Extend ``_emit_dtype`` per the visitor coverage plan."
