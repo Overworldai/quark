@@ -34,6 +34,7 @@ from quark.ir.builder import Builder
 from quark.ir.tensor import GlobalTensor
 from quark.ir.types import BufferType
 from quark.lower._common.spirv_assemble import text_to_binary
+from quark.lower.legalize import legalize
 from quark.lower.ocl import OpenClSpirVLowerer
 
 
@@ -97,9 +98,11 @@ def test_fma_bf16x2_identity():
     n = 16
     X = _make_finite_bf16x2_inputs(n)
 
-    result = OpenClSpirVLowerer(local_size=(n, 1, 1)).lower_module(
-        _build_fma_identity_ir(n)
-    )
+    # Production path goes through Launcher._lower which runs legalize()
+    # before lower_module; reproduce that here so fma_bf16x2 expands.
+    module = _build_fma_identity_ir(n)
+    legalize(module, driver.caps)
+    result = OpenClSpirVLowerer(local_size=(n, 1, 1)).lower_module(module)
     binary = text_to_binary(result.source, target_env="opencl2.0")
 
     nbytes = n * 4
