@@ -2719,6 +2719,24 @@ def _visit_mma(op: MmaOp, ctx: _OclCtx) -> None:
     c_v = op.operands[2]
     c_id = ctx.val_to_id[c_v.id]
 
+    # IGC's DPAS pattern matcher segfaults when several MMAs share the
+    # same A SSA (observed on Battlemage when the online-softmax P
+    # fragment from FragConvertOp feeds 4 chained MMAs — each MMA gets
+    # %frag_convert_result_N as its A). load_matrix-fed MMAs each
+    # produce their own A via fresh OpCompositeConstruct, which IGC
+    # accepts. Mirror that pattern here with OpCopyObject on A: it
+    # gives this MMA a fresh SSA ID without re-emitting the underlying
+    # values, and the crash goes away.
+    a_v = op.operands[0]
+    a_elem_type = _emit_dtype(ctx.text, _a_elem_dt, ctx)
+    a_vec_type = _ocl_type_vec(ctx.text, a_elem_type, _a_width)
+    a_copy_id = ctx.text.alloc_id("mma_a_copy")
+    ctx.text.emit_function(
+        f"{a_copy_id} = OpCopyObject {a_vec_type} {a_id}"
+    )
+    a_id = a_copy_id
+    _ = a_v
+
     # If C is a vec_build of zeros (the common "init acc to 0"
     # idiom for non-loop-carried MMAs), splat-construct it as the
     # accumulator vector type. Mirror of the SPV path's same handling.
