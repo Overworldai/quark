@@ -1122,13 +1122,16 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                 lo = _read_byte_at(pair_m_low, k_pos, f"{s}_lo")
                 hi = _read_byte_at(pair_m_high, k_pos, f"{s}_hi")
                 shift_amt = ctx.text.const_uint(smem_bytes * 8)
-                hi_shifted = ctx.text.alloc_id(f"lm_a_hishift_{s}")
+                # Trying byte-order: high byte = even-m, low byte =
+                # odd-m. The other order gives even-m correct, odd-m
+                # zero; this swap tests the opposite convention.
+                lo_shifted = ctx.text.alloc_id(f"lm_a_loshift_{s}")
                 ctx.text.emit_function(
-                    f"{hi_shifted} = OpShiftLeftLogical {lane_elem_type} {hi} {shift_amt}"
+                    f"{lo_shifted} = OpShiftLeftLogical {lane_elem_type} {lo} {shift_amt}"
                 )
                 packed = ctx.text.alloc_id(f"lm_a_mpacked_{s}")
                 ctx.text.emit_function(
-                    f"{packed} = OpBitwiseOr {lane_elem_type} {lo} {hi_shifted}"
+                    f"{packed} = OpBitwiseOr {lane_elem_type} {hi} {lo_shifted}"
                 )
                 elem_loads.append(packed)
                 continue
