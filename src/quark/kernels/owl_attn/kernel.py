@@ -698,15 +698,21 @@ class OwlAttnKernel(Kernel):
             init_val = qk.select(qk.cmp("lt", lane, n_ml_c), neg_inf_f, zero_f)
             qk.store(ml_smem, init_val, warp_id, lane, pred=init_pred)
 
-            # Per-warp O state: (NumWarps, n_o, SG, c_regs) f32. Each lane
-            # holds c_regs f32 for one (mt, n_dh) tile (the MMA C operand
-            # shape). Init O=0 once before the loop.
+            # Per-warp O state: (NumWarps, n_o, MMA_SG, c_regs) f32. Each
+            # lane holds c_regs f32 for one (mt, n_dh) tile (the MMA C
+            # operand shape). Use the MMA's actual SG width, not the
+            # config's ``sgs`` (which may be the kernel's logical
+            # subgroup_size = 32 by default; Intel MMA pins SG=16).
             n_o_intel = MTiles * N_DH
             c_regs_intel = mma_cfg.shape.c_regs
+            # Derive MMA SG from the layout entry — same source the
+            # lowerer reads to pin OpExecutionMode SubgroupSize.
+            from quark.lower.ocl.lower import _intel_mma_layout
+            mma_sg = _intel_mma_layout(mma_cfg.shape)[0]
             o_smem = qk.smem_alloc(
                 "O_state",
                 DType.F32,
-                (NumWarps, n_o_intel, sgs, c_regs_intel),
+                (NumWarps, n_o_intel, mma_sg, c_regs_intel),
                 pad=0,
             )
             zero_vec_init = qk.vec_build([zero_f] * c_regs_intel)
