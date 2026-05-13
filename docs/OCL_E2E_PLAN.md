@@ -385,6 +385,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last iter: broad compute-cohort coverage. **GREEN on Battlemage** (cos_sim ≥ 0.9999): RMSNorm, KV cache update, GemmKernel bf16, HeadRMSNorm, AdaRMSNorm. **xfail**: AdaGateResidual + ValueResidualPacked (CL_OUT_OF_RESOURCES at launch — both use SplitB32/MergeB32 chains; likely register-pressure or codegen issue), Patchify (cos_sim=0.71 — axis/layout mismatch vs reference). SplitB32Op + MergeB32Op visitors landed in `_DISPATCH`.
+Last iter: bisected the OUT_OF_RESOURCES failure on ValueResidualPacked — at smaller shape (M=32 / D_full=512 / v_width=128) the kernel RUNS through but produces cos_sim=-0.35 (wrong numerics). At production shape it hits OUT_OF_RESOURCES. So there are two layered bugs in the packed-bf16-vector arith path: (a) numerics wrong even when it runs; (b) at larger shapes the IGC-side codegen hits a resource ceiling. Common factor: SplitB32Op / MergeB32Op visitors (which I just added) + the kernel's packed arith chain.
 Active phase: 2 (devkit).
-Next: investigate the OUT_OF_RESOURCES path (start by inspecting SplitB32/MergeB32 emit + the IGC -build-log to see resource usage) — small-kernel fixes that probably unblock 2 kernels.
+Next: debug the SplitB32/MergeB32 emit OR the kernel's expected pattern — likely fix unblocks AdaGateResidual + ValueResidualPacked together. Patchify (cos_sim=0.71) is a separate axis/layout issue.
