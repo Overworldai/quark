@@ -2535,10 +2535,9 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _OclCtx) -> None:
             elem_id = ctx.val_to_id[term.operands[0].id]
 
         # Convert f32 → bf16 → u16. The OpFConvert + OpBitcast pair
-        # mirrors the load_matrix A path (which loads as bfloat16_2
-        # then bitcasts to u16). IGC's DPAS pattern matcher segfaults
-        # if A is built from any other op chain (bitcast-and-shift
-        # produces semantically-equivalent u16 but trips the matcher).
+        # matches what load_matrix emits for the A operand (load
+        # bfloat16_2, OpBitcast to u16) so the IR shape stays
+        # consistent across the two A-acquisition paths.
         bf16_type = _emit_dtype(ctx.text, DType.BF16, ctx)
         bf16_id = ctx.text.alloc_id(f"fc_bf_{s}")
         ctx.text.emit_function(

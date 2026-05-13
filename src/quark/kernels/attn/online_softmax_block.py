@@ -339,16 +339,15 @@ class OnlineSoftmax(Block):
             #    ``load_matrix`` into the fp8 A-frag layout — those reads
             #    match the PTX ISA fp8 m16n8k16/k32 fragment map.
             a_dtype = cfg.shape.a_dtype
-            # Intel + 16-bit A: route through smem (fp8-style) regardless
-            # of in-register frag_convert lane alignment. IGC's DPAS
-            # pattern matcher segfaults when the A operand for OpSubgroup
-            # MatrixMultiplyAccumulateINTEL is built via OpCompositeConstruct
-            # of OpFConvert+OpBitcast on f32 values produced in-register
-            # (verified on Battlemage / libigc.so 24.x against a 4-MMA-chain
-            # owl_attn kernel — IGC ICE at +0x1afa409). Reusing
-            # ``load_matrix`` for the A operand (same path GEMM1 uses)
-            # routes around the crash. Requires the caller to allocate
-            # ``p_smem`` and run a block barrier before reloading.
+            # Intel + 16-bit A: route P through smem and reload via
+            # load_matrix for GEMM2 — same path the fp8 case uses. The
+            # in-register ``frag_convert`` path would be smaller, but
+            # routing through smem keeps GEMM2's A acquisition identical
+            # to GEMM1's (load_matrix on a per-warp slice) which IGC's
+            # DPAS lowering is already happy with. The kernel ships
+            # bf16 from F32 softmax outputs into ``p_smem`` per slot,
+            # then GEMM2's load_matrix gathers each k_step as if it
+            # came from gmem.
             intel_smem_path = (
                 is_intel
                 and a_dtype not in _FP8_DTYPES

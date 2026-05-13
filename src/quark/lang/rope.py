@@ -81,12 +81,13 @@ def emit_rope_cos_sin(
     zero_u = bctx.c(0, dtype=DType.U32)
 
     # Compute all three band frequencies unconditionally and select. The
-    # earlier version used nested ``qk.if_`` to avoid u32 underflow on
-    # ``c_idx - c_x_dim`` when c_idx < x_dim — Intel IGC ICEs on too many
-    # OpPhi (verified 2026-05-14 against Battlemage), and each ``qk.if_``
-    # with a carry adds an OpPhi at the merge. ``qk.select`` is a single
-    # OpSelect (no merge, no phi). To avoid underflow, mask the diff with
-    # qk.select before subtracting.
+    # earlier version used nested ``qk.if_`` to protect ``c_idx -
+    # c_x_dim`` / ``c_idx - c_xy_dim`` from u32 underflow when c_idx is
+    # in a lower band; the OpSelect version is strictly simpler — fewer
+    # OpPhi at merges, no structured-CF blocks, identical numerics on
+    # every backend. To avoid the underflow, mask the diff with
+    # ``qk.select`` before subtracting so the unselected branch sees a
+    # benign operand.
     c_idx_x = qk.select(is_x, c_idx, c_x_dim)   # max(0, ...) for x branch
     c_idx_y = qk.select(is_y, c_idx, c_xy_dim)  # max(c_x_dim, ...) for y branch
     # X band: local_i = c_idx / 2, base = pi * (1 + local_i * scale)

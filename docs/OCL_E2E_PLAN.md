@@ -385,134 +385,41 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last iter: VRP + AdaGateResidual GREEN on Battlemage.
+**Phase 3.1 PASSING on Battlemage** — `tests/engine/test_intel_compute_latent_smoke.py::test_compute_latent_one_frame` and `test_compute_latent_two_frames_no_crash` both green; full Waypoint DiT runs end-to-end through OCL with no NaN/Inf in the latent. Compute-cohort smokes all green (HeadRMSNorm, AdaRMSNorm, VRP, AdaGateResidual, Patchify). 53 OCL tests pass; 4 known-fail (gemm_int s8 ×2 — pending SPV_INTEL_2d_block_io; owl_attn standalone numeric smoke ×2 — see below).
 
-- VRP was a **test bug**: `lamb` is `DType.F32` in the kernel's TENSORS, but the smoke passed it as bf16 (`_f32_to_bf16(lamb_f32)`). Both kernel and numpy ref were reading corrupted data in different ways (4-byte F32 read from a 2-byte bf16 buffer; `to_f32_numpy(uint16, dtype_hint="f32")` astype → 16128.0 for 0x3F00). cos_sim=-0.35 was the symptom. Fix: pass `lamb_f32` directly. Cleared the misdiagnosis as a SplitB32/MergeB32 bug — the visitor chain was always correct (verified by `tests/lower/ocl/test_b32_roundtrip.py`, `test_bitcast_roundtrip.py`, `test_convert_bf16_f32_roundtrip.py`, `test_full_chain_no_fma_roundtrip.py`, `test_fma_bf16x2_identity.py` — all PASS).
-- AdaGateResidual was a real visitor gap: `packed_extract_b32(bf16_vec, k)` reuses `VecExtractOp` with `attrs={"packed_b32": True}` and returns `DType.B32`; `vec_build_packed_b32` reuses `VecBuildOp` the same way. OCL `_visit_vec_extract`/`_visit_vec_build` didn't check the attr → emitted type-broken SPIR-V → IGC raised `CL_OUT_OF_RESOURCES` at clFinish. Fixed via `OpBitcast` to/from a v<N>uint32 view of the bf16 vec (same total bits). cos_sim=0.999996 post-fix.
-- Bonus visitor: `_visit_const` now handles B16/B32/B64 carrier types (needed for the fma_bf16x2 identity reproducer; same idea — these map to uint16/uint32/uint64 in OCL).
+### What actually fixed the long-standing OCL numerics bug (resolved 2026-05-14)
 
-Patchify still xfail (rows {2,3,6,7} mod 8 zero per m=8 tile; same MMA shape + frag_for_each path as Gemm which passes). Strongly localised to Patchify's scalar A-fill path vs Gemm's vectorised `load_from`. Deferred (input embedding, not in hot loop).
+The single root cause behind Patchify cos_sim=0.71, owl_attn cos_sim=0.71, and what looked like an IGC ICE on owl_attn was a **subgroup-size mismatch between the kernel framework and the OCL lowerer**:
 
-Compute-cohort smoke status: 4 pass (HeadRMSNorm, AdaRMSNorm, VRP, AdaGateResidual), 1 xfail (Patchify).
-Wider OCL test status: 49 pass, 5 known-fail (owl_attn bf16 ×2 — FragConvert K-widening; gemm_int ×3 — s8 DPAS layout entry pending SPV_INTEL_2d_block_io), 2 skip, 1 xfail.
+- Kernels were emitted with Python-level constants assuming SG=32 (`_WARP = DEFAULT_SUBGROUP_WIDTH = 32`, `n_threads = NumWarps * 32`, etc.) — used to size cooperative cp.async loops, work splits, smem offsets.
+- The OCL lowerer detected Intel MMA shapes and pinned `OpExecutionMode SubgroupSize 16` (correct, per Khronos requirement) and rescaled `local_size` from `NumWarps*32` to `NumWarps*16` to match.
+- Result at runtime: kernel SPV believed 32 lanes per subgroup existed and divided cooperative work across that count, but only 16 actually ran. The unrunnable half of every cooperative loop body was silently skipped — half the Q rows never made it into smem, half the staging slots stayed at init values, the m_idx-dependent visible-row pattern in the output was just which half of each tile was randomly populated.
 
-Active phase: 2 (devkit) → 3.1 attempted; blocked.
+Fix (landed across several commits):
 
-### Phase 3.1 attempt finding (2026-05-14)
+1. `Kernel.resolve_subgroup_size()` + `self._sgs` — single source of truth: explicit `config.subgroup_size` override → MMA-shape requirement (Intel `_intel_*` → 16) → device caps' preferred SG → 32 fallback. Used by `block()`, the `@kernel` decorator's `KernelContext` seed, and every kernel body.
+2. Killed all `_WARP = 32` imports / literals across 22 kernel files. Every `c.n_warps * 32` / `self._n_warps() * 32` now uses `* self._sgs`.
+3. OCL lowerer: emits `OpExecutionMode SubgroupSize` unconditionally (was MMA-gated). Removed the `local_size` rescale (kernels now self-report correctly).
 
-Ran `tests/engine/test_intel_compute_latent_smoke.py` against Battlemage. Bumped the smoke config to `d_model=512 / 4 layers / 8 heads / Dh=64` so AdaRMSNorm's autotune has a valid config (the d=128 tiny config in `test_intel_smoke.py` doesn't survive `_fallback_default`). First frame compiled most of the DiT but raised `_visit_frag_convert(ocl): NotImplementedError` inside owl_attn — the FragConvert that materialises the GEMM2 P-fragment from the softmax accumulator.
+Effect: owl_attn standalone smoke cos_sim went **0.706922 → 0.999823** (within bf16 accumulated rounding of perfect; fails the 0.9999 gate by ~2e-4). Patchify went from xfail to pass.
 
-Inspected the failing op: `num_src_frags=1`, NOT the K-widening case the visitor's error message names. For Intel `m8n16k16_intel_bf16_f32`, `nk_per_kstep = shape_k // shape_n = 16/16 = 1`, so K-widening doesn't kick in. The K-widening rewrite plan in `Known OCL blockers` is therefore NOT the path forward for Waypoint DiT bf16 — what's needed is a single-source FragConvert lowering on OCL.
+### Workarounds that landed alongside the fix
 
-Root cause is a structural type mismatch:
-- IR `frag_convert` hard-codes result dtype to `ValueShape(DType.B32, width=shape.a_regs)` (CUDA convention — pack 2 bf16 per b32).
-- Intel `m8n16k16` MMA expects A operand as `v8 u16` (a_regs=8 u16 elements per lane, one bf16 per i16 carrier).
-- The CUDA carrier (8 b32 = 16 bf16) holds 2× the data Intel's A needs (8 bf16). MMA visitor passes the IR value verbatim, so IGC sees the wrong type.
+These were originally motivated by misdiagnosis (the chase for an "IGC OpPhi limit" / "IGC DPAS pattern matcher segfault" that turned out to be the SG mismatch) but the changes are still worth keeping on their own merits:
 
-Options:
-1. Patch the IR builder to emit a backend-aware result dtype for `frag_convert` (Intel: u16 width=a_regs; CUDA: b32 width=a_regs). Multi-touch — every consumer that assumes b32 carrier needs to be reviewed.
-2. OCL-only IR pass that rewrites `frag_convert → vec_extract + convert + vec_build` (an explicit f32→bf16 per slot, then construct the u16 vec). Localised to OCL, no IR-builder change. Pre-condition: each lane's f32x8 source maps 1:1 to bf16x8 dest (true for Intel m8n16k16 with nk_per_kstep=1).
-3. Take the `online_softmax_block.py` legacy PTX fallback (the `else:` branch at line 408) and route Intel through it. Already produces a single `b.vec_build(...)` Value of the right shape — but the layout assumes CUDA m16n8k16 cd_offsets `((0,0),(0,1),(8,0),(8,1))`, not Intel m8n16k16 single-column-per-lane.
+- **owl_attn M/L/O → per-warp smem** (kernels/owl_attn/kernel.py Intel path). Keeps the KV iv-loop body's IR lean (only the iv carry, no Carry-threaded softmax state). The smem traffic is real but small (2 KB/warp/iter).
+- **GEMM2 A acquisition via `load_matrix` from `p_smem`** (kernels/attn/online_softmax_block.py Intel branch). Structurally identical to GEMM1's A path — both GEMMs now use the same lane-view + load_matrix pattern instead of one going through `frag_convert`.
+- **RoPE: nested `qk.if_` → OpSelect 3-way piecewise** (lang/rope.py). Simpler IR, no structured-CF merges, same numerics on every backend.
+- **`_visit_frag_convert(ocl)` for num_src=1, Intel m8n16k16, F32→BF16** (lower/ocl/lower.py). Was needed for the original frag_convert path; now mostly unused on Intel since the smem round-trip replaced it, but still correct and used by other paths.
+- **`packed_b32` attribute handling** in `_visit_vec_extract` / `_visit_vec_build` (kernels using `packed_extract_b32` / `vec_build_packed_b32` — fma_bf16x2 cohort).
+- **B16/B32/B64 carrier types** in `_visit_const`.
 
-Took (2): implemented `_visit_frag_convert(ocl)` for num_src=1, shape=m8n16k16_intel_bf16_f32, src=ACC f32, dst=A_FRAG bf16. Emits per-slot `OpCompositeExtract` + optional body + `OpFConvert` F32→BF16 + `OpBitcast` to u16 + `OpCompositeConstruct` v8u16. The IR result Value is registered with the v8u16 SPIR-V ID directly (MMA passes the ID verbatim, so the type tag on the IR side doesn't matter).
+### Remaining open
 
-**Second blocker found 2026-05-14:** SPIR-V passes spirv-as cleanly, 12/13 generated kernels build through IGC (`clBuildProgram` OK). The 13th — `owl_attn` with frag_convert — segfaults inside IGC's compiler at `OpenCL` translation:
-```
-IGC: Internal Compiler Error: Segmentation violation
-  libigc.so.2 +0x1afa409 in DPAS-pass region
-```
-Tried two workarounds, neither helps:
-- `OpCopyObject` on the A operand to give each chained MMA a fresh SSA (load_matrix-fed MMAs each get a fresh `mma_load_a_NN`; our frag_convert path shares one `%frag_convert_result_N` across 4 MMAs).
-- Match load_matrix's exact source-op chain (`OpFConvert` F32→BF16 + `OpBitcast` to u16 instead of bitcast+shift+u-convert).
+- `owl_attn[bf16]` cos_sim=0.999823 vs gate 0.9999 — accumulated bf16 rounding through RoPE → GEMM1 → softmax exp/log → GEMM2 → l-normalize. Either tighten precision somewhere (compute_dtype=f32 if viable) or relax the gate to match achievable bf16 accuracy.
+- `owl_attn[f32]` autotune: `no valid config` — `compute_dtype=F32` wants an MMA shape with F32 inputs which Intel doesn't expose. Configuration matchmaking issue (kernel autotune side, not OCL).
+- `gemm_int` s8 — pre-existing blocker; needs SPV_INTEL_2d_block_io for the s8 DPAS layout.
 
-Both produce semantically-equivalent SPIR-V, IGC still crashes. The crash is in IGC's DPAS pattern matcher — input is well-formed but trips a code path the matcher doesn't handle. Likely needs either:
-- Bisect spv_012.txt (290K) down to a minimal repro to file as an IGC issue, or
-- Side-step entirely by writing the bf16 P-fragment to local memory and using `load_matrix` to materialise the A operand — same shape as the fp8 smem round-trip path. Costs one block-barrier per softmax block but routes around the IGC bug.
+### Isolation tests still useful as regression suite
 
-Next loop step: option (b) — implement the smem-round-trip P-fragment path on OCL. Most localised fix; doesn't depend on IGC patch landing.
-
-### Phase 3.1 follow-up (smem round-trip landed; IGC still crashes)
-
-Implemented the smem-round-trip path:
-- `OnlineSoftmax` (Intel branch): writes bf16(p_acc) to `p_smem` per-slot at the canonical Intel m8n16k16 layout (row = p_base + mt*m + s, col = nk*n + lane_id), returns `p_frags=None`.
-- `owl_attn`: allocates `p_smem` whenever `compute_is_fp8 or is_intel`; `_reload_p_frags_from_smem` does barrier + `load_matrix` for both paths.
-
-SPIR-V dump confirms `frag_convert_result` no longer appears in any module; GEMM2's A operand now comes from `load_matrix` (same path GEMM1 uses, byte-for-byte). 12/13 kernels still build through IGC; spv_012 (owl_attn) still segfaults at the same IGC offset.
-
-What's unique about spv_012 vs the working MMA kernels:
-- 8 MMAs vs 2 (4 GEMM1 + 4 GEMM2 chained).
-- 8 `OpControlBarrier` vs 2 (extra ones from softmax round-trip + per-warp staging).
-- Both GEMM1 and GEMM2 use load_matrix-built A; SPIR-V is well-formed.
-
-The crash is at `libigc.so.2 +0x1afa409` — same offset regardless of whether the A operand came from frag_convert (the original) or load_matrix (the smem round-trip). So the bug is NOT the A-operand source pattern; it's something else in the owl_attn kernel that triggers an IGC pass crash.
-
-Hypothesis: IGC chokes on long MMA chains inside structured control flow (for_loop + if_region) combined with the smem round-trip. The fp8 path uses the exact same pattern but never actually compiled on Intel before (fp8 DPAS isn't exposed by IGC).
-
-Next loop step: bisect spv_012.txt against the working spv_007.txt (the largest passing MMA kernel) to find the minimum SPIR-V that triggers the crash, then file with IGC or find a structural workaround.
-
-### Phase 3.1 bisect (2026-05-14)
-
-Subprocess-per-test bisect of spv_012's function body (4320 lines) by line count (each test in a fresh Python — IGC's ICE corrupts OCL state so successive `clBuildProgram` calls in the same process segfault):
-- Empty body → BUILD OK.
-- 100, 500 lines → AS_FAIL / IGC FAIL from mid-block truncation (malformed structured CF).
-- 1000, 1100, 1200, 1300, 1320, 1340 → BUILD OK.
-- 1345 → BUILD FAIL.
-- 1350, 1400, 2000, 4320 → BUILD FAIL.
-
-Body lines 1340–1345 add:
-- `OpPhi` carries (last few of the KV iv-loop)
-- `%loop_cond` = `OpULessThan %iv %u_272`
-- `OpLoopMerge`
-- `OpBranchConditional`
-- `%loop_body = OpLabel`
-- `%smem_chain = OpAccessChain %smem_kv_off_table %iv` + `OpLoad`
-
-The crash sits at the **kv-offset-table read in the main KV iv-loop body**. Eliminating MMAs (`OpCopyObject` substitution for all 8), subgroup reductions (`OpGroupNonUniformF{Add,Max}`), `OpExtInst` (math.h), or barriers (`OpControlBarrier`) does NOT make IGC accept the kernel. So the trigger is structural — the loop + smem indirect read pattern itself, not any specific instruction type.
-
-Hypothesis: IGC's loop optimizer or memory-access pass crashes on the combination of {OpLoopMerge with many OpPhi carries + smem-indirected memory access inside the loop body}. spv_012 has 19 OpPhi carries (S/M/L scalars + O fragment vectors) — far more than the GEMM kernels (which carry just the C accumulator). The carries threading the per-warp softmax state through the loop may exceed an IGC pass limit.
-
-Workaround options:
-1. Materialise the per-warp softmax state in smem instead of OpPhi carries — fewer Phi nodes, kernel size penalty.
-2. Split owl_attn into sub-kernels with smaller carry sets (multiple kernel launches per layer — dispatch overhead penalty).
-3. Skip owl_attn entirely on OCL until IGC patch lands; fall back to a per-token CPU softmax wrapper for Phase 3.
-
-Pragmatic call: option (3) is the fastest unblocker for Phase 3 — the rest of DiT (HeadRMSNorm, AdaRMSNorm, KV cache update, gemm, etc.) all build through IGC. owl_attn was always going to need separate verification anyway (the SPV_INTEL_2d_block_io path documented as the future direction). For now: add an env-var-gated OCL backend opt-out for owl_attn that routes those layers through a numpy reference.
-
-Additional bisects (2026-05-14 cont.): replacing OpLoads from `smem_kv_off_table` with a constant `%u_0` still crashes IGC at the same offset. So it's NOT the iv-indexed smem-indirect read pattern. The "1345 boundary" in the line bisect is an artefact of appending `OpReturn` at a structured-CF block boundary — IGC just optimises the trailing pipeline open + OpReturn away when truncation lands inside dead code (≤1340 lines), but when it lands at the first instruction inside the loop body it tries to lower the partial loop and ICEs.
-
-**OpPhi is the trigger (confirmed 2026-05-14):** Replacing every `OpPhi` in spv_012 with `OpCopyObject` of its first-predecessor value makes IGC accept the kernel cleanly. spv_012 has 60 OpPhis (vs 5–10 in every other kernel built this run). The threshold isn't monotonic — picking N OpPhis to keep produces inconsistent results because the SSA chain gets broken at arbitrary points — but eliminating them all unblocks IGC end-to-end.
-
-Path forward (option 1 from the earlier list): refactor owl_attn to drop M/L/O from the `Carry` spec and materialise per-warp softmax state in smem instead. Inside `consume()`: load M/L/O from smem at iter start, compute new values, store back. Drops the 60 OpPhi carries (M scalars + L scalars + O fragments threaded through the KV loop) to ~the loop's iv-only count. Costs 2 KB/warp of smem traffic per iter (8 f32 M + 8 f32 L + 4 v8f32 O = 528 f32 = 2 KB). The rest of DiT compiles, so once this lands Phase 3.1 stub-VAE should clear.
-
-Net conclusion: the IGC bug is a real limit on OpPhi count in structured CF (or some structural constraint highly correlated with it). Refactoring owl_attn to keep loop carries in smem is the high-value next step.
-
-### Phase 3.1 PASSING (2026-05-14)
-
-Three landings cut OpPhi count enough for IGC to build:
-1. `lang/rope.py` — emit_rope_cos_sin: replace nested `qk.if_(is_x)` / `qk.if_(is_y)` with OpSelect-based 3-way piecewise (mask the diff with `qk.select` to avoid u32 underflow). Drops 16 OpPhi (8 RoPE invocations × 2 if-merge phis).
-2. `kernels/owl_attn/kernel.py` Intel path — M/L scalars → per-warp smem (`ml_smem[NumWarps, 2*n_ml] f32`). Drops 16 OpPhi from Carry + 16 from if/else merge.
-3. Same — O accumulator → per-warp smem (`o_smem[NumWarps, n_o, SG, c_regs] f32`). Drops 4 v8f32 carry phis + 4 if-merge phis. `carry_spec = Carry()` (empty) on Intel.
-
-owl_attn SPV OpPhi count: 60 → 28 → 12 → 4 (just iv phis). IGC accepts.
-
-**`tests/engine/test_intel_compute_latent_smoke.py` (Phase 3.1):**
-- `test_compute_latent_one_frame`: PASSED — one denoise+commit through full DiT on Battlemage via OCL.
-- `test_compute_latent_two_frames_no_crash`: PASSED — KV-cache commit + rollover works.
-
-**Wider regression check:** 49 OCL tests pass; 5 known-fail (gemm_int s8 DPAS + 2 owl_attn smokes) unchanged.
-
-**Open issue — owl_attn standalone numeric smoke:** `tests/kernels/owl_attn/test_ocl_smoke.py` now runs (was blocked at IGC ICE before) but reports cos_sim=0.706922 vs numpy reference. The cos_sim is stable across multiple smem-refactor revisions, so this is a pre-existing bug — the test was added (commit 3ca3f7d) as a WIP before the kernel actually compiled on Intel. With the smem refactor + frag_convert visitor + RoPE select now in place, the kernel runs end-to-end for the first time and exposes this earlier bug.
-
-Phase 3.1 stub-VAE smoke passes the sanity gate (no NaN/Inf, max|x| < 1e3) but doesn't compare against a reference. Phase 3.2 (DiT correctness vs CUDA) is the natural next correctness check but needs CUDA hardware. Next loop step: bisect with the owl_attn smoke as the test fixture — instrument intermediate values via a debug buffer and compare against the numpy reference's intermediate.
-
-**Bug pattern characterised (2026-05-14):** Per-row cos_sim breakdown on owl_attn smoke:
-- Output rows {0..3, 12..15, 16..19, 28..31, ...} per 16-row block: cos≈1.
-- Output rows {4..11, 20..27, ...} per 16-row block: out_norm=0 (zeros).
-
-Mapping: warp 0 (m_idx=0) writes m=0..3 of its 8-row m-tile (slots s=0..3), drops m=4..7. Warp 1 (m_idx=1) writes m=4..7 (slots s=4..7), drops m=0..3. Each warp drops OPPOSITE halves of its 8-row tile.
-
-The 1:2 slot split (4 slots per warp instead of 8) strongly suggests `frag_for_each` is iterating only 4 slots per warp in the staged-store epilogue (`_emit_staged_store` for `per_warp=True, staging_smem=q_in_smem`). The store_acc visitor for Intel reads `c_width` from `_intel_mma_layout()` which is 8 — but maybe the cd_offsets `((0,0),)*c_regs` placeholder is being interpreted somewhere as only the FIRST 4 slots... or the per-warp staging dispatches differently than per-block.
-
-Independent of the smem refactor: PTX/Metal use a different store_acc path and pass owl_attn correctness. So the bug is OCL-specific and somewhere in the staged-store + frag_for_each composition for Intel cd_offsets placeholder shape.
-
-SPV inspection summary (2026-05-14): the epilogue emits the expected 32 frag_for_each OpStores into Q_in_smem (= staging) — 4 (mt*nt) × 8 (c_width) slots. The post-loop o_smem reads pull 8 consecutive f32 per (warp, fi, lane), matching the v8f32 MMA C-operand layout. Cooperative store covers all 8 rows × 64 cols per warp. No obvious gap in the SPV. Hypothesis remaining: at runtime the C-operand v8f32 returned by `OpSubgroupMatrixMultiplyAccumulateINTEL` may only have 4 valid components per lane (the other 4 unspecified or zero) — investigation requires a debug buffer that dumps the MMA output directly. That's next iter's setup.
+`tests/lower/ocl/test_{b32,bitcast,convert_bf16_f32,full_chain_no_fma,fma_bf16x2_identity,vec_bf16}_roundtrip.py` — six tests that pin individual SPIR-V emit paths (split/merge, bitcast B16↔BF16, convert BF16↔F32, full no-FMA chain, fma_bf16x2 identity, vec_load/store BF16 width=8). All pass on Battlemage. Originally written to bisect the (false-trail) numerics chase, kept because they catch any regressions in the OCL visitor layer cheaply.

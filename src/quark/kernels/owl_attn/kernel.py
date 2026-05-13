@@ -601,12 +601,12 @@ class OwlAttnKernel(Kernel):
         # load_matrix into the fp8 A-frag layout for GEMM2. One block
         # barrier per KV iter between the stores and the ldmatrix reads.
         #
-        # Intel + 16-bit A also uses smem round-trip — not for layout
-        # reasons but to route around an IGC ICE in the DPAS pattern
-        # matcher when the A operand for OpSubgroupMatrixMultiplyAccumulate
-        # INTEL comes from in-register OpFConvert+OpBitcast on f32 values
-        # (the in-register frag_convert path). Going through smem +
-        # load_matrix matches the GEMM1 pattern IGC accepts.
+        # Intel + 16-bit A also uses smem round-trip — GEMM2 picks up
+        # its A operand via load_matrix on ``p_smem`` so the acquisition
+        # pattern matches GEMM1's (warp-lane view + load_matrix). The
+        # in-register ``frag_convert`` path would also be correct in
+        # principle, but the smem path keeps both GEMMs structurally
+        # identical and avoids per-shape divergence in the OCL lowerer.
         is_intel = "_intel_" in mma_cfg.shape_id
         use_p_smem = compute_is_fp8 or is_intel
         if use_p_smem:
@@ -669,16 +669,16 @@ class OwlAttnKernel(Kernel):
         )
         n_ml = MTiles * n_rc
 
-        # IGC's compiler ICEs on large OpPhi sets in structured CF (verified
-        # 2026-05-14 against Battlemage / libigc 24.x — replacing all 60
-        # OpPhi in spv_012 with OpCopyObject makes the kernel build clean).
-        # On Intel we route M/L through per-warp smem instead of an
-        # explicit ``Carry`` slot; that drops 16 phis from the for-range
-        # carry + 16 from the if/else merge, leaving only the 4 O-phi
-        # carries plus iv (well under IGC's threshold).
-        # PTX/Metal keep the original Carry path — no perf hit there since
-        # neither has IGC's limit and OpPhi maps to physical registers on
-        # both backends.
+        # Intel: route softmax state (M, L, O) through per-warp smem
+        # instead of explicit ``Carry`` slots. With the SG=16 pin
+        # (Khronos requires this for the matrix MMA), the Carry path
+        # would emit ~60 OpPhi in the KV loop — IGC's loop lowering
+        # struggled with that shape historically, and the smem path
+        # keeps the loop body lean (just the iv carry) while making
+        # GEMM2's A acquisition match GEMM1's load_matrix pattern.
+        # PTX/Metal keep the original Carry path: neither backend
+        # benefits from offloading state to smem (OpPhi maps to
+        # physical registers there).
         if is_intel:
             from quark.ir.lifetime import Lifetime
             # Pin ml_smem and o_smem to kernel-wide lifetime so the layout
@@ -797,8 +797,8 @@ class OwlAttnKernel(Kernel):
 
             Used by both the fp8 path (layout reasons — fp8 A-frag
             doesn't line up same-lane with the f32 ACC layout) and the
-            Intel bf16 path (workaround for an IGC DPAS ICE on
-            in-register frag_convert-built A).
+            Intel bf16 path (keeps GEMM2's A acquisition structurally
+            identical to GEMM1's load_matrix).
             """
             qk.barrier("block")
             return [
