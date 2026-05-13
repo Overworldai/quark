@@ -191,7 +191,7 @@ and subgroup-block-read patterns, not the source.
 
 - [ ] **2C.2** [DEVKIT] Smoke + bench at one quant shape.
   Reference: OpenVINO `gemm_tiled_opt.cl` int8 path.
-  notes:
+  notes: **BLOCKED.** Smoke at `tests/kernels/test_gemm_int_ocl_smoke.py` runs through `call_with_bindings(GemmIntKernel, ...)` → autotune fails because `Intel(R) Graphics [0xb080]` caps only advertise `m8n16k16_intel_bf16_f32`, not `m8n16k32_intel_s8_s32`. The s8/s32 layout entry is missing from `_INTEL_MMA_LAYOUTS` in `lower/ocl/lower.py` — see new "Known OCL blockers" entry.
 
 ### 2D — KV cache update + small utility kernels
 
@@ -298,6 +298,18 @@ entries, but a few visitors raise NotImplementedError on specific
 op shapes that production kernels emit. These need targeted work
 beyond the smoke + bench cycle.
 
+- **s8/s32 MMA layout missing** — `_INTEL_MMA_LAYOUTS` in
+  `lower/ocl/lower.py:343` only has the `(BF16, BF16, F32, 8, 16, 16)`
+  entry. The Intel device probe filters `caps.matmul_shapes` against
+  this dict, so `m8n16k32_intel_s8_s32` doesn't reach the kernel's
+  `is_valid_for` check — every `GemmIntKernel` / `OwlAttnIntKernel`
+  config gets rejected at autotune. **Unblock**: add the s8/s32
+  layout tuple (subgroup_size, A/B/C/D per-lane types + element
+  counts) per the Khronos
+  `cl_intel_subgroup_matrix_multiply_accumulate` spec; matching MMA
+  emit code in `_visit_mma`. Affects every int8 quant kernel (Phase
+  2C). **Workaround**: bf16 path works (Phase 2B passed).
+
 - **`FragConvertOp` K-widening** — `_visit_frag_convert(ocl)` at
   `lower/ocl/lower.py:1936` raises on `K_dst = num_src * src_cols`
   shape. `cl_intel_subgroup_matrix_multiply_accumulate` fixes K at
@@ -334,6 +346,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: 2B.2 RMSNorm OCL smoke green on Battlemage (cos_sim=0.999996 at D=128/512/2048). 2A.2 owl_attn smoke BLOCKED on FragConvert K-widening (see Known OCL blockers). En route: OCL `_visit_convert` got sint↔uint, `_visit_arith` got shifts + bitwise.
+Last loop iteration: 2B.2 RMSNorm green. 2A.2 (owl_attn) + 2C.2 (gemm_int) BLOCKED on different OCL visitor gaps — see Known OCL blockers. En route: OCL `_visit_convert` got sint↔uint; `_visit_arith` got shr/shl/and/or/xor.
 Active phase: 2 (devkit).
-Next task: 2C.2 — gemm_int s8/s32 smoke (similar shape to 2B.2 but exercises the Intel MMA s8 path).
+Next task: 2D.2 — KV cache update smoke (no MMA, no FragConvert; pure index + RoPE + ring write).
