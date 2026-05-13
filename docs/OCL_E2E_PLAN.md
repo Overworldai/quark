@@ -177,10 +177,10 @@ and subgroup-block-read patterns, not the source.
 - [x] **2B.1** Visitor pass.
   notes: no gaps — AdaRMSNormKernel (17 ops) + HeadRMSNormKernel (17 ops) fully covered post-legalize per 1.2.
 
-- [ ] **2B.2** [DEVKIT] Smoke + bench. Reference OpenVINO
+- [x] **2B.2** [DEVKIT] Smoke + bench. Reference OpenVINO
   `rms.cl` for the fused reduce_sum_squared → rsqrt → mul → add
   pattern.
-  notes:
+  notes: smoke at `tests/kernels/test_rmsnorm_ocl_smoke.py` — 3 shapes pass on Battlemage (D=128 / 512 / 2048), all cos_sim=0.999996 vs numpy reference. Gate ≥ 0.9999 ✓. Bench deferred (production perf comparison vs OpenVINO `rms.cl` is a follow-up).
 
 ### 2C — gemm_int (s8/s32)
 
@@ -334,6 +334,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: devkit synced to Mac HEAD `d59d7a0` via `git push origin spirv-integration` + `git reset --hard` on devkit. 68 tests pass on Battlemage (24 engine + 44 OCL). Launcher routes `INTEL_GPU → _launch_ocl`. Phase 2 prerequisite closed.
+Last loop iteration: 2B.2 RMSNorm OCL smoke green on Battlemage (cos_sim=0.999996 at D=128/512/2048). 2A.2 owl_attn smoke BLOCKED on FragConvert K-widening (see Known OCL blockers). En route: OCL `_visit_convert` got sint↔uint, `_visit_arith` got shifts + bitwise.
 Active phase: 2 (devkit).
-Next task: 2A.2 — owl_attn bf16 numerics smoke on devkit. One shape per `mma_cfg` (m8n16k16 bf16/bf16/f32 and bf16/bf16/bf16), end-to-end through `OclDriver`, gate at cos_sim ≥ 0.9999 vs a numpy reference (PTX ref needs a CUDA host; numpy is enough for the first correctness pass).
+Next task: 2C.2 — gemm_int s8/s32 smoke (similar shape to 2B.2 but exercises the Intel MMA s8 path).
