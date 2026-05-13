@@ -298,37 +298,50 @@ entries, but a few visitors raise NotImplementedError on specific
 op shapes that production kernels emit. These need targeted work
 beyond the smoke + bench cycle.
 
-- **s8/s32 lane-data mapping** — `_INTEL_MMA_LAYOUTS` now has the
-  s8/s32 entry (commits 6a1d719..29695e8); `_visit_mma` and the
-  packed-K path in `_visit_load_matrix` both emit. **Kernel
-  compiles, dispatches, and produces output on Battlemage**.
-  All-ones diagnostic (`test_gemm_int_all_ones_yields_K`) reveals
-  the precise layout error: 512/1024 outputs correct, exactly the
-  even M-rows. Output tile:
-  ```
-  m=0,2,4,6: 64 64 64 64 ... 64   (correct)
-  m=1,3,5,7:  0  0  0  0 ...  0   (zero)
-  ```
-  Signature: the spec packs each u16 A-component as 2 M-rows for
-  the same K-col (low byte = m=2j, high byte = m=2j+1), NOT 2 K-cols
-  for the same M-row like my code emits. Hypothesized correct map
-  for the cl_intel s8 form (SG=16, M=8, K=32):
-  ```
-  Per lane L, slot s ∈ [0..7]:
-    K = L if s%2==0 else L+16
-    low byte  = A[m=2*(s//2),   K]
-    high byte = A[m=2*(s//2)+1, K]
-  ```
-  Fixing `_visit_load_matrix` to emit this convention closes the
-  numerics. Needs verification against the Khronos
-  cl_intel_subgroup_matrix_multiply_accumulate spec PDF (per-lane
-  layout table) or oneDNN's GEMM micro-JIT source before
-  committing. **Affects**: every int8 quant kernel. **Workaround**:
-  bf16 path works (Phase 2B passed). Five landing-ready lowerer
-  fixes surfaced en route: signedness operand mask names, A
-  per-lane vector size, C splat-construct emit, packed-K load
-  path in `_visit_load_matrix`, `_visit_arith` shifts + bitwise,
-  `_visit_convert` sint↔uint.
+- **s8/s32 lane-data mapping → adopt SPV_INTEL_2d_block_io** —
+  `_INTEL_MMA_LAYOUTS` has the s8/s32 entry, `_visit_mma` emits,
+  kernel compiles + dispatches end-to-end on Battlemage. But the
+  per-lane data marshaling DPAS expects for s8 is **not publicly
+  documented** at the byte level — Khronos spec describes operand
+  types only, IGC builtin (`__builtin_IB_sub_group16_idpas_s8_s8_8_8`)
+  hides the layout in closed-source vISA codegen, and every public
+  oneDNN/OpenVINO kernel uses `intel_sub_group_2d_block_read_*`
+  intrinsics to bypass manual lane packing.
+
+  Multiple empirical packings tried — sequential K, stride-SG K,
+  M-pair packing, byte-order swap — all produce the same half-zero
+  pattern (even M-rows correct, odd-M zero). The pattern is
+  structural; brute-force iteration isn't tractable.
+
+  **Decision**: adopt the path oneDNN and OpenVINO take — emit
+  `OpSubgroup2DBlockLoadINTEL` (and friends) from `SPV_INTEL_2d_
+  block_io`. The hardware handles per-lane distribution opaquely,
+  which is exactly what oneDNN relies on.
+
+  **Concrete sub-tasks**:
+  1. Add `SPV_INTEL_2d_block_io` extension + `Subgroup2DBlockIO
+     INTEL` capability emit (parallel to `_ensure_intel_mma_caps`).
+  2. New IR op variant or `LoadMatrixOp` attribute `use_block_io`
+     selecting the block-read path (global-memory source instead
+     of smem). Kernel-side: GemmInt + OwlAttnInt need to skip the
+     smem stage when the block-read path is enabled.
+  3. New visitor `_visit_load_matrix_block_io` emitting the
+     `OpSubgroup2DBlockLoadINTEL` op with the right operand shape
+     for the s8/s32 MMA's A/B fragments.
+  4. Mirror for `StoreMatrixOp` → `OpSubgroup2DBlockStoreINTEL`
+     for the C epilogue.
+
+  **Workaround during this work**: bf16 path (smem-based load,
+  pack_ratio=1) still uses the current `_visit_load_matrix`; only
+  s8/s32 paths route through block-IO. Phase 2B (RMSNorm) and
+  Phase 2 bf16 kernels remain unaffected.
+
+  **Five landing-ready lowerer fixes surfaced** while debugging:
+  signedness operand mask names, A per-lane vector size,
+  C splat-construct emit, packed-K load path in
+  `_visit_load_matrix`, `_visit_arith` shifts + bitwise,
+  `_visit_convert` sint↔uint. All in place; useful for the
+  block-IO work too.
 
 - **`FragConvertOp` K-widening** — `_visit_frag_convert(ocl)` at
   `lower/ocl/lower.py:1936` raises on `K_dst = num_src * src_cols`
@@ -366,6 +379,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: deep dive on the s8/s32 blocker. Architectural part RESOLVED (kernel compiles + runs end-to-end on Battlemage); precise data-layout bug isolated via all-ones diagnostic — needs spec-doc verification before final fix. FragConvert blocker not attempted (multi-day IR rewrite). 5 OCL lowerer fixes landed en route (convert/arith/operand-name/A-vec-size/C-splat).
+Last loop iteration: deep dive on s8/s32 blocker. Architectural part RESOLVED; per-lane data marshaling for DPAS is **not publicly documented** (Khronos spec stops at operand types, IGC builtin closed-source, every public kernel uses block-IO intrinsics to bypass). Decided to adopt the `SPV_INTEL_2d_block_io` path that oneDNN + OpenVINO use rather than reverse-engineer the layout.
 Active phase: 2 (devkit).
-Next: either resolve the s8 layout with spec-doc reference, or pivot to 2D.2 (KV cache + utility kernels, pure compute-cohort).
+Next: implement `SPV_INTEL_2d_block_io` for the s8/s32 load/store path (~1-2 days; sub-tasks listed in Known OCL blockers). bf16 kernels unaffected — Phase 2 bf16 work can continue independently.
