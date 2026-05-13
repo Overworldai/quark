@@ -45,18 +45,16 @@ class DeviceFamily(Enum):
     CPU = "cpu"
 
 
-# Default subgroup (warp/simd/execution-lane) width assumed at kernel
-# import time. The 5 elementwise/normalization kernels currently hardcode
-# this into their ``is_valid()`` tile-size checks because ``is_valid()``
-# runs before any device context is attached to the kernel. Once we plumb
-# caps into ``is_valid_for``, each kernel can consult the device's actual
-# ``caps.subgroup_width`` instead and this constant goes away.
-#
-# 32 is correct for every backend currently wired up (NV / Metal / Apple
-# GPU / CDNA) and for the SPIR-V v1 plan (see PORTABILITY_PLAN.md §3.4 —
-# Intel pinned to SIMD32 via ``reqd_sub_group_size(32)`` for v1). RDNA
-# wave64 and Intel non-pinned builds are the failure modes the plan
-# already calls out; they require the is_valid_for caps work first.
+# Framework-wide *default* subgroup width — used by drivers' probe
+# fallback and by autotune ``default_for`` heuristics that pick an
+# ``n_warps`` before the device is known. Kernels themselves no longer
+# read this directly — the SIMD width they emit against is derived
+# per-kernel from ``Kernel.resolve_subgroup_size()`` (Intel MMA shapes
+# → 16, CUDA / Metal / default → 32), and the OCL lowerer pins the
+# matching width at SPV emit time. Past tense: was previously imported
+# as ``_WARP`` into elementwise/normalization kernels and hardcoded
+# into their ``is_valid()`` tile checks; those references all read
+# ``self._sgs`` now.
 DEFAULT_SUBGROUP_WIDTH: int = 32
 
 

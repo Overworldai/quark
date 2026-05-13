@@ -202,7 +202,7 @@ class PatchifyKernel(Kernel):
             # We use the scalar-store path: write each element individually
             # to the A smem tile. This is less efficient than cp.async but
             # correct for non-contiguous access patterns.
-            n_threads = c.n_warps * 32
+            n_threads = c.n_warps * self._sgs
             tid = bctx.tid
             total_elems = c.BM * c.BK
             elems_per_thread = total_elems // n_threads

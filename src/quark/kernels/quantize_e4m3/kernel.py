@@ -57,7 +57,7 @@ class QuantizeE4M3Kernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         epb = c.elems_per_block
         src_b = s.src_dtype.bytes
         # Per-phase divisibility:
@@ -109,7 +109,7 @@ class QuantizeE4M3Kernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         epb = c.elems_per_block
         src_b = s.src_dtype.bytes
         elems_per_line = 16 // src_b  # 8 for bf16/f16, 4 for f32

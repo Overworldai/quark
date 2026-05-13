@@ -16,7 +16,6 @@ from typing import ClassVar
 
 import quark.lang as qk
 from quark.blocks import TensorDecl
-from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.device import DeviceFamily
 from quark.ir import DType
 from quark.kernels.base import Kernel
@@ -61,14 +60,14 @@ class RMSNormKernel(Kernel):
         s, c = self.spec, self.config
         if c.n_warps < 1 or c.n_warps > 32:
             return False
-        if s.D % _WARP != 0:
+        if s.D % self._sgs != 0:
             return False
         vec_elems = _CP_BYTES // s.dtype.bytes
         if s.D % vec_elems != 0:
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         # Large-D mode: warp-per-row.
-        if _WARP * vec_elems <= s.D:
+        if self._sgs * vec_elems <= s.D:
             return s.B % c.n_warps == 0
         # Small-D mode: cooperative multi-row load.
         # rows_per_load = n_threads * vec_elems / D — must be integer.
@@ -98,9 +97,9 @@ class RMSNormKernel(Kernel):
         if c.n_warps <= 1:
             return False
         vec_elems = _CP_BYTES // s.dtype.bytes
-        if _WARP * vec_elems > s.D or s.D % (_WARP * vec_elems) != 0:
+        if self._sgs * vec_elems > s.D or s.D % (self._sgs * vec_elems) != 0:
             return False
-        epl = s.D // _WARP
+        epl = s.D // self._sgs
         if epl % vec_elems != 0:
             return False
         return (epl // vec_elems) > 4
@@ -108,12 +107,12 @@ class RMSNormKernel(Kernel):
     def grid(self) -> tuple[int, int, int]:
         s, c = self.spec, self.config
         vec_elems = _CP_BYTES // s.dtype.bytes
-        if _WARP * vec_elems <= s.D:
+        if self._sgs * vec_elems <= s.D:
             if self._use_metal_multi_sg():
                 # One block per row; n_warps simdgroups cooperate.
                 return (1, s.B, 1)
             return (1, s.B // c.n_warps, 1)
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         rows_per_load = (n_threads * vec_elems) // s.D
         return (1, s.B // rows_per_load, 1)
 
@@ -154,14 +153,14 @@ class RMSNormKernel(Kernel):
 
         D = s.D
         n_warps = c.n_warps
-        n_threads = n_warps * _WARP
+        n_threads = n_warps * self._sgs
         dtype = s.dtype
-        epl = D // _WARP
+        epl = D // self._sgs
         vec_elems = _CP_BYTES // dtype.bytes
-        min_chunk = _WARP * vec_elems  # 256 for bf16
+        min_chunk = self._sgs * vec_elems  # 256 for bf16
 
         lane = bctx.lane_id
-        warp_c = bctx.c(_WARP, dtype=DType.U32)
+        warp_c = bctx.c(self._sgs, dtype=DType.U32)
 
         if min_chunk <= D:
             self._build_large_d(
@@ -194,15 +193,15 @@ class RMSNormKernel(Kernel):
         n_warps = c.n_warps
         dtype = s.dtype
         vec_elems = _CP_BYTES // dtype.bytes
-        min_chunk = _WARP * vec_elems
+        min_chunk = self._sgs * vec_elems
         # Conditions for the warp-per-row register-stash path:
         #   - D divides evenly across the warp at the vec width
         #   - one full warp's worth of vecs fits the row (D >= min_chunk)
-        #   - elems_per_lane (= D/_WARP) is a multiple of vec_elems
+        #   - elems_per_lane (= D/self._sgs) is a multiple of vec_elems
         if min_chunk > D or D % min_chunk != 0:
             self.build()
             return
-        epl = D // _WARP
+        epl = D // self._sgs
         if epl % vec_elems != 0:
             self.build()
             return
@@ -231,7 +230,7 @@ class RMSNormKernel(Kernel):
         sum_sq = bctx.c(0.0, dtype=DType.F32)
         regs: list[list] = []
         for v in range(vecs_per_lane):
-            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            col = (lane + bctx.c(v * self._sgs, dtype=DType.U32)) * vec_w_c
             x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
             v_regs = []
             for j in range(vec_w):
@@ -246,7 +245,7 @@ class RMSNormKernel(Kernel):
         )
 
         for v in range(vecs_per_lane):
-            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            col = (lane + bctx.c(v * self._sgs, dtype=DType.U32)) * vec_w_c
             out_elems = []
             for j in range(vec_w):
                 y = regs[v][j] * rms_inv
@@ -278,11 +277,11 @@ class RMSNormKernel(Kernel):
         vec_w = vec_elems
         vec_w_c = bctx.c(vec_w, dtype=DType.U32)
         # Each lane covers ``vecs_per_lane`` vec chunks, strided across
-        # the row by ``n_warps * _WARP * vec_w``.
-        n_threads = n_warps * _WARP
+        # the row by ``n_warps * self._sgs * vec_w``.
+        n_threads = n_warps * self._sgs
         epl_per_thread = D // n_threads
         vecs_per_lane = epl_per_thread // vec_w
-        sg_c = bctx.c(_WARP, dtype=DType.U32)
+        sg_c = bctx.c(self._sgs, dtype=DType.U32)
         # Linear thread id within the block.
         tid = sg_id * sg_c + lane
 
@@ -345,7 +344,7 @@ class RMSNormKernel(Kernel):
         while n_chunks > 1 and D % n_chunks != 0:
             n_chunks -= 1
         chunk_D = D // n_chunks
-        loads_per_lane = (chunk_D // vec_elems) // _WARP
+        loads_per_lane = (chunk_D // vec_elems) // self._sgs
         vecs_per_lane = loads_per_lane
 
         block_base = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)

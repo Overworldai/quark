@@ -40,7 +40,6 @@ from quark.kernels.moe_router_shared.problems import moe_router_shared_problems
 from quark.kernels.moe_router_shared.reference import moe_router_shared_reference_numpy
 from quark.kernels.moe_router_shared.spec import MoeRouterSharedSpec
 
-_WARP = 32
 _BM = 32
 _LOG2E = 1.4426950408889634
 
@@ -120,7 +119,7 @@ class MoeRouterSharedKernel(Kernel):
         s, c = self.spec, self.config
         if not (1 <= c.n_warps <= 32):
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         # Strict one-thread-per-token — phase-1 reads logits[tid, e]
         # unconditionally; relaxing to n_threads > M would let the extra
         # threads OOB-read past the logits buffer. Same reasoning as
@@ -190,7 +189,7 @@ class MoeRouterSharedKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         M, E, K = s.M, s.E, s.top_k
         KM = s.total_slots  # == K * M
         n_chunks = KM // _BM

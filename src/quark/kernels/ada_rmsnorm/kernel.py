@@ -23,7 +23,6 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
-from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.device import DeviceFamily
 from quark.ir import DType
 from quark.kernels.ada_rmsnorm.baselines import ada_rmsnorm_baselines
@@ -77,11 +76,11 @@ class AdaRMSNormKernel(Kernel):
         s, c = self.spec, self.config
         if c.n_warps < 1 or c.n_warps > 32:
             return False
-        if s.D % _WARP != 0:
+        if s.D % self._sgs != 0:
             return False
         if s.B % c.n_warps != 0:
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         vec_elems = _CP_BYTES // s.dtype.bytes
         if s.D % vec_elems != 0:
             return False
@@ -90,12 +89,12 @@ class AdaRMSNormKernel(Kernel):
         chunk_D = c.chunk_D
         if chunk_D <= 0 or s.D % chunk_D != 0:
             return False
-        if chunk_D % _WARP != 0:
+        if chunk_D % self._sgs != 0:
             return False
-        min_chunk = _WARP * vec_elems
+        min_chunk = self._sgs * vec_elems
         if chunk_D < min_chunk:
             return False
-        if (chunk_D // vec_elems) // _WARP < 1:
+        if (chunk_D // vec_elems) // self._sgs < 1:
             return False
         return True
 
@@ -111,9 +110,9 @@ class AdaRMSNormKernel(Kernel):
         if c.n_warps <= 1:
             return False
         vec_elems = _CP_BYTES // s.dtype.bytes
-        if _WARP * vec_elems > s.D or s.D % (_WARP * vec_elems) != 0:
+        if self._sgs * vec_elems > s.D or s.D % (self._sgs * vec_elems) != 0:
             return False
-        epl = s.D // _WARP
+        epl = s.D // self._sgs
         if epl % vec_elems != 0:
             return False
         return (epl // vec_elems) > 4
@@ -187,11 +186,11 @@ class AdaRMSNormKernel(Kernel):
         n_warps = c.n_warps
         dtype = s.dtype
         vec_elems = _CP_BYTES // dtype.bytes
-        min_chunk = _WARP * vec_elems
+        min_chunk = self._sgs * vec_elems
         if min_chunk > D or D % min_chunk != 0:
             self.build()
             return
-        epl = D // _WARP
+        epl = D // self._sgs
         if epl % vec_elems != 0:
             self.build()
             return
@@ -221,7 +220,7 @@ class AdaRMSNormKernel(Kernel):
         sum_sq = bctx.c(0.0, dtype=DType.F32)
         regs: list[list] = []
         for v in range(vecs_per_lane):
-            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            col = (lane + bctx.c(v * self._sgs, dtype=DType.U32)) * vec_w_c
             x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
             v_regs = []
             for j in range(vec_w):
@@ -240,7 +239,7 @@ class AdaRMSNormKernel(Kernel):
         log2e = bctx.c(_math.log2(_math.e), dtype=DType.F32) if do_silu else None
 
         for v in range(vecs_per_lane):
-            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            col = (lane + bctx.c(v * self._sgs, dtype=DType.U32)) * vec_w_c
             s_vec = qk.vec_load(g.scale, my_group, col, width=vec_w, dtype=dtype)
             b_vec = qk.vec_load(g.bias, my_group, col, width=vec_w, dtype=dtype)
             out_elems = []
@@ -272,10 +271,10 @@ class AdaRMSNormKernel(Kernel):
         vec_w = vec_elems
         vec_w_c = bctx.c(vec_w, dtype=DType.U32)
 
-        n_threads = n_warps * _WARP
+        n_threads = n_warps * self._sgs
         epl_per_thread = D // n_threads
         vecs_per_lane = epl_per_thread // vec_w
-        sg_c = bctx.c(_WARP, dtype=DType.U32)
+        sg_c = bctx.c(self._sgs, dtype=DType.U32)
         tid = sg_id * sg_c + lane
 
         my_row = qk.block_idx("y")
@@ -344,7 +343,7 @@ class AdaRMSNormKernel(Kernel):
 
         chunk_D = c.chunk_D
         n_chunks = D // chunk_D
-        loads_per_lane = (chunk_D // vec_elems) // _WARP
+        loads_per_lane = (chunk_D // vec_elems) // self._sgs
         vecs_per_lane = loads_per_lane
 
         block_base = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)

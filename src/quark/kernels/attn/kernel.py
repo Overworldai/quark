@@ -155,9 +155,9 @@ class AttnKernel(Kernel):
         if c.n_stages not in (1, 2):
             return False
         n_warps = self._n_warps()
-        if n_warps * 32 > 1024:
+        if n_warps * self._sgs > 1024:
             return False
-        n_threads = n_warps * 32
+        n_threads = n_warps * self._sgs
         # cp.async K tile: KvTile * Dh * 2 bytes / 16 bytes per line
         k_lines = c.KvTile * s.Dh * 2 // 16
         if k_lines > n_threads and k_lines % n_threads != 0:
@@ -180,7 +180,7 @@ class AttnKernel(Kernel):
         return (n_q_tiles, s.B * s.n_kv_heads, 1)
 
     def block(self) -> tuple[int, int, int]:
-        return (self._n_warps() * 32, 1, 1)
+        return (self._n_warps() * self._sgs, 1, 1)
 
     def flops(self) -> int:
         s = self.spec

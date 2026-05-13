@@ -37,7 +37,6 @@ from quark.kernels.moe_router_correct.problems import moe_router_correct_problem
 from quark.kernels.moe_router_correct.reference import moe_router_correct_reference_numpy
 from quark.kernels.moe_router_correct.spec import MoeRouterCorrectSpec
 
-_WARP = 32
 _BM = 32
 _LOG2E = 1.4426950408889634
 
@@ -119,7 +118,7 @@ class MoeRouterCorrectKernel(Kernel):
         s, c = self.spec, self.config
         if not (1 <= c.n_warps <= 32):
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         # Strict one-thread-per-token: phase-1 reads logits[tid, e]
         # unconditionally; relaxing to n_threads > M would let the
         # extra threads OOB-read past the logits buffer.
@@ -181,7 +180,7 @@ class MoeRouterCorrectKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         M, E, K = s.M, s.E, s.top_k
         total_slots = s.total_slots
         n_chunks = total_slots // _BM

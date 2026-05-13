@@ -23,7 +23,6 @@ from typing import ClassVar
 
 import quark.lang as qk
 from quark.blocks import TensorDecl
-from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP
 from quark.ir import DType
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
@@ -90,7 +89,7 @@ class MoeReduceKernel(Kernel):
         # (e.g. f32 partials → bf16 output: 4 → 8, two loads per chunk).
         if vec_w_out % vec_w_in != 0:
             return False
-        if s.D % (_WARP * vec_w_out) != 0:
+        if s.D % (self._sgs * vec_w_out) != 0:
             return False
         return True
 
@@ -203,7 +202,7 @@ class MoeReduceKernel(Kernel):
         vec_w_in = _CP_BYTES // partials_dt.bytes
         vec_w_out = _CP_BYTES // out_dt.bytes
         loads_per_chunk = vec_w_out // vec_w_in
-        epl = D // _WARP
+        epl = D // self._sgs
         vecs_per_lane = epl // vec_w_out
 
         lane = bctx.lane_id
@@ -232,7 +231,7 @@ class MoeReduceKernel(Kernel):
         # ``loads_per_chunk`` partials vec_loads per k), then
         # narrow-cast and vec_store.
         for v in range(vecs_per_lane):
-            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_out_c
+            col = (lane + bctx.c(v * self._sgs, dtype=DType.U32)) * vec_w_out_c
 
             # f32 accumulators — one per element of the output vec.
             accs: list = [bctx.c(0.0, dtype=DType.F32) for _ in range(vec_w_out)]

@@ -24,7 +24,6 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import PipelineBody, SmemVector, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
-from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.ada_gate_residual.baselines import ada_gate_residual_baselines
 from quark.kernels.ada_gate_residual.config import AdaGateResidualConfig
@@ -78,25 +77,25 @@ class AdaGateResidualKernel(Kernel):
         s, c = self.spec, self.config
         if not (1 <= c.n_warps <= 32):
             return False
-        if s.D % _WARP != 0:
+        if s.D % self._sgs != 0:
             return False
         if s.M % c.n_warps != 0:
             return False
         vec_elems = _CP_BYTES // s.dtype.bytes
         if s.D % vec_elems != 0:
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         if (s.D // vec_elems) % n_threads != 0:
             return False
         chunk_D = c.chunk_D
         if chunk_D <= 0 or s.D % chunk_D != 0:
             return False
-        if chunk_D % _WARP != 0:
+        if chunk_D % self._sgs != 0:
             return False
-        min_chunk = _WARP * vec_elems
+        min_chunk = self._sgs * vec_elems
         if chunk_D < min_chunk:
             return False
-        if (chunk_D // vec_elems) // _WARP < 1:
+        if (chunk_D // vec_elems) // self._sgs < 1:
             return False
         return True
 
@@ -180,11 +179,11 @@ class AdaGateResidualKernel(Kernel):
         n_warps = c.n_warps
         dtype = s.dtype
         vec_elems = _CP_BYTES // dtype.bytes
-        min_chunk = _WARP * vec_elems
+        min_chunk = self._sgs * vec_elems
         if min_chunk > D or D % min_chunk != 0:
             self.build()
             return
-        epl = D // _WARP
+        epl = D // self._sgs
         if epl % vec_elems != 0:
             self.build()
             return
@@ -202,7 +201,7 @@ class AdaGateResidualKernel(Kernel):
         my_row = my_group * bctx.c(M, dtype=DType.U32) + my_row_in_group
 
         for v in range(vecs_per_lane):
-            col = (lane + bctx.c(v * _WARP, dtype=DType.U32)) * vec_w_c
+            col = (lane + bctx.c(v * self._sgs, dtype=DType.U32)) * vec_w_c
             g_vec = qk.vec_load(g.gate, my_group, col, width=vec_w, dtype=dtype)
             x_vec = qk.vec_load(g.X, my_row, col, width=vec_w, dtype=dtype)
             y_vec = qk.vec_load(g.Y, my_row, col, width=vec_w, dtype=dtype)
@@ -237,7 +236,7 @@ class AdaGateResidualKernel(Kernel):
         vec_elems = _CP_BYTES // dtype.bytes
 
         chunk_D = c.chunk_D
-        vecs_per_lane = (chunk_D // vec_elems) // _WARP
+        vecs_per_lane = (chunk_D // vec_elems) // self._sgs
 
         # blockIdx.z = gate group index (no division needed).
         my_group = qk.block_idx("z")
@@ -300,7 +299,7 @@ class AdaGateResidualKernel(Kernel):
 
         chunk_D = c.chunk_D
         n_chunks = D // chunk_D
-        loads_per_lane = (chunk_D // vec_elems) // _WARP
+        loads_per_lane = (chunk_D // vec_elems) // self._sgs
         vecs_per_lane = loads_per_lane
 
         # 3D grid: z=gate-group, y=within-group row-group, x=always 1 (no D chunking).

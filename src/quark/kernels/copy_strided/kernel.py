@@ -53,7 +53,7 @@ class CopyStridedKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         return (
             s.N % c.elems_per_block == 0
             and c.elems_per_block % n_threads == 0
@@ -88,7 +88,7 @@ class CopyStridedKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         epb = c.elems_per_block
         epl = epb // n_threads
 

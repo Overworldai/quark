@@ -14,7 +14,6 @@ from typing import ClassVar
 import quark.lang as qk
 from quark.blocks import PipelineBody, TensorDecl
 from quark.blocks.l2.run_pipeline import IterCtx
-from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
@@ -65,7 +64,7 @@ class ValueResidualPackedKernel(Kernel):
         s, c = self.spec, self.config
         if not (1 <= c.n_warps <= 32):
             return False
-        if s.D_full % _WARP != 0:
+        if s.D_full % self._sgs != 0:
             return False
         if s.M % c.n_warps != 0:
             return False
@@ -75,12 +74,12 @@ class ValueResidualPackedKernel(Kernel):
         chunk_D = c.chunk_D
         if chunk_D <= 0 or s.D_full % chunk_D != 0:
             return False
-        if chunk_D % _WARP != 0:
+        if chunk_D % self._sgs != 0:
             return False
-        min_chunk = _WARP * vec_elems
+        min_chunk = self._sgs * vec_elems
         if chunk_D < min_chunk:
             return False
-        if (chunk_D // vec_elems) // _WARP < 1:
+        if (chunk_D // vec_elems) // self._sgs < 1:
             return False
         return True
 
@@ -138,7 +137,7 @@ class ValueResidualPackedKernel(Kernel):
         vec_elems = _CP_BYTES // dtype.bytes
         chunk_D = c.chunk_D
         n_chunks = D_full // chunk_D
-        loads_per_lane = (chunk_D // vec_elems) // _WARP
+        loads_per_lane = (chunk_D // vec_elems) // self._sgs
         vecs_per_lane = loads_per_lane
 
         block_base = qk.block_idx("y") * bctx.c(n_warps, dtype=DType.U32)

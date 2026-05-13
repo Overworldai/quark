@@ -42,7 +42,6 @@ from quark.kernels.moe_router.problems import moe_router_problems
 from quark.kernels.moe_router.reference import moe_router_reference_numpy
 from quark.kernels.moe_router.spec import MoeRouterSpec
 
-_WARP = 32
 _LOG2E = 1.4426950408889634
 
 
@@ -105,7 +104,7 @@ class MoeRouterKernel(Kernel):
         s, c = self.spec, self.config
         if not (1 <= c.n_warps <= 32):
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         # Single-block design caps M.
         if n_threads < s.M:
             return False
@@ -169,7 +168,7 @@ class MoeRouterKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         M, E, K, C = s.M, s.E, s.top_k, s.capacity
         # All E priorities are sorted; the fallback path can try every
         # non-claimed expert, so per-slot trial set spans all of pri_idx.

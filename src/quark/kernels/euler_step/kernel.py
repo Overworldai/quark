@@ -46,7 +46,7 @@ class EulerStepConfig(KernelConfig):
         for epb in (1024, 512, 256, 128, 64, 32):
             if spec.N % epb == 0 and epb % 32 == 0:
                 n_warps = min(4, epb // 32)
-                if epb % (n_warps * 32) == 0:
+                if epb % (n_warps * self._sgs) == 0:
                     return cls(n_warps=n_warps, elems_per_block=epb)
         return cls(n_warps=4, elems_per_block=1024)
 
@@ -89,7 +89,7 @@ class EulerStepKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         return (
             s.N % c.elems_per_block == 0
             and c.elems_per_block % n_threads == 0
@@ -133,7 +133,7 @@ class EulerStepKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         epb = c.elems_per_block
         dtype = s.dtype
 

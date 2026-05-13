@@ -90,7 +90,7 @@ class RandnKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         if c.n_warps < 1 or c.n_warps > 32:
             return False
         if c.elems_per_block <= 0:
@@ -190,7 +190,7 @@ class RandnKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         epb = c.elems_per_block
         epl = epb // n_threads  # outputs per thread, multiple of 4
         groups = epl // 4  # Philox calls per thread

@@ -179,7 +179,7 @@ class KVCacheUpdateKernel(Kernel):
         # autotune skip dominated/invalid configs cleanly. half_Dh,
         # vec_elems, etc. all use cached tile dims now (the smem
         # buffers are compacted by quilt_factor).
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         half_Dh = s.Dh // 2
         is_fp8 = s.kv_dtype in (DType.E4M3, DType.E5M2)
         n_pairs = tile_T_cached * half_Dh
@@ -400,7 +400,7 @@ class KVCacheUpdateKernel(Kernel):
         tile_T = c.tile_T
         tpf = s.tpf
         n_warps = c.n_warps
-        n_threads = n_warps * 32
+        n_threads = n_warps * self._sgs
         L = s.L
         capacity = s.capacity
         num_buckets = s.num_buckets

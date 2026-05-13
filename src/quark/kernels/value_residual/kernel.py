@@ -1,7 +1,7 @@
 """ValueResidual — fused ``out = v + lamb * (v1 - v)`` element-wise.
 
 Rank-1 layout: every tensor is viewed as ``[N]``. Grid is 1D over
-``N // elems_per_block`` blocks, each block has ``n_warps*32`` threads
+``N // elems_per_block`` blocks, each block has ``n_warps * self._sgs`` threads
 and each thread handles ``elems_per_block / n_threads`` scalars.
 
 ``lamb`` is a 1-element device tensor (loaded once per block into a
@@ -55,7 +55,7 @@ class ValueResidualKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         return (
             s.N % c.elems_per_block == 0
             and c.elems_per_block % n_threads == 0
@@ -108,7 +108,7 @@ class ValueResidualKernel(Kernel):
         bctx = self.bctx
 
         n_warps = c.n_warps
-        n_threads = n_warps * 32
+        n_threads = n_warps * self._sgs
         epb = c.elems_per_block
         epl = epb // n_threads
         dtype = s.dtype

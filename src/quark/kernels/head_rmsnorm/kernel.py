@@ -13,7 +13,6 @@ from typing import ClassVar
 
 import quark.lang as qk
 from quark.blocks import TensorDecl
-from quark.device import DEFAULT_SUBGROUP_WIDTH as _WARP  # see device.py:DEFAULT_SUBGROUP_WIDTH
 from quark.ir import DType
 from quark.kernels.base import Kernel
 from quark.kernels.decorator import kernel
@@ -57,12 +56,12 @@ class HeadRMSNormKernel(Kernel):
         s, c = self.spec, self.config
         if c.n_warps < 1 or c.n_warps > 32:
             return False
-        if s.Dh % _WARP != 0:
+        if s.Dh % self._sgs != 0:
             return False
         vec_elems = _CP_BYTES // s.dtype.bytes
         if s.Dh % vec_elems != 0:
             return False
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         total_work = s.M * s.total_heads
         # Each load pass covers n_threads * vec_elems / Dh heads.
         elems_per_load = n_threads * vec_elems
@@ -77,7 +76,7 @@ class HeadRMSNormKernel(Kernel):
 
     def grid(self) -> tuple[int, int, int]:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * _WARP
+        n_threads = c.n_warps * self._sgs
         vec_elems = _CP_BYTES // s.dtype.bytes
         heads_per_load = (n_threads * vec_elems) // s.Dh
         total_work = s.M * s.total_heads
@@ -131,11 +130,11 @@ class HeadRMSNormKernel(Kernel):
 
         Dh = s.Dh
         n_warps = c.n_warps
-        n_threads = n_warps * _WARP
+        n_threads = n_warps * self._sgs
         dtype = s.dtype
         total_heads = s.total_heads
         n_norm_heads = s.n_q_heads + s.n_kv_heads
-        epl = Dh // _WARP  # elements per lane per head (e.g. 2 for Dh=64)
+        epl = Dh // self._sgs  # elements per lane per head (e.g. 2 for Dh=64)
 
         vec_elems = _CP_BYTES // dtype.bytes
 
@@ -152,7 +151,7 @@ class HeadRMSNormKernel(Kernel):
         block_head_base = qk.block_idx("y") * bctx.c(heads_per_load, dtype=DType.U32)
 
         lane = bctx.lane_id
-        warp_c = bctx.c(_WARP, dtype=DType.U32)
+        warp_c = bctx.c(self._sgs, dtype=DType.U32)
         total_heads_c = bctx.c(total_heads, dtype=DType.U32)
         n_norm_c = bctx.c(n_norm_heads, dtype=DType.U32)
         Dh_c = bctx.c(Dh, dtype=DType.U32)

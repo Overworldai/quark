@@ -135,7 +135,7 @@ class ElementwiseKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         epb = c.elems_per_block
         out_dtype = s.effective_out_dtype
         op = s.op

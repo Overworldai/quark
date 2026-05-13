@@ -728,6 +728,15 @@ class Kernel(ABC):
     # instance-method overrides on subclasses) so we don't shadow
     # them in the base.
 
+    @property
+    def _sgs(self) -> int:
+        """Short alias for :meth:`resolve_subgroup_size` for use in kernel
+        bodies. Most non-MMA kernels still write loop arithmetic as
+        ``c.n_warps * self._sgs`` etc. — the historical ``_WARP`` module
+        import is now this property so the value follows the device's
+        resolved subgroup width instead of a hardcoded constant."""
+        return self.resolve_subgroup_size()
+
     def resolve_subgroup_size(self) -> int:
         """SIMD width the kernel runs at, derived from the active MMA shape.
 

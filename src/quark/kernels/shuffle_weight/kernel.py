@@ -60,7 +60,7 @@ class ShuffleWeightKernel(Kernel):
 
     def is_valid(self) -> bool:
         s, c = self.spec, self.config
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         return s.tile_bytes % n_threads == 0 and 1 <= c.n_warps <= 32
 
     def grid(self) -> tuple[int, int, int]:
@@ -95,7 +95,7 @@ class ShuffleWeightKernel(Kernel):
         g = self.g
         bctx = self.bctx
 
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self._sgs
         bpl = s.tile_bytes // n_threads  # bytes per lane per tile
 
         FRAG_BYTES = s.FRAG_BYTES
