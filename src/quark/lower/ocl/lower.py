@@ -533,14 +533,24 @@ def _visit_const(op: ConstOp, ctx: _OclCtx) -> None:
     (out,) = op.results
     dt = out.dtype
     raw = op.attrs.get("value")
-    if dt is DType.U32:
-        cid = ctx.text.const_uint(int(raw))
+    if dt is DType.U32 or dt is DType.B32:
+        cid = ctx.text.const_uint(int(raw) & 0xFFFFFFFF)
     elif dt is DType.S32:
         s32 = ctx.text.type_int(32, signed=True)
         cid = ctx.text.alloc_id(f"s_{int(raw)}")
         ctx.text.add_type_line(f"{cid} = OpConstant {s32} {int(raw)}")
     elif dt is DType.F32:
         cid = ctx.text.const_float(float(raw))
+    elif dt is DType.B16:
+        u16 = ctx.text.type_int(16, signed=False)
+        cid = ctx.text.alloc_id(f"b16_{int(raw) & 0xFFFF}")
+        ctx.text.add_type_line(f"{cid} = OpConstant {u16} {int(raw) & 0xFFFF}")
+    elif dt is DType.B64:
+        u64 = ctx.text.type_int(64, signed=False)
+        cid = ctx.text.alloc_id(f"b64_{int(raw) & 0xFFFFFFFFFFFFFFFF}")
+        ctx.text.add_type_line(
+            f"{cid} = OpConstant {u64} {int(raw) & 0xFFFFFFFFFFFFFFFF}"
+        )
     else:
         raise NotImplementedError(
             f"_visit_const(ocl): dtype {dt!r} not yet wired"
