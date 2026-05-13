@@ -34,3 +34,18 @@ with ``tests/lower/ocl/test_lower.py`` for the OCL-side coverage.
 | `KVCacheUpdateKernel` | `KVCacheUpdateSpec(Dh=64, n_kv_heads=16, in_dtype=DType.BF16)` | `(autotune)` | `full` | 18 op types, all visitors present (post-legalize) |
 | `OwlAttnKernel` | `OwlAttnSpec(Dh=64, n_kv_heads=16, seq_len=512, out_dtype=DType.BF16)` | `(autotune)` | `full` | 28 op types, all visitors present (post-legalize) |
 | `PatchifyKernel` | `PatchifySpec(M=512, N=2048, K=128)` | `(autotune)` | `full` | 22 op types, all visitors present (post-legalize) |
+
+## Additional kernels (direct-construct check)
+
+Kernels not exercised by the Phase 1 forward inventory —
+checked by ``scripts/check_ocl_coverage_direct.py`` with
+hand-picked production-shape specs.
+
+| kernel | spec | OCL status | ops | notes |
+|---|---|---|---|---|
+| `AdaGateResidualKernel` | `AdaGateResidualSpec(M=512, D=2048)` | `full` | 10 | all visitors present |
+| `UnpatchifyKernel` | `UnpatchifySpec(M=512, N=128, K=2048)` | `full` | 22 | all visitors present |
+| `ValueResidualPackedKernel` | `ValueResidualPackedSpec(M=512)` | `full` | 17 | all visitors present |
+| `GemmIntKernel` | `GemmIntSpec(M=512, N=2048, K=2048, out_dtype=DType.BF16)` | `full` | 17 | all visitors present |
+| `OwlAttnIntKernel` | `OwlAttnIntSpec(Dh=64, n_kv_heads=16, H_spatial=16, W_spatial=32)` | `full` | 21 | all visitors present |
+| `KVQuantizeKernel` | `KVQuantizeSpec(Dh=64, num_tokens=512)` | `full` | 10 | all visitors present |

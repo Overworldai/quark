@@ -184,10 +184,10 @@ and subgroup-block-read patterns, not the source.
 
 ### 2C — gemm_int (s8/s32)
 
-- [ ] **2C.1** Visitor — needs `OpSubgroupMatrixMultiplyAccumulate
+- [x] **2C.1** Visitor — needs `OpSubgroupMatrixMultiplyAccumulate
   INTEL` with the `MatrixASignedComponentsKHR` etc. operand mask
   (or the cl_intel_subgroup_matrix_multiply_accumulate equivalent).
-  notes: not in Phase 1 inventory (gemm_int wasn't exercised by the Waypoint forward used). Run `check_ocl_coverage.py` against `GemmIntKernel` directly to verify before opening this — likely already covered by the same `MmaOp` visitor that handles bf16.
+  notes: `scripts/check_ocl_coverage_direct.py` confirms `GemmIntKernel` is `full` (17 ops) post-legalize with `main_shape="m8n16k32_intel_s8_s32"`. Same `MmaOp` visitor handles s8/s32 — no new int8-specific visitor work needed. Bonus: `OwlAttnIntKernel` (21 ops) and `KVQuantizeKernel` (10 ops) also confirmed `full` in the same pass.
 
 - [ ] **2C.2** [DEVKIT] Smoke + bench at one quant shape.
   Reference: OpenVINO `gemm_tiled_opt.cl` int8 path.
@@ -314,6 +314,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: Phase 1 fully closed — 1.3 verified via 44 OCL tests passing on Battlemage devkit (xe3-devbox).
+Last loop iteration: 2C.1 closed + the 3 Phase-1-missed kernels (AdaGateResidual, Unpatchify, ValueResidualPacked) verified `full` on OCL. **All 14 inventoried kernel classes have zero missing visitors** — lowerer is complete for our needs.
 Active phase: 2 (devkit).
-Next: apply the SPV-removal worktree state to devkit so the launcher routes INTEL_GPU → OCL, then Phase 2A.2 (owl_attn numerics smoke).
+Next: get the SPV-removal worktree onto devkit (via SSHFS), then Phase 2A.2 onward (numerics smokes + benches per kernel).
