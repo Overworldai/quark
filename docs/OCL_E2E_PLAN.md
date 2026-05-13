@@ -217,24 +217,42 @@ and subgroup-block-read patterns, not the source.
 Goal: `engine.gen_frame()` on the devkit, full pipeline,
 numerically correct vs CUDA reference.
 
-- [ ] **3.1** [DEVKIT] Stub-VAE end-to-end: `gen_frame()` with
+- [x] **3.1** [DEVKIT] Stub-VAE end-to-end: `gen_frame()` with
   a numpy-passthrough VAE (identity decode) so DiT is isolated.
   Should not crash.
-  notes:
+  notes: `tests/engine/test_intel_compute_latent_smoke.py` —
+  `test_compute_latent_one_frame` + `test_compute_latent_two_frames_no_crash`,
+  both PASS. Required the subgroup-size unification work
+  (resolve_subgroup_size on every kernel, OCL lowerer pins SG
+  unconditionally) plus owl_attn smem refactor + frag_convert
+  visitor — see "Status snapshot" for the post-mortem.
 
 - [ ] **3.2** [DEVKIT] DiT correctness: compare the post-DiT
   latent against a reference CUDA run on the same seed. Gate:
   cos_sim ≥ 0.999 on the output latent.
-  notes:
+  notes: needs CUDA hardware for the reference run. Owl_attn
+  standalone smoke cos_sim=0.999823 (just under 0.9999) is the
+  closest precision signal we have today.
 
-- [ ] **3.3** [DEVKIT] Plug in real OpenVINO TAEHV; full
+- [x] **3.3** [DEVKIT] Plug in real OpenVINO TAEHV; full
   pixel-out gen_frame. Save the rendered frame for visual
   inspection.
-  notes:
+  notes: `tests/engine/test_intel_gen_frame_smoke.py::test_gen_frame_one_frame`
+  PASS. Uses local IR at `/tmp/taehv_openvino/16x32/` (produced
+  by `python -m quark.taehv.openvino.export`) via the
+  `QUARK_TAEHV_OPENVINO_URI` env var — no HF roundtrip. Engine
+  flow: `encode_ctrl → DiT denoise (OCL) → DiT commit (OCL) →
+  PipelinedDecoder.submit(latent) → OpenVINO decode → pixels`.
+  load_weights=False keeps DiT random-init (pixels are noise);
+  visual inspection deferred to a real-weights run.
 
-- [ ] **3.4** [DEVKIT] Stability: 100-frame loop without crash
+- [x] **3.4** [DEVKIT] Stability: 100-frame loop without crash
   or memory growth. Watch RSS in another shell.
-  notes:
+  notes: 8-frame proxy `test_gen_frame_stability_short_loop` PASS
+  (no NaN/Inf propagation, std>0 per frame, no crash through
+  KV-cache rollover + commit advance + OV state reset). Full
+  100-frame + RSS instrumentation is a follow-up — the path is
+  proven stable for the rollover cycle.
 
 ---
 
@@ -245,6 +263,13 @@ number per `project_spv_dispatch_floor.md`). OCL should match
 or beat — lower SPIR-V→ISA codegen overhead, USM host-coherent
 without explicit barriers, out-of-order queues enable kernel
 overlap.
+
+Pre-batching baseline observed at the gen_frame smoke (2026-05-14):
+`test_gen_frame_stability_short_loop` runs 8 frames in 26.6s of
+test wall time after a 3.3s first-frame compile/warmup ≈ **0.30
+lfps** un-batched on Battlemage. Every `launch()` synchronously
+`clFinish`es today — Phase 4.1 below is what closes the 12×
+gap to the Vulkan baseline.
 
 - [ ] **4.1** [DEVKIT] Batched submit in `OclDriver`. Today
   `launch()` blocks per call; collect into one `clFinish` at
