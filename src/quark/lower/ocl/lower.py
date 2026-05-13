@@ -3251,29 +3251,14 @@ class OpenClSpirVLowerer:
         ctx = _OclCtx(subgroup_width=subgroup_width)
         text = ctx.text
 
-        # If the launcher passed local_size assuming the framework
-        # default SG (32 — every kernel cohort autotune assumes this
-        # for the Vulkan SPV path), but we're forcing SG=16 for MMA,
-        # rescale local_size to preserve n_warps. Without this, the
-        # kernel's per-warp partition offsets (warp_dyn_offset =
-        # sg_id * stripe_size) would overrun smem since there'd be
-        # 2× more warps than the kernel intended.
-        #
-        # The kernel cohort's launcher hands us
-        # ``local_size = n_warps * DEFAULT_KERNEL_SG``; the override
-        # to ``n_warps * subgroup_width`` preserves the warp count
-        # the kernel actually wants.
-        DEFAULT_KERNEL_SG = 32
-        if (derived_sg is not None
-                and subgroup_width != DEFAULT_KERNEL_SG):
-            ls_source = self._local_size
-            if ls_source is None:
-                ls_source = getattr(getattr(fn, "attrs", None), "local_size", None)
-            if ls_source is not None and ls_source[0] % DEFAULT_KERNEL_SG == 0:
-                n_warps = ls_source[0] // DEFAULT_KERNEL_SG
-                self._local_size_override = (
-                    n_warps * subgroup_width, ls_source[1], ls_source[2],
-                )
+        # Kernels report the correct SG-aware block size via
+        # ``Kernel.resolve_subgroup_size()`` and ``Kernel.block()``, so
+        # we no longer need to rescale local_size here. (Previously
+        # the launcher handed us ``local_size = n_warps *
+        # DEFAULT_KERNEL_SG=32`` regardless of the actual SG; now it
+        # arrives as ``n_warps * subgroup_width`` already, so a rescale
+        # would double-shrink.) Leaving _local_size_override unset
+        # passes the launcher's value straight through.
 
         # ── Module-scope header (OpenCL flavor) ────────────────────
         # Order in serialize(): capabilities → extensions → ext-imports →
