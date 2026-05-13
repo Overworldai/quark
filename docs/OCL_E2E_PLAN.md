@@ -200,8 +200,8 @@ and subgroup-block-read patterns, not the source.
   `elementwise_binary`, `elementwise_unary`.
   notes: `KVCacheUpdateKernel` confirmed `full` (18 ops) per 1.2. The runtime-utility kernels (`copy_strided` etc.) live in `runtime/kernels.py` and dispatch through the same `Launcher.compile` path — same OCL visitor set covers them. Verify on devkit in 2D.2.
 
-- [ ] **2D.2** [DEVKIT] Bulk smoke run.
-  notes: **BLOCKED** on `_visit_vec_load` bf16-as-b32 packing (see Known OCL blockers). Smoke at `tests/kernels/test_kv_cache_update_ocl_smoke.py`. Two precursor fixes landed en route (`DType.PRED → OpTypeBool` and boolean arith ops). The KV-cache kernel uses vectorized bf16 loads that lower to `VecLoadOp(BF16 → B32)`, which the OCL visitor's first cut doesn't handle.
+- [x] **2D.2** [DEVKIT] Bulk smoke run.
+  notes: **PASSED on Battlemage.** `tests/kernels/test_kv_cache_update_ocl_smoke.py`: K_cache cos_sim=0.999997, Vt_cache cos_sim=1.000000. Four precursor fixes landed en route: `DType.PRED → OpTypeBool`, boolean arith ops (LogicalAnd/Or/NotEqual), `_visit_vec_load` bf16-as-b32 packing (read 2 u16, OpUConvert + ShiftLeftLogical + BitwiseOr), `_visit_vec_store` b32-as-bf16 unpacking (ShiftRightLogical + OpUConvert + OpBitcast), plus B32/B16/B64 → unsigned-int-carrier in `_emit_dtype`.
 
 ### 2E — RoPE
 
@@ -343,21 +343,11 @@ beyond the smoke + bench cycle.
   `_visit_convert` sint↔uint. All in place; useful for the
   block-IO work too.
 
-- **`_visit_vec_load` bf16-as-b32 packing** — KV cache update
-  (and other kernels that use packed-vector loads) emit
-  `VecLoadOp(tensor.dtype=BF16, out.dtype=B32, width=N)` meaning
-  "read 2N bf16 from memory, return N i32 each packing 2 bf16".
-  The OCL visitor's "first cut" only handles
-  `out.dtype == tensor.dtype` and raises on the dtype-mix.
-  **Unblock**: extend `_visit_vec_load` (and `_visit_vec_store`)
-  to read pairs of u16 and pack via OpUConvert → shift → OR
-  (mirror of the packed-K path in `_visit_load_matrix`).
-  Affects KV cache update + any kernel that uses packed bf16
-  vector ops. Surfaced 2026-05-13 by Phase 2D.2 smoke
-  (`tests/kernels/test_kv_cache_update_ocl_smoke.py`). Two
-  precursor visitor fixes also landed: `_emit_dtype` now handles
-  `DType.PRED → OpTypeBool`, and `_visit_arith` has the boolean
-  ops (LogicalAnd / LogicalOr / LogicalNotEqual for XOR).
+- **`_visit_vec_load` / `_visit_vec_store` packing** — ~~BLOCKED~~
+  **RESOLVED 2026-05-13**: `VecLoadOp(BF16 → B32)` and
+  `VecStoreOp(B32 → BF16)` now lower correctly via shift+OR
+  packing (load) and shift+truncate+bitcast unpacking (store).
+  Closed by Phase 2D.2 (KV cache smoke passed cos_sim ≥ 0.9999).
 
 - **`FragConvertOp` K-widening** — `_visit_frag_convert(ocl)` at
   `lower/ocl/lower.py:1936` raises on `K_dst = num_src * src_cols`
@@ -395,6 +385,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: 2D.2 (KV cache smoke) hit a THIRD OCL visitor gap — `_visit_vec_load` only handles `out.dtype == tensor.dtype` and the kernel needs bf16-as-b32 packing. Two precursor fixes landed (PRED→OpTypeBool, boolean arith ops). **Pattern**: Phase 1.2's static op-type coverage was necessary but not sufficient — each op's visitor body has shape/dtype variants the kernels actually emit. 3 of 4 Phase 2 kernels (owl_attn, gemm_int, kv_cache_update) blocked on different visitor gaps; only RMSNorm sailed through.
+Last loop iteration: **Phase 2D.2 PASSED** on Battlemage (cos_sim ≥ 0.9999). Four lowerer fixes landed: PRED→OpTypeBool, boolean arith ops, vec_load packing (BF16→B32), vec_store unpacking (B32→BF16), B*/Bxx dtypes in _emit_dtype. Two of three documented blockers now resolved (vec_load packing + s8 architectural scaffolding); only FragConvert and s8 lane-mapping remain.
 Active phase: 2 (devkit).
-Next: a structured visitor-coverage pass (enumerate variants per op, fill them) is more durable than one-by-one smoke iteration. Three concrete unblock paths in Known OCL blockers — `SPV_INTEL_2d_block_io` for s8, `_visit_vec_load` packing for KV, FragConvert IR rewrite for owl_attn. Most tractable: vec_load packing (mirrors the packed-K load_matrix path, ~1-2h).
+Next: smoke the remaining compute-cohort kernels (GemmKernel bf16, HeadRMSNormKernel, PatchifyKernel, UnpatchifyKernel, AdaRMSNormKernel, AdaGateResidualKernel, ValueResidualPackedKernel) — should mostly land like RMSNorm + KV cache did, with any new visitor gaps surfacing as the same actionable pattern.
