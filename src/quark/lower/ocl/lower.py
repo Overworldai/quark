@@ -2159,9 +2159,15 @@ def _visit_mma(op: MmaOp, ctx: _OclCtx) -> None:
         ctx.text.emit_function(
             f"{scalar_id} = OpCompositeExtract {scalar_t} {c_id} 0"
         )
+        # OpCompositeConstruct needs N component operands (one per
+        # vector lane), not a single scalar — IGC interprets a single
+        # operand as a v1 vector type and rejects the MMA with
+        # "Matrix C type: <1 x i32>". Repeat the scalar c_width times
+        # to match the vector lane count.
         new_c = ctx.text.alloc_id("mma_c_init")
+        repeated = " ".join([scalar_id] * c_width)
         ctx.text.emit_function(
-            f"{new_c} = OpCompositeConstruct {c_vec_type} {scalar_id}"
+            f"{new_c} = OpCompositeConstruct {c_vec_type} {repeated}"
         )
         c_id = new_c
 
