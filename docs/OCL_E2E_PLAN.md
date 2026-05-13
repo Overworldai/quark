@@ -396,5 +396,22 @@ Patchify still xfail (rows {2,3,6,7} mod 8 zero per m=8 tile; same MMA shape + f
 Compute-cohort smoke status: 4 pass (HeadRMSNorm, AdaRMSNorm, VRP, AdaGateResidual), 1 xfail (Patchify).
 Wider OCL test status: 49 pass, 5 known-fail (owl_attn bf16 ×2 — FragConvert K-widening; gemm_int ×3 — s8 DPAS layout entry pending SPV_INTEL_2d_block_io), 2 skip, 1 xfail.
 
-Active phase: 2 (devkit) → ready to enter Phase 3 (end-to-end gen_frame). Two Phase 2 items still open: 2A.2 (owl_attn bf16) and 2C.2 (gemm_int). Both blocked on documented multi-day work in "Known OCL blockers"; Phase 3 stub-VAE (3.1) can run without them since DiT uses owl_attn but only at shapes where K-widening doesn't kick in (TBD on devkit) — and stub-VAE doesn't exercise gemm_int.
-Next: 3.1 — attempt `gen_frame()` with stub VAE on devkit. Expect crashes on shapes that hit owl_attn FragConvert. If so, fall back to the legalizer-style split (slice the K-widening into multiple m8n16k16 MMAs before the FragConvert).
+Active phase: 2 (devkit) → 3.1 attempted; blocked.
+
+### Phase 3.1 attempt finding (2026-05-14)
+
+Ran `tests/engine/test_intel_compute_latent_smoke.py` against Battlemage. Bumped the smoke config to `d_model=512 / 4 layers / 8 heads / Dh=64` so AdaRMSNorm's autotune has a valid config (the d=128 tiny config in `test_intel_smoke.py` doesn't survive `_fallback_default`). First frame compiled most of the DiT but raised `_visit_frag_convert(ocl): NotImplementedError` inside owl_attn — the FragConvert that materialises the GEMM2 P-fragment from the softmax accumulator.
+
+Inspected the failing op: `num_src_frags=1`, NOT the K-widening case the visitor's error message names. For Intel `m8n16k16_intel_bf16_f32`, `nk_per_kstep = shape_k // shape_n = 16/16 = 1`, so K-widening doesn't kick in. The K-widening rewrite plan in `Known OCL blockers` is therefore NOT the path forward for Waypoint DiT bf16 — what's needed is a single-source FragConvert lowering on OCL.
+
+Root cause is a structural type mismatch:
+- IR `frag_convert` hard-codes result dtype to `ValueShape(DType.B32, width=shape.a_regs)` (CUDA convention — pack 2 bf16 per b32).
+- Intel `m8n16k16` MMA expects A operand as `v8 u16` (a_regs=8 u16 elements per lane, one bf16 per i16 carrier).
+- The CUDA carrier (8 b32 = 16 bf16) holds 2× the data Intel's A needs (8 bf16). MMA visitor passes the IR value verbatim, so IGC sees the wrong type.
+
+Options:
+1. Patch the IR builder to emit a backend-aware result dtype for `frag_convert` (Intel: u16 width=a_regs; CUDA: b32 width=a_regs). Multi-touch — every consumer that assumes b32 carrier needs to be reviewed.
+2. OCL-only IR pass that rewrites `frag_convert → vec_extract + convert + vec_build` (an explicit f32→bf16 per slot, then construct the u16 vec). Localised to OCL, no IR-builder change. Pre-condition: each lane's f32x8 source maps 1:1 to bf16x8 dest (true for Intel m8n16k16 with nk_per_kstep=1).
+3. Take the `online_softmax_block.py` legacy PTX fallback (the `else:` branch at line 408) and route Intel through it. Already produces a single `b.vec_build(...)` Value of the right shape — but the layout assumes CUDA m16n8k16 cd_offsets `((0,0),(0,1),(8,0),(8,1))`, not Intel m8n16k16 single-column-per-lane.
+
+Picking (2): least-invasive, doesn't touch other backends, mirrors the rewrite approach used for fma_bf16x2. Next loop step: implement an OCL-side rewriter that consumes `FragConvertOp(num_src=1, src=acc f32x8, dst=a_frag bf16, shape=m8n16k16_intel*)` and emits an explicit per-slot scalar chain producing a v8u16 result the MMA can consume.
