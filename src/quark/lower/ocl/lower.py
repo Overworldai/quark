@@ -212,6 +212,8 @@ def _emit_dtype(text: SpvText, dt: DType, ctx: "_OclCtx | None" = None) -> str:
             text.add_capability("Int8")
             ctx.has_int8_cap = True
         return text.type_int(8, signed=True)
+    if dt is DType.PRED:
+        return text.type_bool()
     raise NotImplementedError(
         f"OclSpirVLowerer: dtype {dt!r} not yet supported in Phase 3 "
         "first cut. Extend ``_emit_dtype`` per the visitor coverage plan."
