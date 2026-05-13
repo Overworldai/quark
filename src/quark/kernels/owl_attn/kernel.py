@@ -670,13 +670,42 @@ class OwlAttnKernel(Kernel):
         )
         n_ml = MTiles * n_rc
 
-        # Typed carry — O + per-(mt, rc) m / l scalars. See attn/kernel.py
-        # for the same pattern.
-        carry_spec = Carry(
-            o=o_acc,
-            m=(n_ml, -1e30, DType.F32),
-            l=(n_ml, 0.0, DType.F32),
-        )
+        # IGC's compiler ICEs on large OpPhi sets in structured CF (verified
+        # 2026-05-14 against Battlemage / libigc 24.x — replacing all 60
+        # OpPhi in spv_012 with OpCopyObject makes the kernel build clean).
+        # On Intel we route M/L through per-warp smem instead of an
+        # explicit ``Carry`` slot; that drops 16 phis from the for-range
+        # carry + 16 from the if/else merge, leaving only the 4 O-phi
+        # carries plus iv (well under IGC's threshold).
+        # PTX/Metal keep the original Carry path — no perf hit there since
+        # neither has IGC's limit and OpPhi maps to physical registers on
+        # both backends.
+        if is_intel:
+            ml_smem = qk.smem_alloc(
+                "ML_state",
+                DType.F32,
+                (NumWarps, 2 * n_ml),
+                pad=0,
+            )
+            # Init: lane i < n_ml → M[i] = -inf; n_ml ≤ i < 2*n_ml → L[i-n_ml] = 0.
+            # Lanes ≥ 2*n_ml are masked off via pred.
+            zero_f = qk.const(DType.F32, 0.0)
+            neg_inf_f = qk.const(DType.F32, -1e30)
+            n_ml_c = bctx.c(n_ml, dtype=DType.U32)
+            two_n_ml_c = bctx.c(2 * n_ml, dtype=DType.U32)
+            lane = bctx.lane_id
+            init_pred = qk.cmp("lt", lane, two_n_ml_c)
+            init_val = qk.select(qk.cmp("lt", lane, n_ml_c), neg_inf_f, zero_f)
+            qk.store(ml_smem, init_val, warp_id, lane, pred=init_pred)
+            qk.barrier("block")
+            carry_spec = Carry(o=o_acc)
+        else:
+            ml_smem = None
+            carry_spec = Carry(
+                o=o_acc,
+                m=(n_ml, -1e30, DType.F32),
+                l=(n_ml, 0.0, DType.F32),
+            )
 
         # ── Flat KV iteration across all segments ──────────────────────
         # PipelineBody with compile-time ``n_iters = capacity / KvTile``
@@ -764,6 +793,44 @@ class OwlAttnKernel(Kernel):
         def consume(ictx: IterCtx) -> Carry:
             carry = ictx.carry
             valid = qk.cmp("lt", ictx.iter_idx, n_real_total)
+            if ml_smem is not None:
+                # Intel: M/L state lives in per-warp smem. Carry only O.
+                flat_carry = list(carry.o)
+                with bctx.bld.if_(valid, carried=flat_carry) as (then_in, else_in, arms):
+                    with arms.then_():
+                        inner_o = list(then_in)
+                        inner_m = [
+                            qk.load(ml_smem, warp_id, qk.const(DType.U32, i))
+                            for i in range(n_ml)
+                        ]
+                        inner_l = [
+                            qk.load(ml_smem, warp_id, qk.const(DType.U32, n_ml + i))
+                            for i in range(n_ml)
+                        ]
+                        s_vals = mma1(a=q_frags, b=ictx.stage.k, acc=s_acc.init())
+                        o_vals, m_vals, l_vals, p_frags = softmax(
+                            s_acc_vals=s_vals, o_vals=inner_o,
+                            m_vals=inner_m, l_vals=inner_l,
+                        )
+                        if use_p_smem:
+                            p_frags = _reload_p_frags_from_smem()
+                        new_o = mma2(a=p_frags, b=ictx.stage.vt, acc=o_vals)
+                        # Write back M/L. All lanes write the lane-uniform
+                        # row-reduced value; benign same-value race.
+                        for i, v in enumerate(m_vals):
+                            qk.store(ml_smem, v, warp_id, qk.const(DType.U32, i))
+                        for i, v in enumerate(l_vals):
+                            qk.store(
+                                ml_smem, v, warp_id,
+                                qk.const(DType.U32, n_ml + i),
+                            )
+                        qk.yield_(*new_o)
+                    with arms.else_():
+                        qk.yield_(*else_in)
+                results = bctx.bld.last_results
+                carry.o = list(results)
+                return carry
+            # PTX/Metal: original explicit-carry path.
             flat_carry = list(carry.o) + list(carry.m) + list(carry.l)
             with bctx.bld.if_(valid, carried=flat_carry) as (then_in, else_in, arms):
                 with arms.then_():
@@ -810,6 +877,15 @@ class OwlAttnKernel(Kernel):
         # the way ``run_pipeline`` does, so populate ``o_acc.results``
         # directly from the bound Carry here.
         o_acc.results = list(final.o)
+        if ml_smem is not None:
+            # Intel: read final L back from per-warp smem for the
+            # ``O /= l`` row_scale. M is not needed by the epilogue.
+            final_l = [
+                qk.load(ml_smem, warp_id, qk.const(DType.U32, n_ml + i))
+                for i in range(n_ml)
+            ]
+        else:
+            final_l = final.l
         qk.store_acc(
             g_out,
             o_acc,
@@ -820,6 +896,6 @@ class OwlAttnKernel(Kernel):
             per_warp=True,
             warp_id=warp_id,
             kv_pad=c.KvPad,
-            row_scale=final.l,
+            row_scale=final_l,
             gmem_col_base_full=out_col_base,
         )
