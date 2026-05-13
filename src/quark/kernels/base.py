@@ -738,18 +738,30 @@ class Kernel(ABC):
         return self.resolve_subgroup_size()
 
     def resolve_subgroup_size(self) -> int:
-        """SIMD width the kernel runs at, derived from the active MMA shape.
+        """SIMD width the kernel runs at.
 
-        Intel's ``cl_intel_subgroup_matrix_multiply_accumulate`` pins SG=16
-        for every shape currently in the registry; the lowerer enforces
-        the same via ``OpExecutionMode SubgroupSize 16``. CUDA/Metal
-        default to 32. Autotuners DO NOT set ``config.subgroup_size`` —
-        it's only an explicit-override knob (intended for opt-in SIMD16
-        on Apple, etc.), and is honored here when set.
+        Resolution order:
 
-        Single source of truth — used by ``block()`` to size the CTA, by
-        the decorator to seed ``KernelContext.subgroup_size``, and
-        readable from kernel build bodies via ``bctx.subgroup_size``.
+        1. **Explicit config override** — ``config.subgroup_size`` if set.
+           Autotuners do NOT set this; it's a manual opt-in knob (e.g.
+           SIMD16 on Apple).
+        2. **MMA-shape requirement** — Intel's
+           ``cl_intel_subgroup_matrix_multiply_accumulate`` requires
+           SG ∈ {8, 16}; we pin 16 for every ``_intel_*`` shape in the
+           registry. CUDA / Metal / NAX MMA shapes use 32.
+        3. **Device's preferred SG** — ``caps.subgroup_width`` from the
+           driver probe. The OCL probe reports the device's preferred
+           default (e.g. Battlemage exposes SG ∈ {8, 16, 32} and the
+           probe picks 32). CUDA reports the warp size (32), Metal
+           reports the threadgroup width (32).
+        4. **Conservative fallback** — 32 if no caps are bound yet.
+
+        The OCL lowerer emits ``OpExecutionMode SubgroupSize {this}``
+        unconditionally so IGC respects the choice rather than picking
+        its own. Single source of truth — used by ``block()`` to size
+        the CTA, by the decorator to seed ``KernelContext.subgroup_size``,
+        and readable from kernel build bodies via ``bctx.subgroup_size``
+        (or the ``self._sgs`` shortcut).
         """
         cfg_sgs = getattr(self.config, "subgroup_size", None)
         if cfg_sgs is not None:
@@ -760,6 +772,16 @@ class Kernel(ABC):
                 shape_id = self._mma_cfg().shape_id
                 if "_intel_" in shape_id:
                     return 16
+        # Consult device caps for the preferred SG when available.
+        # Caps may not be bound yet during early kernel construction;
+        # the probe-time fallback (32) is correct for every backend
+        # currently wired.
+        from quark.kernels.decorator import _resolve_caps
+        caps = _resolve_caps(self)
+        if caps is not None:
+            sg = getattr(caps, "subgroup_width", None)
+            if sg:
+                return int(sg)
         return 32
 
     def block(self) -> tuple[int, int, int]:

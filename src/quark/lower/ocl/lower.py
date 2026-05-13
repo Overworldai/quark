@@ -3332,18 +3332,25 @@ class OpenClSpirVLowerer:
         # driver pins the matching value when CompiledKernel.launch
         # fires.
         #
-        # MMA-using kernels MUST pin SubgroupSize since
-        # ``cl_intel_subgroup_matrix_multiply_accumulate`` requires
-        # SG ∈ {8, 16}. Without this, Battlemage defaults to SG=32
-        # and the MMA op silently fills only 2/4 result slots (an
-        # earlier empirical probe — see project_openvino_taehv.md).
+        # Always pin SubgroupSize to the kernel's resolved SG. MMA
+        # kernels MUST pin (``cl_intel_subgroup_matrix_multiply_
+        # accumulate`` requires SG ∈ {8, 16}; without the pin
+        # Battlemage defaults to SG=32 and the MMA fills only 2/4
+        # slots — see project_openvino_taehv.md). Non-MMA kernels
+        # don't strictly *require* the pin, but pinning makes the
+        # kernel's compile-time work-distribution arithmetic
+        # (``n_threads = NumWarps * self._sgs``, cooperative thread
+        # splits, etc.) agree with IGC's actual SG instead of relying
+        # on IGC's heuristic happening to pick the same value the
+        # kernel assumed. Single source of truth: ``ctx.subgroup_width``
+        # comes from ``Kernel.resolve_subgroup_size()`` via the
+        # decorator and the launcher's lowerer wiring.
         # The SubgroupSize execution mode is part of OpenCL 2.x core
         # and IGC accepts it directly (no extra capability needed
         # under Kernel execution model).
-        if ctx.has_intel_mma_caps:
-            text.add_execution_mode(
-                f"OpExecutionMode {fn_id} SubgroupSize {ctx.subgroup_width}"
-            )
+        text.add_execution_mode(
+            f"OpExecutionMode {fn_id} SubgroupSize {ctx.subgroup_width}"
+        )
 
         return LoweredOclSpirVKernel(
             source=text.serialize(),
