@@ -430,3 +430,22 @@ Both produce semantically-equivalent SPIR-V, IGC still crashes. The crash is in 
 - Side-step entirely by writing the bf16 P-fragment to local memory and using `load_matrix` to materialise the A operand — same shape as the fp8 smem round-trip path. Costs one block-barrier per softmax block but routes around the IGC bug.
 
 Next loop step: option (b) — implement the smem-round-trip P-fragment path on OCL. Most localised fix; doesn't depend on IGC patch landing.
+
+### Phase 3.1 follow-up (smem round-trip landed; IGC still crashes)
+
+Implemented the smem-round-trip path:
+- `OnlineSoftmax` (Intel branch): writes bf16(p_acc) to `p_smem` per-slot at the canonical Intel m8n16k16 layout (row = p_base + mt*m + s, col = nk*n + lane_id), returns `p_frags=None`.
+- `owl_attn`: allocates `p_smem` whenever `compute_is_fp8 or is_intel`; `_reload_p_frags_from_smem` does barrier + `load_matrix` for both paths.
+
+SPIR-V dump confirms `frag_convert_result` no longer appears in any module; GEMM2's A operand now comes from `load_matrix` (same path GEMM1 uses, byte-for-byte). 12/13 kernels still build through IGC; spv_012 (owl_attn) still segfaults at the same IGC offset.
+
+What's unique about spv_012 vs the working MMA kernels:
+- 8 MMAs vs 2 (4 GEMM1 + 4 GEMM2 chained).
+- 8 `OpControlBarrier` vs 2 (extra ones from softmax round-trip + per-warp staging).
+- Both GEMM1 and GEMM2 use load_matrix-built A; SPIR-V is well-formed.
+
+The crash is at `libigc.so.2 +0x1afa409` — same offset regardless of whether the A operand came from frag_convert (the original) or load_matrix (the smem round-trip). So the bug is NOT the A-operand source pattern; it's something else in the owl_attn kernel that triggers an IGC pass crash.
+
+Hypothesis: IGC chokes on long MMA chains inside structured control flow (for_loop + if_region) combined with the smem round-trip. The fp8 path uses the exact same pattern but never actually compiled on Intel before (fp8 DPAS isn't exposed by IGC).
+
+Next loop step: bisect spv_012.txt against the working spv_007.txt (the largest passing MMA kernel) to find the minimum SPIR-V that triggers the crash, then file with IGC or find a structural workaround.
