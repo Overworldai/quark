@@ -728,16 +728,42 @@ class Kernel(ABC):
     # instance-method overrides on subclasses) so we don't shadow
     # them in the base.
 
+    def resolve_subgroup_size(self) -> int:
+        """SIMD width the kernel runs at, derived from the active MMA shape.
+
+        Intel's ``cl_intel_subgroup_matrix_multiply_accumulate`` pins SG=16
+        for every shape currently in the registry; the lowerer enforces
+        the same via ``OpExecutionMode SubgroupSize 16``. CUDA/Metal
+        default to 32. Autotuners DO NOT set ``config.subgroup_size`` —
+        it's only an explicit-override knob (intended for opt-in SIMD16
+        on Apple, etc.), and is honored here when set.
+
+        Single source of truth — used by ``block()`` to size the CTA, by
+        the decorator to seed ``KernelContext.subgroup_size``, and
+        readable from kernel build bodies via ``bctx.subgroup_size``.
+        """
+        cfg_sgs = getattr(self.config, "subgroup_size", None)
+        if cfg_sgs is not None:
+            return int(cfg_sgs)
+        if type(self).mma_sites(self.spec):
+            import contextlib
+            with contextlib.suppress(KeyError, NotImplementedError):
+                shape_id = self._mma_cfg().shape_id
+                if "_intel_" in shape_id:
+                    return 16
+        return 32
+
     def block(self) -> tuple[int, int, int]:
         """Default: ``(n_warps * subgroup_size, 1, 1)`` — single-row block
         from ``config.n_warps``. Kernels with a computed warp count
         (attn/owl_attn use ``gqa_ratio * NCW``) override.
 
-        ``subgroup_size`` is the *resolved* SIMD width: ``config.subgroup_size``
-        if explicitly set (opt-in on Intel), else 32 (historical default).
-        Sizing block in subgroup-size units guarantees ``num_subgroups_per_WG ==
-        n_warps`` regardless of width, which the per-warp slot-partition math
-        depends on (``warp_id = qk.subgroup_id()`` must range 0..n_warps-1).
+        ``subgroup_size`` resolves via :meth:`resolve_subgroup_size` —
+        derived from the active MMA shape (Intel → 16, default 32).
+        Sizing block in subgroup-size units guarantees
+        ``num_subgroups_per_WG == n_warps`` regardless of width, which
+        the per-warp slot-partition math depends on (``warp_id =
+        qk.subgroup_id()`` must range 0..n_warps-1).
         """
         n_warps = getattr(self.config, "n_warps", None)
         if n_warps is None:
@@ -745,8 +771,7 @@ class Kernel(ABC):
                 f"{type(self).__name__}.block() must be implemented or config "
                 f"must have an n_warps field"
             )
-        sgs = getattr(self.config, "subgroup_size", None) or 32
-        return (n_warps * sgs, 1, 1)
+        return (n_warps * self.resolve_subgroup_size(), 1, 1)
 
     def entry_name(self) -> str:
         """Symbol name for the compiled kernel. Defaults to the

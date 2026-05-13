@@ -159,8 +159,8 @@ class OwlAttnIntKernel(Kernel):
         # Capacity must be a whole multiple of KvTile.
         if s.capacity % c.KvTile != 0:
             return False
-        # Dh must be a multiple of sgs (=32) so Q quant lanes split evenly.
-        sgs = c.subgroup_size or 32
+        # Dh must be a multiple of sgs so Q quant lanes split evenly.
+        sgs = self.resolve_subgroup_size()
         if s.Dh % sgs != 0:
             return False
         return True
@@ -184,12 +184,11 @@ class OwlAttnIntKernel(Kernel):
         return (s.tpf // bqr, s.B * s.n_kv_heads * s.gqa_ratio, 1)
 
     def block(self) -> tuple[int, int, int]:
-        sgs = self.config.subgroup_size or 32
         # Phase 3.5a: gqa heads are expanded onto grid.y (each WG handles
         # one (b, kv_h, q_head_in_gqa) triple), not onto warps within a
         # block. Block has c.NCW warps regardless of gqa_ratio.
         n_warps = self.config.NCW
-        return (n_warps * sgs, 1, 1)
+        return (n_warps * self.resolve_subgroup_size(), 1, 1)
 
     def flops(self) -> int:
         s = self.spec
@@ -254,7 +253,7 @@ class OwlAttnIntKernel(Kernel):
         # Phase 3.5a: gqa heads are expanded onto grid.y, not warps.
         # NumWarps == c.NCW (block has NCW warps regardless of gqa).
         NumWarps = c.NCW
-        sgs = c.subgroup_size or 32
+        sgs = self.resolve_subgroup_size()
         n_threads = NumWarps * sgs
 
         BlockQRows = c.NCW * c.MTiles * m_tile

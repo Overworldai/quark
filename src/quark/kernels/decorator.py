@@ -174,19 +174,13 @@ def kernel(
                 n_warps = self._n_warps()
             else:
                 n_warps = getattr(self.config, "n_warps", 4)
-            # SIMD width opt-in (SPV / Intel). ``None`` → 32 (default).
-            sgs = getattr(self.config, "subgroup_size", None) or 32
-            ctx = KernelContext(self.NAME, n_warps=n_warps, subgroup_size=sgs)
-            self.ctx = ctx
-            self.bld = ctx.bld
-            # Walk the manifest once. Every tensor is available as
-            # self.g.NAME from inside build().
-            g_dict = ctx.declare_tensors(self.TENSORS, self.spec, self.config)
-            self.g = SimpleNamespace(**g_dict)
 
-            # Auto-publish bctx so build() can drop the opening ritual.
-            # Resolve mma_cfg via _mma_cfg() if the kernel declares any
-            # MMA sites; otherwise pass None.
+            # Resolve mma_cfg before KernelContext so the per-kernel SG
+            # width (derived from MMA shape; see resolve_subgroup_size)
+            # is known. Intel MMA shapes pin SG=16 — autotuners do NOT
+            # set ``config.subgroup_size``; the resolver picks it from
+            # the shape, and the OCL lowerer's OpExecutionMode pins
+            # the matching width at compile time.
             import contextlib
 
             mma_cfg = None
@@ -194,6 +188,15 @@ def kernel(
                 # Invalid main_shape → leave mma_cfg=None; build() decides.
                 with contextlib.suppress(KeyError):
                     mma_cfg = self._mma_cfg()
+
+            sgs = self.resolve_subgroup_size()
+            ctx = KernelContext(self.NAME, n_warps=n_warps, subgroup_size=sgs)
+            self.ctx = ctx
+            self.bld = ctx.bld
+            # Walk the manifest once. Every tensor is available as
+            # self.g.NAME from inside build().
+            g_dict = ctx.declare_tensors(self.TENSORS, self.spec, self.config)
+            self.g = SimpleNamespace(**g_dict)
             self.make_bctx(mma_cfg)  # publishes self.bctx
 
             # Block-base convention: self.m_base = block_base("y", BM),

@@ -158,8 +158,7 @@ class OwlAttnKernel(Kernel):
         return (n_q_tiles, s.B * s.n_kv_heads, 1)
 
     def block(self) -> tuple[int, int, int]:
-        sgs = self.config.subgroup_size or 32
-        return ((self.spec.gqa_ratio * self.config.NCW) * sgs, 1, 1)
+        return ((self.spec.gqa_ratio * self.config.NCW) * self.resolve_subgroup_size(), 1, 1)
 
     def flops(self) -> int:
         s = self.spec
@@ -334,7 +333,7 @@ class OwlAttnKernel(Kernel):
         NumWarps = GQA * NCW
         # Effective SIMD width. ``c.subgroup_size`` is None on the
         # historical SIMD32 path; ``or 32`` resolves the default.
-        sgs = c.subgroup_size or 32
+        sgs = self.resolve_subgroup_size()
         mma_cfg = self._mma_cfg()
         m_tile = mma_cfg.shape.m
         n_tile = mma_cfg.shape.n
