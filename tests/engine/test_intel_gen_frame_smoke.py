@@ -106,13 +106,14 @@ def test_gen_frame_one_frame(gen_frame_env):
 
     pixels = engine.gen_frame(ctrl=None)
     assert pixels is not None, "gen_frame returned None"
-    # Documented contract: [temporal_compression, H_pix, W_pix, 3] uint8.
+    # Documented contract: [temporal_compression=4, H_pix, W_pix, 3]
+    # uint8. ``temporal_compression`` lives on the raw config dict
+    # rather than the Waypoint15Config dataclass; TAEHV is fixed at 4.
     assert pixels.ndim == 4, f"pixels shape {tuple(pixels.shape)} ndim != 4"
-    assert pixels.shape[0] == engine.cfg.temporal_compression
+    assert pixels.shape[0] == 4, f"expected 4 subframes, got {pixels.shape[0]}"
     assert pixels.shape[-1] == 3
     assert pixels.dtype == np.uint8 or str(pixels.dtype) == "torch.uint8"
 
-    # Finiteness — uint8 can't be NaN/Inf, but a quick value-range
-    # sanity is the equivalent gate. Decoded pixels in [0, 255].
+    # uint8 can't be NaN/Inf — sanity range gate.
     pix_np = pixels.numpy() if hasattr(pixels, "numpy") else np.asarray(pixels)
     assert pix_np.min() >= 0 and pix_np.max() <= 255
