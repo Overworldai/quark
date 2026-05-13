@@ -37,9 +37,6 @@ def _ocl_driver_or_skip():
 
 def _build_b16_bf16_b16_ir(n: int = 16):
     """``out[i] = bitcast(bitcast(in[i] as b16, bf16), b16)``."""
-    from quark.ir.value import Value
-    from quark.ir.types import ValueShape
-
     b = Builder("bitcast_module")
     fn = b.begin_function("bitcast_chain")
     b.param("X", BufferType(DType.B16))
@@ -50,16 +47,10 @@ def _build_b16_bf16_b16_ir(n: int = 16):
                        name="Z", param=fn.params[1])
     tid = b.thread_idx("x")
     v_b16 = b.load(g_x, tid)
-    # bitcast B16 → BF16, then BF16 → B16 — must be identity.
-    v_bf = fn.fresh_value(ValueShape(DType.BF16))
-    bc1 = BitcastOp(results=(v_bf,), operands=(v_b16,),
-                    attrs={"dst_dtype": DType.BF16})
-    fn.body.blocks[0].ops.append(bc1)
-    v_b16_2 = fn.fresh_value(ValueShape(DType.B16))
-    bc2 = BitcastOp(results=(v_b16_2,), operands=(v_bf,),
-                    attrs={"dst_dtype": DType.B16})
-    fn.body.blocks[0].ops.append(bc2)
-    b.store(g_z, v_b16_2, tid)
+    # bitcast B16 → BF16 → B16 must be identity.
+    v_bf = b.bitcast(v_b16, DType.BF16)
+    v_b16_out = b.bitcast(v_bf, DType.B16)
+    b.store(g_z, v_b16_out, tid)
     b.end_function()
     return b.module
 
