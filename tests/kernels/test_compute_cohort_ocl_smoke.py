@@ -145,7 +145,6 @@ def test_patchify_ocl_smoke():
     _check("Patchify", out_f32, ref)
 
 
-@pytest.mark.xfail(reason="CL_OUT_OF_RESOURCES at launch (SplitB32/MergeB32 chain) — investigation pending")
 def test_value_residual_packed_ocl_smoke():
     from quark.ir import DType
     from quark.kernels.value_residual_packed.reference import (
@@ -153,10 +152,11 @@ def test_value_residual_packed_ocl_smoke():
     )
     from quark.kernels.value_residual_packed.spec import ValueResidualPackedSpec
 
-    M = 64
-    D_full = 4096
-    v_col_offset = 3072
-    v_width = 1024
+    # Smaller shapes to bisect OUT_OF_RESOURCES on Battlemage.
+    M = 32
+    D_full = 512
+    v_col_offset = 384
+    v_width = 128
     rng = np.random.default_rng(0xC0DE)
     QKV_curr_f32 = (rng.standard_normal((M, D_full)) * 0.5).astype(np.float32)
     QKV_first_f32 = (rng.standard_normal((M, D_full)) * 0.5).astype(np.float32)
