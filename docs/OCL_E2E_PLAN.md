@@ -485,3 +485,25 @@ Additional bisects (2026-05-14 cont.): replacing OpLoads from `smem_kv_off_table
 Path forward (option 1 from the earlier list): refactor owl_attn to drop M/L/O from the `Carry` spec and materialise per-warp softmax state in smem instead. Inside `consume()`: load M/L/O from smem at iter start, compute new values, store back. Drops the 60 OpPhi carries (M scalars + L scalars + O fragments threaded through the KV loop) to ~the loop's iv-only count. Costs 2 KB/warp of smem traffic per iter (8 f32 M + 8 f32 L + 4 v8f32 O = 528 f32 = 2 KB). The rest of DiT compiles, so once this lands Phase 3.1 stub-VAE should clear.
 
 Net conclusion: the IGC bug is a real limit on OpPhi count in structured CF (or some structural constraint highly correlated with it). Refactoring owl_attn to keep loop carries in smem is the high-value next step.
+
+### Phase 3.1 PASSING (2026-05-14)
+
+Three landings cut OpPhi count enough for IGC to build:
+1. `lang/rope.py` — emit_rope_cos_sin: replace nested `qk.if_(is_x)` / `qk.if_(is_y)` with OpSelect-based 3-way piecewise (mask the diff with `qk.select` to avoid u32 underflow). Drops 16 OpPhi (8 RoPE invocations × 2 if-merge phis).
+2. `kernels/owl_attn/kernel.py` Intel path — M/L scalars → per-warp smem (`ml_smem[NumWarps, 2*n_ml] f32`). Drops 16 OpPhi from Carry + 16 from if/else merge.
+3. Same — O accumulator → per-warp smem (`o_smem[NumWarps, n_o, SG, c_regs] f32`). Drops 4 v8f32 carry phis + 4 if-merge phis. `carry_spec = Carry()` (empty) on Intel.
+
+owl_attn SPV OpPhi count: 60 → 28 → 12 → 4 (just iv phis). IGC accepts.
+
+**`tests/engine/test_intel_compute_latent_smoke.py` (Phase 3.1):**
+- `test_compute_latent_one_frame`: PASSED — one denoise+commit through full DiT on Battlemage via OCL.
+- `test_compute_latent_two_frames_no_crash`: PASSED — KV-cache commit + rollover works.
+
+**Wider regression check:** 49 OCL tests pass; 5 known-fail (gemm_int s8 DPAS + 2 owl_attn smokes) unchanged.
+
+**Open issue — owl_attn standalone numeric smoke:** `tests/kernels/owl_attn/test_ocl_smoke.py` now runs (was blocked at IGC ICE before) but reports cos_sim=0.706922 vs numpy reference. Likely bug in the smem refactor:
+- Maybe `bctx.lane_id` differs from the MMA's per-lane meaning when subgroup_size > 16.
+- Maybe init loop for `o_smem` only initialises some slots (only lanes 0..c_regs−1 of each subgroup write?).
+- Maybe `ml_smem` store race when more than one subgroup-worth of lanes hits each slot.
+
+Phase 3.1 stub-VAE smoke passes the sanity gate (no NaN/Inf, max|x| < 1e3) so numeric correctness was not directly verified there — the standalone owl_attn smoke does that and shows the deviation. Next loop step: bisect the numeric error.
