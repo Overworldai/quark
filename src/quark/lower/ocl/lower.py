@@ -1051,20 +1051,13 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                 f"narrower than smem elem ({smem_elem_type}) — not wired"
             )
         pack_ratio = lane_bytes // smem_bytes
-        if which == "a" and pack_ratio > 1:
-            # Lane L holds K-cols [L*pack_ratio, (L+1)*pack_ratio);
-            # within each lane the column base for K is
-            # col_base + L*pack_ratio.
-            col_lane_packed = ctx.text.alloc_id("lm_a_col_lane_pack")
-            pack_const = ctx.text.const_uint(pack_ratio)
-            lane_off = ctx.text.alloc_id("lm_a_lane_off")
-            ctx.text.emit_function(
-                f"{lane_off} = OpIMul {u32} {lane_id} {pack_const}"
-            )
-            ctx.text.emit_function(
-                f"{col_lane_packed} = OpIAdd {u32} {col_base} {lane_off}"
-            )
-            col_lane = col_lane_packed
+        # Stride between successive packed K-cols per lane. For the
+        # packed-K case the cl_intel DPAS layout interleaves K-cols
+        # across lanes at the subgroup-width stride: lane L holds
+        # K-cols [L, L+SG, L+2*SG, ..., L+(pack_ratio-1)*SG]. NOT
+        # sequential [L*pack_ratio, ...] — empirically tested on
+        # Battlemage 2026-05-13.
+        pack_k_stride = ctx.subgroup_width if pack_ratio > 1 else 1
 
         for s in range(width):
             row_s = ctx.text.alloc_id(f"lm_{which}_row_{s}")
@@ -1107,11 +1100,13 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                 elem_loads.append(val)
             else:
                 # Packed: read ``pack_ratio`` smem elements at
-                # K-offsets [0, pack_ratio), pack little-endian
-                # into one lane element via shift+OR.
+                # K-offsets [0, pack_k_stride, 2*pack_k_stride, …],
+                # pack little-endian into one lane element via
+                # shift+OR. For cl_intel s8 DPAS, pack_k_stride =
+                # SG (=16), giving lane L → K-cols [L, L+16].
                 packed = None
                 for k_off in range(pack_ratio):
-                    k_off_const = ctx.text.const_uint(k_off)
+                    k_off_const = ctx.text.const_uint(k_off * pack_k_stride)
                     pos = ctx.text.alloc_id(f"lm_{which}_pos_{s}_{k_off}")
                     ctx.text.emit_function(
                         f"{pos} = OpIAdd {u32} {col_lane} {k_off_const}"
