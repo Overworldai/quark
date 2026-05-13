@@ -25,12 +25,14 @@ import pytest
 # finds a valid config on Battlemage. AdaRMSNorm + Gemm tune spaces
 # bottom out at sizes that need D ≥ 128 and tile divisibility — the
 # 128-d / 16-row config in test_intel_smoke.py is too small for
-# AdaRMSNorm on devkit. d_model=512 / 4 layers / 8 heads / Dh=64
-# matches the prod dim ratios at ~1/4 the parameter count.
+# AdaRMSNorm on devkit. d_model=512 / 1 layer / 8 heads / Dh=64
+# matches the prod dim ratios at ~1/24 the parameter count.
+# Single layer keeps the per-layer kernel SPV identical but reduces
+# call count (each layer dispatches the same compiled kernels).
 _SMOKE_CFG = {
     "model_type": "test",
     "d_model": 512,
-    "n_layers": 4,
+    "n_layers": 1,
     "n_heads": 8,
     "n_kv_heads": 4,
     "fourier_dim": 256,
