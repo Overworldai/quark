@@ -385,6 +385,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last iter: bisected the OUT_OF_RESOURCES failure on ValueResidualPacked — at smaller shape (M=32 / D_full=512 / v_width=128) the kernel RUNS through but produces cos_sim=-0.35 (wrong numerics). At production shape it hits OUT_OF_RESOURCES. So there are two layered bugs in the packed-bf16-vector arith path: (a) numerics wrong even when it runs; (b) at larger shapes the IGC-side codegen hits a resource ceiling. Common factor: SplitB32Op / MergeB32Op visitors (which I just added) + the kernel's packed arith chain.
+Last iter: SplitB32/MergeB32 visitor isolation test (`tests/lower/ocl/test_b32_roundtrip.py`) PASSES — every uint32 pattern survives Split → Merge unchanged on Battlemage. So the visitors themselves are correct; the ValueResidualPacked / AdaGateResidual numerics bug is downstream — in the Convert/Bitcast chain the legalizer inserts around Split/Merge (the `fma_bf16x2` expansion in `legalizations.py` is a long chain: Split B32 → Bitcast B16→BF16 → Convert BF16→F32 → FMA → Convert F32→BF16 → Bitcast BF16→B16 → Merge).
 Active phase: 2 (devkit).
-Next: debug the SplitB32/MergeB32 emit OR the kernel's expected pattern — likely fix unblocks AdaGateResidual + ValueResidualPacked together. Patchify (cos_sim=0.71) is a separate axis/layout issue.
+Next: instrument one of the intermediate ops (most suspect: `_visit_bitcast` for B16↔BF16, since those are different DType enums with same width carrier). Could also be a `_visit_convert` BF16↔F32 issue specific to packed paths.
