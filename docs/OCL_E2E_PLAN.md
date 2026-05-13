@@ -314,6 +314,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: 2C.1 closed + the 3 Phase-1-missed kernels (AdaGateResidual, Unpatchify, ValueResidualPacked) verified `full` on OCL. **All 14 inventoried kernel classes have zero missing visitors** — lowerer is complete for our needs.
+Last loop iteration: devkit synced to Mac HEAD `d59d7a0` via `git push origin spirv-integration` + `git reset --hard` on devkit. 68 tests pass on Battlemage (24 engine + 44 OCL). Launcher routes `INTEL_GPU → _launch_ocl`. Phase 2 prerequisite closed.
 Active phase: 2 (devkit).
-Next: get the SPV-removal worktree onto devkit (via SSHFS), then Phase 2A.2 onward (numerics smokes + benches per kernel).
+Next task: 2A.2 — owl_attn bf16 numerics smoke on devkit. One shape per `mma_cfg` (m8n16k16 bf16/bf16/f32 and bf16/bf16/bf16), end-to-end through `OclDriver`, gate at cos_sim ≥ 0.9999 vs a numpy reference (PTX ref needs a CUDA host; numpy is enough for the first correctness pass).
