@@ -89,6 +89,12 @@ def test_gemm_int_all_ones_yields_K():
     print(f"\n  M={M} N={N} K={K}: expected {expected}, got "
           f"{n_correct}/{n_total} correct, {n_zero} zeros, "
           f"first unique: {unique}")
+    out_2d = out_f32.reshape(M, N)
+    # Diagnostic: print the first 8x16 block (one WG output tile)
+    print("  First WG tile (M=8 rows × N=16 cols):")
+    for m in range(8):
+        row = " ".join(f"{int(v):2d}" for v in out_2d[m, :16])
+        print(f"    m={m}: {row}")
     assert n_correct == n_total, (
         f"all-ones GemmInt: only {n_correct}/{n_total} match K={K}; "
         f"unique values seen: {unique}"
