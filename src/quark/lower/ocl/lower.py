@@ -408,8 +408,15 @@ _INTEL_MMA_LAYOUTS: dict[tuple, tuple] = {
     # hold 8-bit packed components, not raw 32-bit ints.
     (DType.S8, DType.S8, DType.S32, 8, 16, 32): (
         16,             # SG=16 per spec
-        DType.U32, 4,   # A: v4 of u32 (4 packed s8 along K per i32)
-        DType.U32, 8,   # B: v8 of u32 (same packing)
+        # IGC requires A's per-lane vector size to match M (8) for
+        # the s8 form — the int8 layout broadcasts A across lanes
+        # so every lane holds the M=8 rows × packed-K data, not just
+        # one column k=L like the bf16 path. ``OpSubgroupMatrix
+        # MultiplyAccumulateINTEL`` fails build with
+        # "Matrix A argument must have size 8 to match M" when A is
+        # v4 u32 instead of v8.
+        DType.U32, 8,   # A: v8 of u32 (M=8 rows × K-packed quartets)
+        DType.U32, 8,   # B: v8 of u32 (column n=L, K-packed quartets)
         DType.S32, 8,   # C: v8 of s32 (column n=L, rows m=0..7)
         32,             # K-Dim operand
         "MatrixASignedComponentsINTEL|MatrixBSignedComponentsINTEL"
