@@ -657,7 +657,7 @@ class Kernel(ABC):
             return False
         if (c.BN // mma.shape.n) % c.n_warps != 0:
             return False
-        n_threads = c.n_warps * 32
+        n_threads = c.n_warps * self.resolve_subgroup_size()
         if (c.BM * c.BK) % n_threads != 0:
             return False
         if (c.BN * c.BK) % n_threads != 0:
