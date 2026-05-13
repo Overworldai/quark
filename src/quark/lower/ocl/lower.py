@@ -1033,7 +1033,39 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                     slot_id = packed
             elem_loads.append(slot_id)
     else:
-        # A or C: each slot is a single element at smem[(row+s)*stride + (col+L)].
+        # A or C: each slot is one lane-element at
+        # ``smem[(row+s)*stride + (col+L)]``.
+        #
+        # Packed-K case (s8/s32 form A): the smem element is narrower
+        # than the lane element (s8 in smem, u16 per lane). Each slot
+        # then reads ``pack_ratio = lane_bytes / smem_bytes`` smem
+        # bytes at K-offsets ``L*pack_ratio + k_off`` for
+        # ``k_off ∈ [0, pack_ratio)``, packed little-endian into the
+        # lane element. For bf16/f32 / f32/f32, pack_ratio==1 and the
+        # loop degenerates to the single-element read.
+        smem_bytes = _dtype_bytes_for_lane(smem_elem_type, ctx)
+        lane_bytes = _dtype_bytes_for_lane(lane_elem_type, ctx)
+        if lane_bytes < smem_bytes:
+            raise NotImplementedError(
+                f"_visit_load_matrix(ocl): lane elem ({lane_elem_type}) "
+                f"narrower than smem elem ({smem_elem_type}) — not wired"
+            )
+        pack_ratio = lane_bytes // smem_bytes
+        if which == "a" and pack_ratio > 1:
+            # Lane L holds K-cols [L*pack_ratio, (L+1)*pack_ratio);
+            # within each lane the column base for K is
+            # col_base + L*pack_ratio.
+            col_lane_packed = ctx.text.alloc_id("lm_a_col_lane_pack")
+            pack_const = ctx.text.const_uint(pack_ratio)
+            lane_off = ctx.text.alloc_id("lm_a_lane_off")
+            ctx.text.emit_function(
+                f"{lane_off} = OpIMul {u32} {lane_id} {pack_const}"
+            )
+            ctx.text.emit_function(
+                f"{col_lane_packed} = OpIAdd {u32} {col_base} {lane_off}"
+            )
+            col_lane = col_lane_packed
+
         for s in range(width):
             row_s = ctx.text.alloc_id(f"lm_{which}_row_{s}")
             s_const = ctx.text.const_uint(s)
@@ -1044,33 +1076,114 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
             ctx.text.emit_function(
                 f"{row_mul} = OpIMul {u32} {row_s} {row_stride}"
             )
-            flat = ctx.text.alloc_id(f"lm_{which}_flat_{s}")
-            ctx.text.emit_function(
-                f"{flat} = OpIAdd {u32} {row_mul} {col_lane}"
-            )
-            if warp_off_id is not None:
-                flat_w = ctx.text.alloc_id(f"lm_{which}_flat_warp_{s}")
+
+            if pack_ratio == 1:
+                flat = ctx.text.alloc_id(f"lm_{which}_flat_{s}")
                 ctx.text.emit_function(
-                    f"{flat_w} = OpIAdd {u32} {flat} {warp_off_id}"
+                    f"{flat} = OpIAdd {u32} {row_mul} {col_lane}"
                 )
-                flat = flat_w
-            chain = ctx.text.alloc_id(f"lm_{which}_chain_{s}")
-            ctx.text.emit_function(
-                f"{chain} = OpAccessChain {smem_scalar_ptr} {smem_var_id} {flat}"
-            )
-            val = ctx.text.alloc_id(f"lm_{which}_val_{s}")
-            ctx.text.emit_function(
-                f"{val} = OpLoad {smem_elem_type} {chain}"
-            )
-            # Bitcast if smem dtype doesn't match lane elem dtype
-            # (BF16↔U16 same width; F32↔F32 same).
-            if smem_elem_type != lane_elem_type:
-                cast = ctx.text.alloc_id(f"lm_{which}_cast_{s}")
+                if warp_off_id is not None:
+                    flat_w = ctx.text.alloc_id(f"lm_{which}_flat_warp_{s}")
+                    ctx.text.emit_function(
+                        f"{flat_w} = OpIAdd {u32} {flat} {warp_off_id}"
+                    )
+                    flat = flat_w
+                chain = ctx.text.alloc_id(f"lm_{which}_chain_{s}")
                 ctx.text.emit_function(
-                    f"{cast} = OpBitcast {lane_elem_type} {val}"
+                    f"{chain} = OpAccessChain {smem_scalar_ptr} {smem_var_id} {flat}"
                 )
-                val = cast
-            elem_loads.append(val)
+                val = ctx.text.alloc_id(f"lm_{which}_val_{s}")
+                ctx.text.emit_function(
+                    f"{val} = OpLoad {smem_elem_type} {chain}"
+                )
+                # Bitcast if smem dtype doesn't match lane elem dtype
+                # (BF16↔U16 same width; F32↔F32 same).
+                if smem_elem_type != lane_elem_type:
+                    cast = ctx.text.alloc_id(f"lm_{which}_cast_{s}")
+                    ctx.text.emit_function(
+                        f"{cast} = OpBitcast {lane_elem_type} {val}"
+                    )
+                    val = cast
+                elem_loads.append(val)
+            else:
+                # Packed: read ``pack_ratio`` smem elements at
+                # K-offsets [0, pack_ratio), pack little-endian
+                # into one lane element via shift+OR.
+                packed = None
+                for k_off in range(pack_ratio):
+                    k_off_const = ctx.text.const_uint(k_off)
+                    pos = ctx.text.alloc_id(f"lm_{which}_pos_{s}_{k_off}")
+                    ctx.text.emit_function(
+                        f"{pos} = OpIAdd {u32} {col_lane} {k_off_const}"
+                    )
+                    flat = ctx.text.alloc_id(f"lm_{which}_flat_{s}_{k_off}")
+                    ctx.text.emit_function(
+                        f"{flat} = OpIAdd {u32} {row_mul} {pos}"
+                    )
+                    if warp_off_id is not None:
+                        flat_w = ctx.text.alloc_id(
+                            f"lm_{which}_flat_warp_{s}_{k_off}"
+                        )
+                        ctx.text.emit_function(
+                            f"{flat_w} = OpIAdd {u32} {flat} {warp_off_id}"
+                        )
+                        flat = flat_w
+                    chain = ctx.text.alloc_id(
+                        f"lm_{which}_chain_{s}_{k_off}"
+                    )
+                    ctx.text.emit_function(
+                        f"{chain} = OpAccessChain {smem_scalar_ptr} "
+                        f"{smem_var_id} {flat}"
+                    )
+                    val_smem = ctx.text.alloc_id(
+                        f"lm_{which}_val_smem_{s}_{k_off}"
+                    )
+                    ctx.text.emit_function(
+                        f"{val_smem} = OpLoad {smem_elem_type} {chain}"
+                    )
+                    # Widen smem element to the lane element type
+                    # (e.g. s8 → u16). Use OpUConvert via an
+                    # unsigned intermediate type so signed s8s don't
+                    # get sign-extended into the high byte — DPAS
+                    # interprets the int8 carrier byte-wise.
+                    # smem s8 is signed; bitcast to unsigned then
+                    # zero-extend.
+                    smem_u = ctx.text.alloc_id(
+                        f"lm_{which}_smem_u_{s}_{k_off}"
+                    )
+                    smem_unsigned_t = ctx.text.type_int(
+                        smem_bytes * 8, signed=False,
+                    )
+                    ctx.text.emit_function(
+                        f"{smem_u} = OpBitcast {smem_unsigned_t} {val_smem}"
+                    )
+                    widened = ctx.text.alloc_id(
+                        f"lm_{which}_widened_{s}_{k_off}"
+                    )
+                    ctx.text.emit_function(
+                        f"{widened} = OpUConvert {lane_elem_type} {smem_u}"
+                    )
+                    if k_off == 0:
+                        packed = widened
+                    else:
+                        shift_amt = ctx.text.const_uint(k_off * smem_bytes * 8)
+                        shifted = ctx.text.alloc_id(
+                            f"lm_{which}_shifted_{s}_{k_off}"
+                        )
+                        ctx.text.emit_function(
+                            f"{shifted} = OpShiftLeftLogical "
+                            f"{lane_elem_type} {widened} {shift_amt}"
+                        )
+                        new_packed = ctx.text.alloc_id(
+                            f"lm_{which}_packed_{s}_{k_off}"
+                        )
+                        ctx.text.emit_function(
+                            f"{new_packed} = OpBitwiseOr "
+                            f"{lane_elem_type} {packed} {shifted}"
+                        )
+                        packed = new_packed
+                assert packed is not None
+                elem_loads.append(packed)
 
     res_id = ctx.text.alloc_id(f"mma_load_{which}")
     ctx.val_to_id[out.id] = res_id
@@ -1571,6 +1684,37 @@ def _matching_width_dtype(kind: str, bytes_: int) -> DType:
             f"_matching_width_dtype(ocl): no {kind} dtype with {bytes_} bytes"
         )
     return table[(kind, bytes_)]
+
+
+def _dtype_bytes_for_lane(spv_type_id: str, ctx: _OclCtx) -> int:
+    """Reverse-lookup a SPIR-V scalar type-id back to its byte width.
+
+    Walks the SPIR-V text's type lines for the declared scalar.
+    Cheaper than passing dtype around — visitors already have the
+    type-id from ``_emit_dtype`` / ``smem_elem_type``.
+    """
+    # Look for the type-id's declaration in the assembler's emitted
+    # type lines (e.g. ``%int_8_1 = OpTypeInt 8 1`` → 1 byte).
+    for line in ctx.text.type_lines:
+        if not line.startswith(spv_type_id + " = "):
+            continue
+        rest = line.split(" = ", 1)[1].strip()
+        toks = rest.split()
+        if toks[0] == "OpTypeInt":
+            bits = int(toks[1])
+            return max(1, bits // 8)
+        if toks[0] == "OpTypeFloat":
+            return max(1, int(toks[1]) // 8)
+        # Anything else (OpTypeBool, OpTypeVector…) isn't a scalar
+        # the lane-elem reverse lookup should hit.
+        raise NotImplementedError(
+            f"_dtype_bytes_for_lane: type-id {spv_type_id!r} resolves to "
+            f"{toks[0]!r}; only OpTypeInt/OpTypeFloat scalars are handled."
+        )
+    raise RuntimeError(
+        f"_dtype_bytes_for_lane: type-id {spv_type_id!r} not declared in "
+        "ctx.text.type_lines"
+    )
 
 
 def _dtype_kind(dt: DType) -> str:
