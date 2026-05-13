@@ -37,7 +37,25 @@ Reference codebase for kernel patterns:
   Intel engine is line-for-line identical (see `## Engine shape`
   in this file).
 
-Devkit access: SSHFS + `ssh devkit` per `quark/docs/DEVKIT.md`.
+Devkit access — **use the SSHFS mount, not patches**:
+
+- The devkit's `/root/` is mounted on Mac at
+  `/Users/clyde/Documents/intel-devkit/`. The devkit's `~/quark`
+  shows up at `/Users/clyde/Documents/intel-devkit/quark/`. **Edit
+  files there directly from Mac** — they appear on the devkit
+  instantly.
+- **Do NOT** do `git format-patch` → `scp` → `git am` into a
+  detached worktree. That fights against the devkit's editable
+  install (which is pinned to `/root/quark/src`), forces PYTHONPATH
+  overrides, surfaces missing-file gaps that need symlink hacks,
+  and never quite resolves cleanly. Tried it on 2026-05-13 — lost
+  ~30 min and got nowhere useful.
+- For commands on devkit, ssh in: `ssh devkit '...'`. Hostname is
+  `xe3-devbox` (Battlemage / Panther Lake silicon).
+- The sshfs mount is slow for bulk ops like `git status` (walks
+  every file across the network). For those, ssh in and run the
+  command server-side.
+
 Don't claim "no hardware access" without trying.
 
 ---
