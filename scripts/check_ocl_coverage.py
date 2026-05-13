@@ -156,9 +156,19 @@ def main() -> None:
     os.environ.setdefault("QUARK_SKIP_VAE", "1")
     os.environ.setdefault("QUARK_DISABLE_NAX", "1")
 
+    # Patch at the source module so it works regardless of how the
+    # engine imports (module-level on Mac, lazy-inside-__init__ on
+    # devkit's older intel.py).
     import quark.engine.intel as _intel_mod
-    _intel_mod.load_yaml_config = lambda path: dict(_SMOKE_CFG)
-    _intel_mod._resolve_path = lambda uri, **kw: uri
+    import quark.models.config as _cfg_mod
+    _stub_load = lambda path: dict(_SMOKE_CFG)
+    _stub_resolve = lambda uri, **kw: uri
+    _cfg_mod.load_yaml_config = _stub_load
+    _cfg_mod._resolve_path = _stub_resolve
+    if hasattr(_intel_mod, "load_yaml_config"):
+        _intel_mod.load_yaml_config = _stub_load
+    if hasattr(_intel_mod, "_resolve_path"):
+        _intel_mod._resolve_path = _stub_resolve
 
     # Load _DISPATCH from the OCL lowerer.
     print("→ loading OCL _DISPATCH ...", flush=True)

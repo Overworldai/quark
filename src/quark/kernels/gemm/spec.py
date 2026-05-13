@@ -19,12 +19,15 @@ from dataclasses import dataclass
 from quark.ir import DType
 from quark.kernels.base import KernelSpec
 
-_VALID_AB = frozenset({DType.BF16, DType.F16, DType.F32, DType.E4M3, DType.E5M2})
+_VALID_AB = frozenset({DType.BF16, DType.F16, DType.F32, DType.E4M3, DType.E5M2, DType.S8})
 _VALID_OUT = frozenset({DType.BF16, DType.F16, DType.F32, DType.E4M3, DType.E5M2})
 _VALID_ACTIVATIONS = frozenset({None, "silu"})
 # Dtypes that can actually drive an MMA fragment (F32 doesn't — it must
 # be downcast on load, the same way bf16×e4m3 works via ``compute_dtype``).
-_VALID_COMPUTE = frozenset({DType.BF16, DType.F16, DType.E4M3, DType.E5M2})
+# S8 is the int8 quant path on Intel Xe2 (m8n16k32 coopmat); the
+# kernel must be passed per-row A/B scales for the int32→f32 epilogue
+# conversion.
+_VALID_COMPUTE = frozenset({DType.BF16, DType.F16, DType.E4M3, DType.E5M2, DType.S8})
 
 
 @dataclass(frozen=True)
@@ -96,12 +99,27 @@ class GemmSpec(KernelSpec):
             raise ValueError(f"GemmSpec: b_dtype {self.b_dtype!r} not in {_VALID_AB}")
         if self.out_dtype not in _VALID_OUT:
             raise ValueError(f"GemmSpec: out_dtype {self.out_dtype!r} not in {_VALID_OUT}")
-        if self.acc_dtype is not DType.F32:
-            raise ValueError("GemmSpec: acc_dtype must be F32 (no tf32 path)")
+        # Accumulator dtype must be F32 (float MMA), with one exception:
+        # the int8 path uses the s8/s8/s32 cooperative matrix (S32 acc)
+        # and the kernel does the s32→f32 conversion via per-row scale
+        # multiply in the epilogue. Spec carries S32 in that case so the
+        # MMA shape lookup picks the right registry entry.
+        if self.compute_dtype is DType.S8:
+            if self.acc_dtype is not DType.S32:
+                raise ValueError(
+                    "GemmSpec: compute_dtype=S8 requires acc_dtype=S32 "
+                    "(matches m8n16k32_intel_s8_s32 coopmat)"
+                )
+        else:
+            if self.acc_dtype is not DType.F32:
+                raise ValueError(
+                    "GemmSpec: acc_dtype must be F32 (no tf32 path) "
+                    "for non-S8 compute paths"
+                )
         if self.compute_dtype is not None and self.compute_dtype not in _VALID_COMPUTE:
             raise ValueError(
                 f"GemmSpec: compute_dtype {self.compute_dtype!r} not in {_VALID_COMPUTE} "
-                "(F32 has no tensor-core MMA; must be BF16/F16/E4M3/E5M2)"
+                "(F32 has no tensor-core MMA; must be BF16/F16/E4M3/E5M2/S8)"
             )
         if self.activation not in _VALID_ACTIVATIONS:
             raise ValueError(

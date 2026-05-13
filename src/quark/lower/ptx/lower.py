@@ -150,6 +150,15 @@ class _FnCtx:
     op_stack: list[Op] = field(default_factory=list)
     # Back-reference to the owning module (for MmaShape lookups).
     module: Module | None = None
+    # Block size at launch time — populated by ``_lower_function``
+    # from ``fn.attrs.max_threads_per_block`` when set. Used by the
+    # ``for_loop(unroll=True)`` const-fold path so kernels can write
+    # SG-agnostic bounds like ``total / block_dim_x()``; the
+    # ``BlockDimOp`` resolves to ``local_size[dim]`` at lower time.
+    # Falls back to ``(0, 0, 0)`` when the kernel didn't set the attr,
+    # in which case BlockDim references can't fold and unroll bounds
+    # must be plain ConstOps.
+    local_size: tuple[int, int, int] = (0, 0, 0)
 
     def fresh_label(self, stem: str) -> str:
         self.label_counter += 1
@@ -251,6 +260,16 @@ class PtxLowerer:
         from quark.lower.smem_layout import compute_smem_layout, dump_smem_layout
 
         ctx = _FnCtx(module=module)
+        # Populate ctx.local_size from FunctionAttrs so the
+        # ``ForLoopOp(unroll=True)`` const-fold path can resolve
+        # ``BlockDimOp`` to a Python int. The kernel cohort sets
+        # ``max_threads_per_block`` on the function when it knows the
+        # launch block size; today's GemmKernel etc. do this via
+        # ``Kernel.block()``. For the 1D-block convention every CUDA
+        # kernel uses, ``max_threads_per_block`` is local_size_x.
+        mtb = getattr(getattr(fn, "attrs", None), "max_threads_per_block", None)
+        if mtb is not None:
+            ctx.local_size = (int(mtb), 1, 1)
         # Compute the smem layout plan up front so per-op alloc visitors
         # consume offsets/aliasing rather than running their own counter.
         # Aliasing off by default during bring-up (passthrough mode).
@@ -955,6 +974,72 @@ class PtxLowerer:
             raise NotImplementedError(f"BarrierOp scope {scope!r}")
 
     def _visit_for_loop(self, op: ForLoopOp, ctx: _FnCtx) -> None:
+        # ``unroll=True`` on the ForLoopOp: Python-unroll the body at
+        # lower time. Used by kernel-cohort copy loops that were
+        # historically emitted as Python ``for i in range(N)`` blocks.
+        # The OCL/IGC backend needs SG-agnostic IR (block_dim_x() is
+        # 16 on OCL vs 32 on PTX/Vulkan-SPV), so the kernel cohort
+        # migrates Python unrolls → IR ``for_loop(..., unroll=True)``.
+        # On CUDA the result is byte-identical PTX to the old emit:
+        # N inlined iterations with iv bound to a const per iter.
+        # See ``quark.ir.op.ForLoopOp`` docstring for the full rationale.
+        if op.attrs.get("unroll", False):
+            self._visit_for_loop_unrolled(op, ctx)
+            return
+        self._visit_for_loop_runtime(op, ctx)
+
+    def _visit_for_loop_unrolled(self, op: ForLoopOp, ctx: _FnCtx) -> None:
+        """Python-unroll the body with iv bound to ``mov.u32 iv, <i>``
+        per iter. Requires lo/hi/step to be statically resolvable
+        via ``eval_const_int`` — supports ConstOp, BlockDimOp (read
+        from ``ctx.local_size`` populated from
+        ``FunctionAttrs.max_threads_per_block``), and ArithOp on
+        those. This lets the kernel cohort write SG-agnostic bounds
+        like ``total / block_dim_x()`` — the PTX side const-folds
+        ``block_dim_x()`` to the function's intended block size and
+        unrolls to the same N inlined iters as the prior Python
+        ``for i in range(N)`` emit."""
+        from quark.lower._common.const_fold import eval_const_int
+
+        lo_i = eval_const_int(op.lo, ctx.local_size)
+        hi_i = eval_const_int(op.hi, ctx.local_size)
+        step_i = eval_const_int(op.step, ctx.local_size)
+        if lo_i is None or hi_i is None or step_i is None or step_i == 0:
+            raise NotImplementedError(
+                "PTX for_loop(unroll=True) requires statically-resolvable "
+                "lo/hi/step (ConstOps or ArithOps on consts). Got "
+                f"lo={op.lo!r}, hi={op.hi!r}, step={op.step!r}. "
+                "BlockDimOp-folding via FunctionAttrs.max_threads_per_block "
+                "is a planned follow-up."
+            )
+
+        iv = op.induction_var
+        assert iv is not None
+        iv_reg = ctx.regs.name_for(iv)
+        iv_cls = reg_class(iv.dtype)
+
+        # Pre-alias carries onto result regs (same shape as runtime path).
+        carried_in = op.carried_in
+        for cin, res, cbv in zip(
+            carried_in, op.results, op.carried_body_vars, strict=False,
+        ):
+            ctx.regs.alias(cbv, res)
+            _emit_value_mov(ctx, res, cin)
+
+        ctx.op_stack.append(op)
+        try:
+            for i in range(lo_i, hi_i, step_i):
+                # Bind iv = const(i). Same physical reg each iter; the
+                # const write at iter start is what the body sees.
+                ctx.emit(f"mov.{iv_cls} {iv_reg}, {i};")
+                # Walk body. YieldOps inside coalesce yielded values
+                # into result regs — naturally becomes the next iter's
+                # carry-in via the alias on carried_body_vars.
+                self._walk_region(op.body.ops, ctx)
+        finally:
+            ctx.op_stack.pop()
+
+    def _visit_for_loop_runtime(self, op: ForLoopOp, ctx: _FnCtx) -> None:
         # Layout — while loop (guard before first iteration):
         #
         #     mov.u32 iv, lo

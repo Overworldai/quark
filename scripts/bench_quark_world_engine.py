@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import random
 import time
 from pathlib import Path
@@ -106,7 +107,7 @@ def _np_to_f32(x):
 
 
 def _f32_to_carrier(arr_f32, dtype: str):
-    """numpy f32 → tagged numpy carrier for the given quark dtype."""
+    """numpy f32 → tagged numpy carrier (Metal) or QuarkTensor (SPV)."""
     if dtype == "bf16":
         raw = (arr_f32.view(np.uint32) >> 16).astype(np.uint16)
     elif dtype == "f16":
@@ -117,32 +118,25 @@ def _f32_to_carrier(arr_f32, dtype: str):
         raw = arr_f32.astype(np.int32)
     else:
         raise ValueError(f"unknown carrier dtype {dtype!r}")
+    import sys as _sys
+    if _sys.platform != "darwin":
+        from quark.runtime.tensor import QuarkTensor as _QT
+        return _QT.from_numpy(raw, dtype=dtype)
     return _tag(raw, dtype)
 
 
 def _randn(*shape, dtype="bf16"):
-    np_dt = _NP_DT_MAP[dtype]
     rng = np.random.default_rng()
-    if np_dt == np.uint16:
-        f32 = rng.standard_normal(shape).astype(np.float32)
-        raw = (f32.view(np.uint32) >> 16).astype(np.uint16)
-    else:
-        raw = rng.standard_normal(shape).astype(np_dt)
-    return _tag(raw, dtype)
+    f32 = rng.standard_normal(shape).astype(np.float32)
+    return _f32_to_carrier(f32, dtype)
 
 
 def _zeros(*shape, dtype="bf16"):
-    return _tag(np.zeros(shape, dtype=_NP_DT_MAP[dtype]), dtype)
+    return _f32_to_carrier(np.zeros(shape, dtype=np.float32), dtype)
 
 
 def _tensor(data, dtype="f32"):
-    np_dt = _NP_DT_MAP[dtype]
-    arr = np.array(data, dtype=np.float32)
-    if np_dt == np.uint16:
-        raw = (arr.view(np.uint32) >> 16).astype(np.uint16)
-    else:
-        raw = arr.astype(np_dt)
-    return _tag(raw, dtype)
+    return _f32_to_carrier(np.array(data, dtype=np.float32), dtype)
 
 
 # ── ctrl input ───────────────────────────────────────────────────
@@ -374,14 +368,44 @@ def _load_taehv(ae_uri: str, *, ane: bool, latent_height: int, latent_width: int
 
     from quark.taehv import load_taehv
 
-    coreml_uri = os.environ.get("QUARK_TAEHV_COREML_URI") or f"{ae_uri}-coreml"
-    compute_units = "CPU_AND_NE" if ane else "CPU_AND_GPU"
-    ae = load_taehv(
-        coreml_uri,
-        latent_height=latent_height,
-        latent_width=latent_width,
-        compute_units=compute_units,
-    )
+    # Backend selection:
+    #   * On darwin: CoreML (CPU_AND_NE or CPU_AND_GPU).
+    #   * Elsewhere: OpenVINO (GPU / CPU / NPU).
+    # Override via ``QUARK_TAEHV_BACKEND`` (``coreml`` / ``openvino``),
+    # or via the URI suffix conventions ``-coreml`` / ``-openvino``.
+    ov_uri_env = os.environ.get("QUARK_TAEHV_OPENVINO_URI")
+    ov_dir_env = os.environ.get("QUARK_TAEHV_OPENVINO_DIR")
+    coreml_uri_env = os.environ.get("QUARK_TAEHV_COREML_URI")
+    backend = (os.environ.get("QUARK_TAEHV_BACKEND") or "").lower() or None
+    # If the user explicitly points to an OpenVINO IR (env URI or
+    # local dir), treat that as a strong opt-in even on darwin —
+    # avoids requiring two env vars (DIR + BACKEND) to get the
+    # OpenVINO path.
+    if backend is None and (ov_uri_env or ov_dir_env):
+        backend = "openvino"
+
+    if sys.platform == "darwin" and backend != "openvino":
+        uri = coreml_uri_env or f"{ae_uri}-coreml"
+        compute_units = "CPU_AND_NE" if ane else "CPU_AND_GPU"
+        ae = load_taehv(
+            uri,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            compute_units=compute_units,
+        )
+    else:
+        # OpenVINO path. ``uri`` may be an HF repo or a local export dir.
+        uri = ov_uri_env or os.environ.get("QUARK_TAEHV_OPENVINO_DIR") or f"{ae_uri}-openvino"
+        # ``ane`` is ignored on OpenVINO; ``QUARK_TAEHV_OPENVINO_DEVICE``
+        # (GPU/CPU/NPU/AUTO) picks the OpenVINO device.
+        device = os.environ.get("QUARK_TAEHV_OPENVINO_DEVICE", "GPU")
+        ae = load_taehv(
+            uri,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            compute_units=device,
+            backend="openvino",
+        )
     return ae, ane
 
 
@@ -449,6 +473,12 @@ def _write_video_hevc(pixels, output_path: str, fps: int, crf: int) -> None:
 
 
 def _encode_seed(path: str, preset: str, ae_uri: str, latent_height: int, latent_width: int):
+    # Diagnostic: skip CoreML encode and load a pre-saved latent (for
+    # cross-host SPV demos that can't run CoreML).
+    pre = os.environ.get("QUARK_PRE_ENCODED_SEED")
+    if pre:
+        import numpy as _np
+        return _np.load(pre).astype(_np.float32)
     """Encode an image (or short video) to a ``[T, C, H, W]`` f32 latent.
 
     Uses **PIL + LANCZOS** for the resize, identical to
@@ -628,11 +658,29 @@ def _make_config(preset: str):
 
     presets = {"360p": (8, 16), "720p": (16, 32)}
     h, w = presets[preset]
-    # Metal has no native fp8 (no e4m3 type in MSL). Force the all-bf16
-    # quant profile so the KV cache + OwlAttn MMAs stay in the half-dt
-    # path; QuantConfig defaults to fp8-everything for Hopper/Ada.
+    # Metal has no native fp8 (no e4m3 type in MSL). SPV doesn't either —
+    # the SpirVLowerer rejects DType.E4M3 (PORTABILITY_PLAN §3.2). Force
+    # the all-bf16 quant profile on both so KV cache + OwlAttn MMAs stay
+    # in the half-dt path; QuantConfig defaults to fp8-everything for
+    # Hopper/Ada.
     is_metal = sys.platform == "darwin"
-    quant = QuantConfig.all_bf16() if is_metal else QuantConfig()
+    # Match the auto-detect in ``quark.runtime.sync``: Linux with no
+    # CUDA and a working SPV driver → SPV. Both Metal and SPV need the
+    # all-bf16 profile because neither lowerer supports e4m3 today.
+    is_spv = False
+    if not is_metal:
+        try:
+            from quark.runtime.cuda import CudaRuntime
+            if CudaRuntime.instance().device_count() == 0:
+                from quark.drivers import spv as _spv_drivers
+                is_spv = _spv_drivers.is_available()
+        except Exception:
+            try:
+                from quark.drivers import spv as _spv_drivers
+                is_spv = _spv_drivers.is_available()
+            except Exception:
+                pass
+    quant = QuantConfig.all_bf16() if (is_metal or is_spv) else QuantConfig()
     return Waypoint15Config(
         d_model=2048,
         n_layers=24,
@@ -898,9 +946,15 @@ def main():
         # Reset the decoder's MemBlock state — the warmup primed it
         # with zeros, which we want to clear before the timed run.
         ae.reset()
+        # Honest backend label: probe ``ae`` rather than the historical
+        # ``is_ane`` flag, which only meant "CoreML w/ ANE compute".
+        if hasattr(ae, "_device"):
+            _backend_label = f"OpenVINO/{ae._device}"
+        else:
+            _backend_label = "ANE" if is_ane else "Metal-GPU"
         print(
             f"  TAEHV ready ({time.perf_counter() - t_ae:.1f}s, "
-            f"backend={'ANE' if is_ane else 'GPU'})"
+            f"backend={_backend_label})"
         )
 
     use_pipeline = ae is not None and args.pipeline
@@ -1059,13 +1113,18 @@ def main():
     _sync()
 
     # ── Generate frames (timed) ──
-    decode_mode = (
-        "no decode"
-        if args.no_decode
-        else f"+ ANE decode ({'pipelined' if use_pipeline else 'serial'})"
-        if is_ane
-        else "+ CPU decode (serial)"
-    )
+    if args.no_decode:
+        decode_mode = "no decode"
+    else:
+        # Try to derive a meaningful backend label from ``ae``.
+        if hasattr(ae, "_device"):
+            _backend_label = f"OpenVINO/{ae._device}"
+        elif is_ane:
+            _backend_label = "ANE"
+        else:
+            _backend_label = "Metal-GPU"
+        _mode_label = "pipelined" if use_pipeline else "serial"
+        decode_mode = f"+ {_backend_label} decode ({_mode_label})"
     print(
         f"\ngenerating {args.n_frames} frames ({n_denoise} denoise + 1 commit each) "
         f"[{decode_mode}] …"
@@ -1132,11 +1191,12 @@ def main():
         # because commit hasn't been encoded yet. The trailing-edge
         # order hides drain behind commit's lazy GPU work, which is
         # the right call when the iter is GPU-bound.
+        _force_latent = bool(os.environ.get("QUARK_DUMP_LATENTS"))
         lt = gen_frame(
             ctrl_sequence[args.warmup + 1 + i],
             base_fi + i,
-            return_latent=not args.no_decode,
-            snapshot=snapshot,
+            return_latent=(not args.no_decode) or _force_latent,
+            snapshot=snapshot or _force_latent,
         )
         if lt is not None and snapshot:
             # Only the snapshot path appends to ``latents`` — the
@@ -1185,6 +1245,11 @@ def main():
     # attention saturates around ``cfg.global_window`` frames; report
     # both windows so PR descriptions can show cold + warm steady-state.
     init_n = min(10, len(fwd_arr))
+    # Diagnostic per-frame dump for inter-frame variance analysis.
+    _frame_dump = os.environ.get("QUARK_DUMP_FRAME_TIMINGS")
+    if _frame_dump:
+        np.save(_frame_dump, fwd_arr)
+        print(f"  [diag] per-frame Forward timings saved to {_frame_dump}")
     if len(fwd_arr) >= cfg.global_window + 50:
         sat_arr = fwd_arr[cfg.global_window:]
         print(
@@ -1197,7 +1262,8 @@ def main():
         )
     if dec_arr is not None and len(dec_arr):
         if use_pipeline:
-            print(f"  ANE decode:  {dec_arr.mean():6.1f} ms collect (overlapped)")
+            _ae_lbl = f"OpenVINO/{ae._device}" if hasattr(ae, "_device") else ("ANE" if is_ane else "Metal-GPU")
+            print(f"  {_ae_lbl} decode:  {dec_arr.mean():6.1f} ms collect (overlapped)")
         else:
             print(f"  Decode:      {dec_arr.mean():6.1f} ms avg ({dec_arr.std():5.1f} ms std)")
     print(f"  Latent step: {pf_arr.mean():6.1f} ms forward only")
@@ -1209,6 +1275,13 @@ def main():
     print(f"{'=' * 50}")
 
     if args.no_decode or (not latents and not pixel_chunks):
+        # Diagnostic dump for offline cross-backend comparison.
+        dump_path = os.environ.get("QUARK_DUMP_LATENTS")
+        if dump_path and latents:
+            latent_nps = [_np_to_f32(lt).reshape(1, C, H, W) for lt in latents]
+            all_latents = np.concatenate(latent_nps, axis=0)
+            np.save(dump_path, all_latents)
+            print(f"  [diag] saved latents to {dump_path} {all_latents.shape}")
         return
 
     out_lower = args.output.lower()

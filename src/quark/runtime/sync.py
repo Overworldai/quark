@@ -18,11 +18,11 @@ import os as _os
 _IS_METAL = sys.platform == "darwin"
 
 
-def _detect_is_spv() -> bool:
-    """Match ``runtime.tensor._detect_is_spv``: env-var override
-    first, then auto-detect (CUDA wins if available, else Vulkan)."""
+def _detect_is_ocl() -> bool:
+    """Match ``runtime.tensor._detect_is_ocl``: env-var override first,
+    then auto-detect (CUDA wins if available, else OpenCL/IGC)."""
     backend = _os.environ.get("QUARK_BACKEND", "").lower()
-    if backend in ("spv", "intel"):
+    if backend in ("ocl", "intel"):
         return True
     if _os.environ.get("QUARK_FORCE_BACKEND", "").lower() == "intel_gpu":
         return True
@@ -36,14 +36,14 @@ def _detect_is_spv() -> bool:
     except Exception:
         pass
     try:
-        from quark.drivers import spv as _spv_drivers
+        from quark.drivers import ocl as _ocl_drivers
 
-        return _spv_drivers.is_available()
+        return _ocl_drivers.is_available()
     except Exception:
         return False
 
 
-_IS_SPV = _detect_is_spv()
+_IS_OCL = _detect_is_ocl()
 
 
 def synchronize() -> None:
@@ -58,9 +58,8 @@ def synchronize() -> None:
     leave their dispatches sitting in the queue, and later phases
     (warmup, generation) execute them out-of-order with stale state.
 
-    On SPV: ``_sd.sync`` calls ``vkDeviceWaitIdle`` which drains
-    everything in flight on the compute queue. Async-mode launches
-    (``sync=False``) accumulate in the queue until this fires.
+    On OCL: ``OclDriver.sync`` calls ``clFinish`` which drains every
+    queued kernel + transfer.
     """
     if _IS_METAL:
         from quark.drivers import _metal_dispatch as _md
@@ -70,10 +69,10 @@ def synchronize() -> None:
         if _md.has_pending():
             _md.eval()
         return
-    if _IS_SPV:
-        from quark.drivers import _spv_dispatch as _sd
+    if _IS_OCL:
+        from quark.runtime.tensor import _OclStorage
 
-        _sd.sync()
+        _OclStorage._drv().sync()
         return
     from quark.runtime.cuda import CudaRuntime
 

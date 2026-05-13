@@ -869,6 +869,7 @@ class Builder:
         *,
         iv_name: str = "i",
         carried: Sequence[Value] = (),
+        unroll: bool = False,
     ) -> Iterator[tuple[Value, tuple[Value, ...]]]:
         """Build a ForLoopOp with an explicit induction variable and
         loop-carried values. The context manager yields `(iv, (carried_in, ...))`
@@ -902,7 +903,7 @@ class Builder:
         for_op = _op.ForLoopOp(
             results=results,
             operands=(lo, hi, step) + carried,
-            attrs={"iv_name": iv_name, "iv_dtype": lo.dtype},
+            attrs={"iv_name": iv_name, "iv_dtype": lo.dtype, "unroll": bool(unroll)},
             regions=(body_region,),
             induction_var=iv,
             carried_body_vars=body_carried,

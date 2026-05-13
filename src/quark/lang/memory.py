@@ -75,12 +75,15 @@ def q_register_load(
         name="Q_warp",
     )
 
-    # cp.async Q tile (each warp loads its own rows, 32 threads).
-    lane_id = bctx.tid % 32
+    # cp.async Q tile (each warp loads its own rows, subgroup-width
+    # threads). ``bctx.subgroup_size`` is 32 on the historical path
+    # and 16 when ``KernelConfig.subgroup_size = 16``.
+    sgs = bctx.subgroup_size
+    lane_id = bctx.tid % bctx.c(sgs)
     warp_smem.copy_from(
         g_q.tile(row=q_row, col=0, shape=(warp_rows, Dh)),
         tid=lane_id,
-        n_threads=32,
+        n_threads=sgs,
         async_load=True,
     )
     qk.async_commit()

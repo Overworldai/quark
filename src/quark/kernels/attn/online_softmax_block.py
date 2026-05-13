@@ -120,29 +120,30 @@ class OnlineSoftmax(Block):
         scale_c = b.const(DType.F32, self.scale)
         neg_inf = b.const(DType.F32, -1e30)
 
-        # ``is_intel_spv``: Intel KHR cooperative_matrix has an
+        # ``is_intel``: Intel cooperative_matrix
+        # (``cl_intel_subgroup_matrix_multiply_accumulate``) has an
         # implementation-private lane↔(row, col) mapping, so per-c_reg
         # ``cd_offsets`` can't express the ``rows``-many row classes
-        # online softmax needs. The SPV lowerer recovers the row from
+        # online softmax needs. The OCL lowerer recovers the row from
         # the smem layout instead — kernel asks for ``shape.m``-many
         # ``frag_reduce`` results via ``n_classes_override`` and
         # ``frag_apply`` selectors via dynamic-row-dispatch
         # (``slot_to_selector_idx=None``). Other backends (PTX/Apple)
         # keep the per-c_reg path that works for their public lane
         # layouts.
-        is_intel_spv = (
+        is_intel = (
             mma_shape_id is not None and "_intel_" in mma_shape_id
         )
         # Number of row classes:
         #   - PTX/Apple: distinct dr values in cd_offsets
-        #   - Intel SPV: full row count (shape.m)
-        if is_intel_spv:
+        #   - Intel: full row count (shape.m)
+        if is_intel:
             n_rc = cfg.shape.m
             dr_vals = list(range(n_rc))
         else:
             dr_vals = sorted({dr for dr, _ in cd_offsets})
             n_rc = len(dr_vals)
-        row_class = {i: dr_vals.index(dr) for i, (dr, _) in enumerate(cd_offsets)} if not is_intel_spv else {}
+        row_class = {i: dr_vals.index(dr) for i, (dr, _) in enumerate(cd_offsets)} if not is_intel else {}
         # GEMM2 P-fragment packs ``nk_per_kstep`` acc tiles per k-step.
         # For m16n8k16 this is 2 (k=16 covers 2 nk-tiles of 8 cols each).
         # For m8n8k8 it's 1 (k=8 matches one nk-tile).
@@ -164,7 +165,7 @@ class OnlineSoftmax(Block):
 
         if mma_shape_id is not None:
             reduce_kwargs = (
-                {"n_classes_override": n_rc} if is_intel_spv else {}
+                {"n_classes_override": n_rc} if is_intel else {}
             )
             for mt in range(MT):
                 for nk in range(NK):
@@ -231,11 +232,11 @@ class OnlineSoftmax(Block):
         # extract+vec_build pattern produces. PTX lowers to per-reg
         # ``mul.f32``, same count as before.
         if mma_shape_id is not None:
-            # Intel SPV path: pass selectors with ``slot_to_selector_idx
+            # Intel path: pass selectors with ``slot_to_selector_idx
             # =None`` to opt into dynamic-row-dispatch (lowerer derives
             # row from smem layout). PTX/Apple: per-c_reg static map.
             slot_to_selector_idx = (
-                None if is_intel_spv
+                None if is_intel
                 else tuple(dr_vals.index(dr) for dr, _ in cd_offsets)
             )
             for mt in range(MT):
@@ -280,11 +281,11 @@ class OnlineSoftmax(Block):
 
         if mma_shape_id is not None:
             slot_to_selector_idx = (
-                None if is_intel_spv
+                None if is_intel
                 else tuple(dr_vals.index(dr) for dr, _ in cd_offsets)
             )
             reduce_kwargs = (
-                {"n_classes_override": n_rc} if is_intel_spv else {}
+                {"n_classes_override": n_rc} if is_intel else {}
             )
 
             # Step 4a: compute P f32 ACC fragments via frag_apply.

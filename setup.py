@@ -5,14 +5,13 @@ Uses nanobind (matching MLX's binding stack) for low-overhead Python→C calls.
 * macOS (``sys_platform == 'darwin'``): builds ``_metal_dispatch`` —
   the metal-cpp + nanobind extension that drives Apple Metal directly
   (no MLX, no PyObjC). See ``src/quark/drivers/_metal_dispatch.cpp``.
-* Linux (``sys_platform == 'linux'``): builds ``_spv_dispatch`` — the
-  Vulkan + nanobind extension for the SPIR-V backend. See
-  ``src/quark/drivers/_spv_dispatch.cpp`` and PORTABILITY_PLAN §3.1.
+* Linux (``sys_platform == 'linux'``): builds ``_ocl_dispatch`` — the
+  OpenCL + nanobind extension that drives Intel iGPUs/Arc through
+  Intel NEO + IGC. See ``src/quark/drivers/_ocl_dispatch.cpp``.
 * Windows: no native ext today — the CUDA driver is pure ctypes
   (``drivers/cuda.py``).
 
-Both extensions are optional at build time: missing system deps
-(``libvulkan-dev`` on Linux, the macOS SDK on darwin) skip the
+Extensions are optional at build time: missing system deps skip the
 build with a warning rather than failing — letting CI on a host
 without one toolchain still install the rest of the package.
 """
@@ -92,16 +91,15 @@ if sys.platform == "linux":
 
     nb_inc, nb_src, nb_robin = _nanobind_paths()
 
-    # ``-lvulkan`` resolves to libvulkan.so via the system loader. The
-    # build host needs ``libvulkan-dev`` (Ubuntu/Debian) /
-    # ``vulkan-loader-devel`` (Fedora) for ``vulkan/vulkan.h``. At
-    # runtime any vendor ICD (Mesa, Intel proprietary, NVIDIA) is
-    # picked up — no SDK install required on the deploy box.
+    # OpenCL backend — Intel iGPU/Arc via Intel NEO + IGC. Build
+    # requires opencl-headers + libOpenCL (Ubuntu: ``apt install
+    # opencl-headers ocl-icd-opencl-dev``). At runtime, NEO
+    # (intel-opencl-icd) supplies the ICD.
     ext_modules.append(
         Extension(
-            "quark.drivers._spv_dispatch",
+            "quark.drivers._ocl_dispatch",
             sources=[
-                "src/quark/drivers/_spv_dispatch.cpp",
+                "src/quark/drivers/_ocl_dispatch.cpp",
                 os.path.join(nb_src, "nb_combined.cpp"),
             ],
             include_dirs=[
@@ -109,13 +107,13 @@ if sys.platform == "linux":
                 nb_inc,
                 nb_robin,
             ],
-            libraries=["vulkan"],
+            libraries=["OpenCL"],
             extra_compile_args=[
                 "-std=c++17",
                 "-O2",
                 "-fvisibility=hidden",
                 "-DNB_COMPACT_ASSERTIONS",
-                "-DVK_ENABLE_BETA_EXTENSIONS=1",
+                "-DCL_TARGET_OPENCL_VERSION=300",
             ],
         )
     )

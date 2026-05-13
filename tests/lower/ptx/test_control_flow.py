@@ -47,6 +47,51 @@ class TestForLoop:
         f32_movs = re.findall(r"mov\.f32 %f\d+, %f\d+;", text)
         assert len(f32_movs) >= 2
 
+    def test_unroll_python_inlines_n_iters_no_loop_label(self, fresh_builder):
+        """``ForLoopOp(unroll=True)`` Python-unrolls the body at lower
+        time — N inlined iterations with iv bound to ``mov.u32 iv,
+        <i>;`` per iter. Produces no loop label and no backedge — the
+        result is the same instruction stream as today's Python-side
+        ``for i in range(N)`` emit. Lets the kernel cohort migrate
+        copy loops to IR while keeping CUDA perf unchanged."""
+        b = fresh_builder
+        lo = b.const(DType.U32, 0)
+        hi = b.const(DType.U32, 4)
+        step = b.const(DType.U32, 1)
+        with b.for_loop(lo, hi, step, iv_name="k", unroll=True) as (k, _):
+            pass
+        out = lower(b)
+        text = body(out)
+        # No loop label, no backedge — fully inlined.
+        assert not re.search(r"\$L_\d+:", text), (
+            f"unrolled loop should have no loop label, got:\n{text}"
+        )
+        assert not re.search(r"@%p\d+ bra \$L_\d+;", text), (
+            "unrolled loop should have no backedge"
+        )
+        # 4 iv-init movs (one per iter, with literal const value).
+        iv_movs = re.findall(r"mov\.u32 %r\d+, \d+;", text)
+        assert len(iv_movs) >= 4, (
+            f"expected ≥4 iv-init movs for 4 iters, got {len(iv_movs)}:\n{text}"
+        )
+
+    def test_unroll_rejects_non_const_bounds(self, fresh_builder):
+        """``unroll=True`` requires statically-resolvable lo/hi/step.
+        Today only ConstOp-traced bounds are supported (BlockDimOp-
+        folding via FunctionAttrs is a planned follow-up). A runtime
+        bound (e.g. derived from ``thread_idx``) raises
+        NotImplementedError with a clear message."""
+        import pytest as _pytest
+        b = fresh_builder
+        tid = b.thread_idx("x")
+        # Use tid as the upper bound — genuinely runtime, can't fold.
+        lo = b.const(DType.U32, 0)
+        step = b.const(DType.U32, 1)
+        with b.for_loop(lo, tid, step, iv_name="k", unroll=True) as (k, _):
+            pass
+        with _pytest.raises(NotImplementedError, match="statically-resolvable"):
+            lower(b)
+
     def test_nested_loops_have_two_labels(self, fresh_builder):
         b = fresh_builder
         lo = b.const(DType.U32, 0)

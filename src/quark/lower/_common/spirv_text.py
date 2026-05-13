@@ -85,9 +85,7 @@ class SpvText:
     def set_memory_model(self, model: str) -> None:
         """Override the default ``OpMemoryModel Logical GLSL450``.
 
-        The CooperativeMatrixKHR + VulkanMemoryModel capability pair
-        (used by the SPV cooperative-matrix path) requires
-        ``Logical Vulkan`` instead. Idempotent.
+        The OCL backend uses ``Physical64 OpenCL``. Idempotent.
         """
         self.memory_model = f"OpMemoryModel {model}"
 

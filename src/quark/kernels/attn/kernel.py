@@ -357,11 +357,11 @@ class AttnKernel(Kernel):
 
         # Row classes per m-tile:
         #   - PTX m16n8 → 2 (dr ∈ {0, 8}); m8n8k8 → 1 (dr ∈ {0})
-        #   - Intel SPV → ``shape.m`` (full per-row, derived from smem
-        #     layout — see ``online_softmax_block`` ``is_intel_spv``)
-        is_intel_spv = "_intel_" in mma_cfg.shape_id
+        #   - Intel → ``shape.m`` (full per-row, derived from smem
+        #     layout — see ``online_softmax_block`` ``is_intel``)
+        is_intel = "_intel_" in mma_cfg.shape_id
         n_rc = (
-            mma_cfg.shape.m if is_intel_spv
+            mma_cfg.shape.m if is_intel
             else len({dr for dr, _ in mma_cfg.cd_offsets})
         )
         n_ml = MTiles * n_rc

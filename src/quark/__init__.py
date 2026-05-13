@@ -122,15 +122,29 @@ def eval():
     this is a no-op (well, fast-path: nothing pending). Inside lazy,
     use this to commit early when you need to read an intermediate
     result without exiting the block.
+
+    Backend-aware: Metal has a separate lazy queue (graph-node ops)
+    plus its eager encoder; SPV / CUDA just need a single
+    ``synchronize`` to drain the compute queue.
     """
-    from quark.drivers import _metal_dispatch as _md
+    import sys as _sys
 
-    if _md.has_lazy_pending():
-        _md.eval_queue()
-    from quark.functional._dispatch import clear_strided_copy_meta, launcher
+    if _sys.platform == "darwin":
+        from quark.drivers import _metal_dispatch as _md
 
-    clear_strided_copy_meta()
-    launcher().driver.sync(None)
+        if _md.has_lazy_pending():
+            _md.eval_queue()
+        from quark.functional._dispatch import clear_strided_copy_meta, launcher
+
+        clear_strided_copy_meta()
+        launcher().driver.sync(None)
+    else:
+        # Linux / SPV / CUDA — single drain via runtime.sync.synchronize.
+        # On SPV that flushes pending cmd_bufs + vkDeviceWaitIdle; on
+        # CUDA it does ``stream_synchronize(0)``.
+        from quark.runtime.sync import synchronize as _sync
+
+        _sync()
 
 
 @contextmanager

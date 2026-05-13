@@ -52,11 +52,11 @@ class MmaConfig:
     * ``min_cuda_cc`` + ``cuda``    — CUDA  (PTX mnemonic suffix)
     * ``min_metal_gen`` + ``metal`` — Metal (MSL tiling
       ``"<frag_dtype>:<mf>:<nf>:<kf>"`` consumed by ``_parse_msl_tiling``)
-    * ``min_intel_gpu_gen`` + ``intel_gpu`` — Intel SPIR-V (Vulkan
-      KHR_cooperative_matrix). The payload is a tag the SPIR-V
-      lowerer parses; today the only emitted form is
-      ``"khr:subgroup"`` (subgroup-scope KHR coopmat — Battlemage
-      doesn't expose workgroup scope).
+    * ``min_intel_gpu_gen`` + ``intel_gpu`` — Intel iGPU/Arc via OCL
+      + IGC. The payload is a tag the OCL lowerer parses; today the
+      only emitted form is ``"khr:subgroup"`` (subgroup-scope
+      cooperative-matrix, mapping to ``cl_intel_subgroup_matrix_
+      multiply_accumulate`` at IGC compile time).
 
     Gate semantics: ``min_*=None`` means the shape has no path on that
     backend at all. ``shapes_for_chip`` filters the descriptor list
@@ -92,7 +92,7 @@ class MmaConfig:
     min_metal_gen: Optional[ChipGeneration] = None
     metal: Optional[str] = None  # MSL tiling ``"<frag_dtype>:<mf>:<nf>:<kf>"``
 
-    # --- Intel SPIR-V backend (Vulkan KHR_cooperative_matrix) ---
+    # --- Intel iGPU/Arc backend (OpenCL + IGC, cl_intel_subgroup_matrix_multiply_accumulate) ---
     min_intel_gpu_gen: Optional[ChipGeneration] = None
     intel_gpu: Optional[str] = None  # tag, e.g. ``"khr:subgroup"``
 
@@ -538,17 +538,18 @@ _BF16_M8N16K16_INTEL_F32 = MmaConfig(
         a_dtype=DType.BF16,
         b_dtype=DType.BF16,
         acc_dtype=DType.F32,
-        # Reg counts are nominal — the SPIR-V lowerer derives storage
-        # from the cooperative_matrix type the driver allocates, not
-        # from these fields. Kept truthful-ish so callers that
-        # introspect (e.g. autotune budget calcs) don't divide by zero.
-        a_regs=4,  # 8m × 16k bf16 / 32 lanes = 4 elements/lane
-        b_regs=8,  # 16n × 16k bf16 / 32 lanes = 8 elements/lane
-        c_regs=4,  # 8m × 16n f32 / 32 lanes = 4 elements/lane
+        # Reg counts are the spec-canonical SG=16 per-lane widths for
+        # the ``cl_intel_subgroup_matrix_multiply_accumulate`` extension
+        # (the only supported subgroup sizes are 8 and 16 per Khronos;
+        # SG=16 is Battlemage's native DPAS width). The OCL lowerer
+        # reads them to size per-lane fragment vectors.
+        a_regs=8,  # SG=16: lane L holds column k=L; 8 rows of A per lane
+        b_regs=8,  # SG=16: lane L holds column n=L; 16 K-rows in 8 packed-pair i32
+        c_regs=8,  # SG=16: lane L holds column n=L; 8 rows of C per lane
     ),
-    a_offsets=_intel_offsets(4),
+    a_offsets=_intel_offsets(8),
     b_offsets=_intel_offsets(8),
-    cd_offsets=_intel_offsets(4),
+    cd_offsets=_intel_offsets(8),
     lane_col_step=2,  # bf16 in b32 carrier
     min_cuda_cc=None,
     cuda=None,
@@ -567,13 +568,13 @@ _BF16_M8N16K16_INTEL_BF16 = MmaConfig(
         a_dtype=DType.BF16,
         b_dtype=DType.BF16,
         acc_dtype=DType.BF16,
-        a_regs=4,
+        a_regs=8,
         b_regs=8,
-        c_regs=4,  # 8m × 16n bf16 / 32 lanes = 4 elements/lane
+        c_regs=8,  # SG=16: 8 rows of C per lane (bf16 acc)
     ),
-    a_offsets=_intel_offsets(4),
+    a_offsets=_intel_offsets(8),
     b_offsets=_intel_offsets(8),
-    cd_offsets=_intel_offsets(4),
+    cd_offsets=_intel_offsets(8),
     lane_col_step=2,
     min_cuda_cc=None,
     cuda=None,
@@ -592,13 +593,13 @@ _F16_M8N16K16_INTEL_F32 = MmaConfig(
         a_dtype=DType.F16,
         b_dtype=DType.F16,
         acc_dtype=DType.F32,
-        a_regs=4,
+        a_regs=8,
         b_regs=8,
-        c_regs=4,
+        c_regs=8,
     ),
-    a_offsets=_intel_offsets(4),
+    a_offsets=_intel_offsets(8),
     b_offsets=_intel_offsets(8),
-    cd_offsets=_intel_offsets(4),
+    cd_offsets=_intel_offsets(8),
     lane_col_step=2,
     min_cuda_cc=None,
     cuda=None,
@@ -617,14 +618,46 @@ _F16_M8N16K16_INTEL_F16 = MmaConfig(
         a_dtype=DType.F16,
         b_dtype=DType.F16,
         acc_dtype=DType.F16,
-        a_regs=4,
+        a_regs=8,
         b_regs=8,
+        c_regs=8,
+    ),
+    a_offsets=_intel_offsets(8),
+    b_offsets=_intel_offsets(8),
+    cd_offsets=_intel_offsets(8),
+    lane_col_step=2,
+    min_cuda_cc=None,
+    cuda=None,
+    min_metal_gen=None,
+    metal=None,
+    min_intel_gpu_gen=ChipGeneration.INTEL_XE2,
+    intel_gpu="khr:subgroup",
+)
+
+# Intel Xe2 int8 cooperative_matrix — m=8, n=16, k=32 (doubled inner
+# dim vs bf16/f16). Each MMA does 8192 ops/cycle vs 4096 for bf16,
+# unlocking 2× theoretical throughput on attention/GEMM.
+_S8_M8N16K32_INTEL_S32 = MmaConfig(
+    shape=MmaShape(
+        name="m8n16k32_intel_s8_s32",
+        m=8,
+        n=16,
+        k=32,
+        a_dtype=DType.S8,
+        b_dtype=DType.S8,
+        acc_dtype=DType.S32,
+        # Per-lane storage at SIMD32:
+        #   a: m=8 × k=32 / 32 lanes = 8 s8 per lane = 2 b32 carriers
+        #   b: n=16 × k=32 / 32 lanes = 16 s8 per lane = 4 b32 carriers
+        #   c: m=8 × n=16 / 32 lanes = 4 s32 per lane = 4 b32 carriers
+        a_regs=8,
+        b_regs=16,
         c_regs=4,
     ),
-    a_offsets=_intel_offsets(4),
-    b_offsets=_intel_offsets(8),
+    a_offsets=_intel_offsets(8),
+    b_offsets=_intel_offsets(16),
     cd_offsets=_intel_offsets(4),
-    lane_col_step=2,
+    lane_col_step=4,  # s8 in b32 carrier = 4 elements per b32 reg
     min_cuda_cc=None,
     cuda=None,
     min_metal_gen=None,
@@ -651,6 +684,7 @@ ALL_SHAPES: tuple[MmaConfig, ...] = (
     _BF16_M8N16K16_INTEL_BF16,
     _F16_M8N16K16_INTEL_F32,
     _F16_M8N16K16_INTEL_F16,
+    _S8_M8N16K32_INTEL_S32,
 )
 
 # Reverse index for O(1) shape_id → config lookups. Built once at

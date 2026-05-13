@@ -125,14 +125,13 @@ def _time_callable(fn, *, warmup_ms: float = 100.0, bench_ms: float = 300.0) -> 
         return (elapsed_s * 1e6) / max(n_bench, 1)
 
     if dev.family is DeviceFamily.INTEL_GPU:
-        # SPV / Vulkan path: ``SpvDriver.launch`` waits inline today
-        # (eager-submit shape — see ``_spv_dispatch.cpp``), so each
-        # ``fn()`` call returns after the dispatch completes. The
-        # accumulating-command-buffer optim from the Metal path will
-        # land here as PORTABILITY_PLAN §3.7's perf work matures, at
-        # which point this branch grows an explicit drain. Until then,
-        # the same eager loop the Metal path uses is correct and
-        # gives a clean μs/call.
+        # OCL/IGC path: ``OclDriver.launch`` waits inline today (eager
+        # submit shape), so each ``fn()`` call returns after the
+        # dispatch completes. The accumulating-command-buffer optim
+        # from the Metal path will land here later, at which point this
+        # branch grows an explicit drain. Until then, the same eager
+        # loop the Metal path uses is correct and gives a clean
+        # μs/call.
         t0 = _time.perf_counter()
         n_warm = 0
         while (_time.perf_counter() - t0) * 1000 < warmup_ms:
@@ -317,8 +316,8 @@ class CompiledKernel:
 
         On CUDA: writes into preallocated output buffers, returns None.
         On Metal: returns list of numpy array outputs (driver allocates them).
-        On SPV: ``sync=False`` skips the per-launch fence wait —
-        caller must ``driver.sync()`` before reading outputs.
+        On OCL: ``sync=False`` skips the per-launch wait — caller must
+        ``driver.sync()`` before reading outputs.
         """
         if len(buffers) != len(self.param_spec.buffers):
             raise ValueError(
@@ -327,25 +326,42 @@ class CompiledKernel:
                 f"got {len(buffers)}"
             )
 
-        # Detect Metal path via driver type.
-        from quark.device import DeviceFamily
-
-        if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.METAL:
-            return self._launch_metal(buffers, scalars, persistent_outs=persistent_outs)
-        if hasattr(self.driver, "family") and self.driver.family is DeviceFamily.INTEL_GPU:
-            # ``quark.lazy()`` flips ``_LAZY`` to True; under it, the
-            # SPV launch skips the per-call ``vkWaitForFences`` so
-            # dispatches accumulate in the queue. Caller must
-            # ``synchronize()`` before reading outputs (the same
-            # contract the Metal lazy mode uses). Saves ~70 μs per
-            # launch on the steady-state cmd_buf-cache hit, which
-            # dominates the per-frame cost on dispatch-bound stacks
-            # like Waypoint forward (24 layers × ~10 ops/layer ×
-            # 5 sigmas = ~1200 launches/frame).
-            spv_sync = sync and not _LAZY.get()
-            return self._launch_spv(buffers, scalars, sync=spv_sync)
-
+        # Hoist driver-family detection to a one-shot resolution
+        # cached on ``self``. Per-call ``hasattr`` + attribute access
+        # + ``is`` comparisons add ~1-2μs/call; on Waypoint forward
+        # (~1500 launches/frame) that's a few ms of pure dispatch
+        # overhead the lazy-mode decomposition exposed.
+        kind = self._dispatch_kind
+        if kind == "ocl":
+            return self._launch_ocl(buffers, scalars, sync=sync)
+        if kind == "metal":
+            return self._launch_metal(buffers, scalars,
+                                      persistent_outs=persistent_outs)
         return self._launch_cuda(buffers, scalars, stream)
+
+    @property
+    def _dispatch_kind(self) -> str:
+        """Resolve ``driver.family`` to a small string tag once.
+
+        Cached on ``self`` so the per-call ``launch`` dispatch becomes
+        a single ``str ==`` comparison instead of ``hasattr`` + module
+        import + two ``is`` checks. Strings are tagged ``"ocl"`` /
+        ``"metal"`` / ``"cuda"`` (default).
+        """
+        kind = getattr(self, "_dispatch_kind_cache", None)
+        if kind is not None:
+            return kind
+        from quark.device import DeviceFamily  # noqa: PLC0415
+
+        family = getattr(self.driver, "family", None)
+        if family is DeviceFamily.METAL:
+            kind = "metal"
+        elif family is DeviceFamily.INTEL_GPU:
+            kind = "ocl"
+        else:
+            kind = "cuda"
+        self._dispatch_kind_cache = kind
+        return kind
 
     def _launch_cuda(self, buffers, scalars, stream) -> None:
         """CUDA launch path — pointer-based, writes in place.
@@ -507,144 +523,61 @@ class CompiledKernel:
             self.driver.sync(None)
         return results
 
-    def _launch_spv(self, buffers: list, scalars: tuple, *, sync: bool = True) -> None:
-        """SPIR-V / Vulkan launch path.
+    def _launch_ocl(self, buffers: list, scalars: tuple, *, sync: bool = True) -> None:
+        """OCL launch path — extracts USM handles from ``QuarkTensor``
+        operands and calls the OCL driver's ``launch`` with the
+        kernel handle + grid + buffer-handle list.
 
-        Hot-path fast-cache: when the buffer-tuple identity (and the
-        empty-scalar case) match the previous call, skip the entire
-        per-buffer iteration / pack_scalars / grid_fn / driver-wrap
-        round-trip and call ``_sd.launch`` directly with the cached
-        ``(grid, handles, push_bytes)``. Drops the per-call Python
-        cost from ~200 μs to ~30 μs on Battlemage; on a Waypoint
-        forward (~1200 launches/frame) that's ~200 ms / frame off
-        the wall — most of the ``compiled.launch`` overhead the
-        decomposition under ``quark.lazy()`` exposed.
-
-        Cache key intentionally uses ``id()`` of the buffer list
-        plus the lengths of the resolved handles. Mutating the
-        buffers list itself (rare) or rebinding to a different list
-        misses the cache; the slow path then refills it.
-
-        Per-buffer policy on the slow path: ``int`` handle,
-        ``(handle, mapped_ptr)`` tuple, ``QuarkTensor`` with SPV
-        storage, or ``numpy.ndarray`` (copied into a fresh Vulkan
-        buffer per call — production code should pin tensors via
-        QuarkTensor instead).
+        Per-buffer policy: ``QuarkTensor`` with OCL storage (production
+        hot path), ``int`` raw handle, or ``numpy.ndarray`` (slow
+        fallback — copied into a fresh USM buffer per call).
         """
-        from quark.drivers import _spv_dispatch as _sd
-
-        # Fast path: resolve buffers → handle-tuple, then check cache
-        # keyed on (id-tuple-of-buffers, len(scalars)). The functional
-        # dispatch layer rebuilds the buffer list each call but the
-        # buffer OBJECTS (QuarkTensor instances bound to module
-        # parameters / persistent state) are stable, so id-tuple
-        # matches across calls. ``spv_handle`` lookup is fast (one
-        # isinstance + attribute access on _SpvStorage).
-        import numpy as np
-        from quark.runtime.tensor import QuarkTensor
-
-        # Build the id-tuple in a tight loop — avoids constructing
-        # the full handle list when the cache hits.
-        n = len(buffers)
-        id_key = tuple(id(b) for b in buffers)
-        cache = getattr(self, "_spv_fast_cache", None)
-        if (
-            cache is not None
-            and not scalars
-            and cache[0] == id_key
-        ):
-            _sd.launch(self.module.handle, cache[1], cache[2], cache[3], sync=sync)
-            return
+        from quark.runtime.tensor import QuarkTensor  # noqa: PLC0415
 
         handles: list[int] = []
-        for buf in buffers:
-            if isinstance(buf, int):
-                handles.append(buf)
-            elif isinstance(buf, QuarkTensor):
-                h = buf.spv_handle
+        for i, (buf, pspec) in enumerate(
+            zip(buffers, self.param_spec.buffers, strict=False)
+        ):
+            if isinstance(buf, QuarkTensor):
+                h = buf.ocl_handle
                 if h is None:
                     raise TypeError(
-                        f"_launch_spv: QuarkTensor uses non-SPV storage "
-                        f"({type(buf._storage).__name__}); set QUARK_BACKEND="
-                        "spv before allocating tensors that feed SPV launches."
+                        f"_launch_ocl: buffer {i} ({pspec.name!r}) is a "
+                        f"QuarkTensor with non-OCL storage "
+                        f"({type(buf._storage).__name__}). Set "
+                        f"``QUARK_BACKEND=ocl`` before allocating tensors "
+                        f"that feed OCL launches."
                     )
                 handles.append(h)
+            elif isinstance(buf, int):
+                handles.append(buf)
             elif isinstance(buf, tuple) and len(buf) == 2 and isinstance(buf[0], int):
                 handles.append(buf[0])
-            elif isinstance(buf, np.ndarray):
-                arr = np.ascontiguousarray(buf)
-                h, ptr = _sd.allocate_buffer(arr.nbytes)
-                import ctypes
-                ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
-                handles.append(h)
             else:
-                raise TypeError(
-                    f"_launch_spv: buffer is {type(buf).__name__}; expected "
-                    "int handle / (handle, ptr) / numpy.ndarray / QuarkTensor."
-                )
+                import numpy as _np  # noqa: PLC0415
+                if isinstance(buf, _np.ndarray):
+                    import ctypes  # noqa: PLC0415
+                    arr = _np.ascontiguousarray(buf)
+                    h, ptr = self.driver.allocate_buffer(arr.nbytes)
+                    ctypes.memmove(ptr, arr.ctypes.data, arr.nbytes)
+                    handles.append(h)
+                else:
+                    raise TypeError(
+                        f"_launch_ocl: buffer {i} is {type(buf).__name__}; "
+                        "expected QuarkTensor / int handle / "
+                        "(handle, ptr) / numpy.ndarray."
+                    )
 
+        push_bytes = b""
         if scalars:
-            scalar_blobs = self.param_spec.pack_scalars(tuple(scalars))
-            push_bytes = b"".join(scalar_blobs)
-        else:
-            push_bytes = b""
+            # Pack scalars into push bytes for OCL's push-constant slot.
+            push_bytes = b"".join(self.param_spec.pack_scalars(tuple(scalars)))
 
         grid = self.grid_fn(*self.grid_args)
-
-        # Cache resolved tuple keyed on the id-tuple. Non-empty
-        # scalars skip caching (push_bytes varies).
-        if not scalars:
-            self._spv_fast_cache = (id_key, grid, handles, push_bytes)
-
-        # The driver's launch signature wants the SpvCompiledModule
-        # dataclass (with the pipeline handle + n_buffers + push
-        # validation), the workgroup grid, the buffer-handle list,
-        # and the push-constant bytes.
         self.driver.launch(
-            self.module,
-            grid=grid,
-            buffer_handles=handles,
-            push_bytes=push_bytes,
-            sync=sync,
+            self.module, grid=grid, buffers=handles,
+            push_bytes=push_bytes, sync=sync,
         )
-        return None
-
-    def launch_spv_fast(
-        self,
-        buffer_handles: list[int],
-        *,
-        push_bytes: bytes = b"",
-        sync: bool = True,
-    ) -> None:
-        """SPV fast path: skip the per-launch buffer-list dispatch and
-        scalar-pack work that ``launch()`` does. Caller provides the
-        already-resolved buffer-handle list (typically from
-        ``SpvDriver.allocate_buffer``) and the already-packed push-byte
-        payload — same arguments the C-side ``_sd.launch`` consumes.
-
-        Bench on Battlemage shows ``launch()`` (with its buffer-iter +
-        scalar-pack + grid_fn round-trip) costs ~70μs/call beyond the
-        ~24μs ``_sd.launch`` floor in the steady-state cmd_buf-cache
-        hit. Hot-path callers (functional wrappers, autotune-cache
-        warm loops) that already hold buffer handles can skip the
-        wrapper and land at the same overhead floor as the bench.
-
-        ``sync=False`` parallels ``launch()``'s knob — caller takes
-        responsibility for ``driver.sync()`` before reading outputs.
-
-        Returns ``None`` (output buffers are written in place via the
-        provided handle list, mirroring the CUDA path).
-        """
-        from quark.drivers import _spv_dispatch as _sd
-
-        _sd.launch(
-            self.module.handle,
-            self.grid_fn(*self.grid_args),
-            list(buffer_handles),
-            push_bytes,
-            sync=sync,
-        )
-        return None
 
     def launch_metal_fast(
         self,
@@ -690,23 +623,17 @@ def _driver_for(family: DeviceFamily):
 
         return MetalDriver
     if family is DeviceFamily.INTEL_GPU:
-        from quark.drivers.spv import SpvDriver
+        # OpenCL / IGC backend — the production Intel iGPU path.
+        from quark.drivers.ocl import OclDriver
 
-        # SpvDriver doesn't take a ``device=`` kwarg the way Cuda /
-        # MetalDriver do — it picks the default Vulkan device via
-        # ``pick_default_device`` unless ``device_index`` is passed.
-        # Adapt with a small wrapper class that swallows the
-        # ``device=`` kwarg the launcher passes through.
-        class _SpvDriverAdapter(SpvDriver):
+        class _OclDriverAdapter(OclDriver):
             def __init__(self, *, device=None):
-                # ``device`` is the quark Device; we don't need it for
-                # SpvDriver (it picks the Vulkan device from the
-                # available ICDs). Stash for parity.
-                super().__init__()
+                idx = device.index if device is not None else 0
+                super().__init__(device_index=idx)
                 self._quark_device = device
                 self.family = DeviceFamily.INTEL_GPU
 
-        return _SpvDriverAdapter
+        return _OclDriverAdapter
     raise NotImplementedError(f"_driver_for: backend {family.value!r} not yet implemented")
 
 
@@ -809,20 +736,22 @@ class Launcher:
                 smem_bytes=lowered.smem_bytes,
             )
         elif self.device.family is DeviceFamily.INTEL_GPU:
-            # SPIR-V / Vulkan path. The lowerer emits SPIR-V text;
-            # ``text_to_binary`` shells out to ``spirv-as`` to get
-            # the binary blob the driver consumes. ``n_buffers`` /
-            # ``push_constants_size`` come from the lowered kernel
-            # metadata so SpvDriver.compile can validate at descriptor-
-            # set creation. See PORTABILITY_PLAN §3.1 / §3.2.
-            from quark.lower.spv import text_to_binary
-            spirv_binary = text_to_binary(lowered.source)
+            # OpenCL/IGC path. The OCL lowerer emits OpenCL-flavor
+            # SPIR-V text (Kernel entry point + Physical64 OpenCL
+            # memory model + CrossWorkgroup pointer args); ``spirv-as
+            # --target-env opencl2.0`` assembles it, and the driver
+            # then hands the binary to IGC via
+            # ``clCreateProgramWithIL``.
+            from quark.lower._common.spirv_assemble import text_to_binary
+            spirv_binary = text_to_binary(
+                lowered.source, target_env="opencl2.0"
+            )
             compiled_mod = self.driver.compile(
-                source=spirv_binary,
+                spirv=spirv_binary,
                 entry=lowered.entry_name,
                 n_buffers=lowered.n_buffers,
-                push_constants_size=lowered.push_constants_size,
-                smem_bytes=lowered.smem_bytes,
+                subgroup_size=lowered.subgroup_size,
+                local_size=lowered.local_size,
             )
         else:
             try:
@@ -879,7 +808,7 @@ class Launcher:
         which is in ``device.caps.matmul_shapes``.
 
         Also downgrades ``config.n_stages`` to 1 on devices without
-        ``supports_async_copy`` (today: Metal, SPV/Intel). The
+        ``supports_async_copy`` (today: Metal, Intel iGPU). The
         double-buffer scaffolding emits ``async_copy`` ops that the
         legalizer rewrites to sync loads on those devices, but the
         outer two-buffer + extra-barrier wrapping stays — strictly
@@ -952,6 +881,15 @@ class Launcher:
                 block = kernel.block()
                 if hasattr(lowerer, "_local_size"):
                     lowerer._local_size = block
+                # Phase 2: allow KernelConfig to opt into a non-32 SIMD
+                # width. Read from ``config.subgroup_size`` if set; the
+                # lowerer's slot-partition math threads through ctx,
+                # the driver pairs it with ``requiredSubgroupSize`` at
+                # pipeline create. None / unset → default 32.
+                cfg = getattr(kernel, "config", None)
+                cfg_sgs = getattr(cfg, "subgroup_size", None) if cfg else None
+                if cfg_sgs is not None and hasattr(lowerer, "_subgroup_width"):
+                    lowerer._subgroup_width = int(cfg_sgs)
             return lowerer.lower_module(ir_or_program)
         raise NotImplementedError(
             "Launcher._lower: legacy Program-based emit() not yet "

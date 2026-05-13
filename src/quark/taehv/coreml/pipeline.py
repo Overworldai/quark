@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 if TYPE_CHECKING:
-    from quark.taehv.coreml import CoreMLTAEHV
+    from quark.taehv.coreml.runtime import CoreMLTAEHV
 
 
 class PipelinedDecoder:

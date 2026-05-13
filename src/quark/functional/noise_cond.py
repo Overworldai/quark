@@ -65,13 +65,23 @@ def _precompute_cuda(sigmas, freqs_list, fourier_dim, n, W1, W2):
         fourier[i, : len(freqs_list)] = _SQRT2 * np.sin(phase)
         fourier[i, len(freqs_list) :] = _SQRT2 * np.cos(phase)
 
-    # Get weights as f32 numpy.
+    # Get weights as f32 numpy. Three carrier types reach here:
+    #   * QuarkTensor (CUDA / SPV) — has both ``astype`` and ``to_numpy``.
+    #   * Metal-tagged ndarray subclass (``_Tagged``) — has ``astype``
+    #     but no ``to_numpy``; bf16 is stored as uint16 bit pattern.
+    #   * Raw numpy / torch tensor — fall through to PyTorch's
+    #     ``.float().cpu()`` path.
     def _to_f32_np(t):
-        if hasattr(t, "astype"):
-            return (
-                t.astype("f32").to_numpy() if hasattr(t, "to_numpy") else np.array(t.float().cpu())
-            )
-        return np.array(t)
+        if hasattr(t, "astype") and hasattr(t, "to_numpy"):
+            return t.astype("f32").to_numpy()
+        if isinstance(t, np.ndarray):
+            # ``_Tagged`` ndarray for bf16 stores raw uint16 bits; expand
+            # to f32 by left-shifting into the high half of a uint32.
+            qd = getattr(t, "quark_dtype", None)
+            if qd == "bf16" or t.dtype == np.uint16:
+                return (t.astype(np.uint32) << 16).view(np.float32)
+            return t.astype(np.float32)
+        return np.array(t.float().cpu())
 
     w1 = _to_f32_np(W1)  # [d_mid, fourier_dim]
     w2 = _to_f32_np(W2)  # [d_model, d_mid]

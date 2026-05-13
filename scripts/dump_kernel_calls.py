@@ -149,11 +149,23 @@ def main() -> None:
     Launcher.compile = recording_compile  # type: ignore[method-assign]
     AutotuneCache.lookup_or_search = recording_lookup  # type: ignore[method-assign]
 
-    # Stub config load + path resolve so we don't need a real URI.
+    # Stub config load + path resolve at the source module so the
+    # patches work regardless of how the engine imports them (module
+    # level on Mac's new intel.py; lazy-inside-__init__ on the
+    # devkit's SPV-stub intel.py).
     import quark.engine.intel as _intel_mod
+    import quark.models.config as _cfg_mod
 
-    _intel_mod.load_yaml_config = lambda path: dict(_SMOKE_CFG)
-    _intel_mod._resolve_path = lambda uri, **kw: uri
+    _stub_load = lambda path: dict(_SMOKE_CFG)
+    _stub_resolve = lambda uri, **kw: uri
+    _cfg_mod.load_yaml_config = _stub_load
+    _cfg_mod._resolve_path = _stub_resolve
+    # Patch the engine-module bindings too (Mac's new intel.py
+    # imports them at module load and would otherwise miss).
+    if hasattr(_intel_mod, "load_yaml_config"):
+        _intel_mod.load_yaml_config = _stub_load
+    if hasattr(_intel_mod, "_resolve_path"):
+        _intel_mod._resolve_path = _stub_resolve
 
     # Build engine.
     print("→ constructing EngineIntel ...", flush=True)

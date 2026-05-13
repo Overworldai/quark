@@ -819,12 +819,35 @@ class ForLoopOp(Op):
     operands: (lo, hi, step, *carried_in)
     regions:  (body,)
     results:  one per carried_in, matching yielded values from body
-    attrs:    iv_name (str), iv_dtype (DType)
+    attrs:    iv_name (str), iv_dtype (DType), unroll (bool, default False)
 
     The induction variable and the per-iteration "body carry" Values
     are Values defined by this op and visible only inside `body`.
     `carried_body_vars[i]` is the Value the body sees as the incoming
     value of the i-th carried slot.
+
+    The ``unroll`` attr is a hint to the backend. When True:
+    - PTX / Metal / NAX backends Python-unroll the body at lower time,
+      substituting ``induction_var`` with a fresh ConstOp per iter.
+      Produces the same instruction stream as today's Python-unrolled
+      emit, with the bounds expressed at IR-level instead of baked
+      into Python. Requires lo/hi/step to be statically resolvable
+      at lower time (ConstOp / BlockDimOp / ArithOp on those); the
+      lowerer raises NotImplementedError otherwise.
+    - SPV / OCL backends emit ``OpLoopMerge ... Unroll`` (the SPIR-V
+      LoopControl::Unroll bit). spirv-opt + downstream compilers
+      (IGC on Intel) honor it. Bounds can be runtime — the unroll
+      decision is made by the downstream compiler.
+
+    Motivation: lets the kernel cohort emit SG-agnostic copy loops
+    (``for_loop(0, total / block_dim_x(), 1, unroll=True)``) where
+    ``block_dim_x()`` resolves to a different constant per backend
+    (32 for PTX / Vulkan-SPV, 16 for OCL/IGC). Without ``unroll``,
+    today's Python ``for i in range(N)`` bakes a specific SG into
+    the IR via the loop bound; with ``unroll``, the IR carries the
+    semantic quantity (``total / block_dim_x``) and the backend
+    resolves it. See memory/project_openvino_taehv.md "Phase 3 step
+    (16)" for the OCL/Intel-MMA case that motivates this.
     """
 
     KIND: ClassVar[str] = "for_loop"

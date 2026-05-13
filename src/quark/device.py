@@ -37,11 +37,10 @@ class DeviceFamily(Enum):
     ROCM = "rocm"
     OPENCL = "opencl"
     METAL = "metal"
-    # Intel GPUs (Arc discrete + Xe integrated). Distinct from OPENCL
-    # because the target IR is SPIR-V compute shaders driven via
-    # Vulkan / Level Zero, not CL's SPIR-V flavor — the driver picks,
-    # the register table keys on this family. See
-    # PORTABILITY_PLAN.md §3.
+    # Intel GPUs (Arc discrete + Xe integrated) reached via OpenCL +
+    # IGC. The lowerer emits OpenCL-flavor SPIR-V; the driver compiles
+    # via ``clCreateProgramWithIL``. See the OCL backend under
+    # ``quark.lower.ocl``.
     INTEL_GPU = "intel_gpu"
     CPU = "cpu"
 
@@ -394,12 +393,12 @@ def _detect_family() -> DeviceFamily:
     Detection order (first match wins):
       1. CUDA      (libcuda probe finds a device)
       2. Metal     (metal-cpp driver detects a device)
-      3. INTEL_GPU (Vulkan / SPV probe finds a device — Linux iGPU)
+      3. INTEL_GPU (OpenCL probe finds an Intel device — Linux iGPU/Arc)
       4. CPU       (always available as a fallback)
 
-    Intel SPV is below CUDA in the auto-detect order so a CUDA box
-    with both libcuda and Vulkan available stays on CUDA. Force
-    via ``QUARK_FORCE_BACKEND=intel_gpu`` to override on dual-driver
+    Intel is below CUDA in the auto-detect order so a CUDA box with
+    both libcuda and OpenCL available stays on CUDA. Force via
+    ``QUARK_FORCE_BACKEND=intel_gpu`` to override on dual-driver
     machines (or any other family).
 
     ROCm / OpenCL aren't auto-detected; force via ``QUARK_FORCE_BACKEND``
@@ -424,9 +423,9 @@ def _detect_family() -> DeviceFamily:
     except Exception:
         pass
     try:
-        from quark.drivers import spv as _spv_drivers
+        from quark.drivers import ocl as _ocl_drivers
 
-        if _spv_drivers.is_available():
+        if _ocl_drivers.is_available():
             return DeviceFamily.INTEL_GPU
     except Exception:
         pass
@@ -452,11 +451,11 @@ def current_device() -> Device:
     if family is DeviceFamily.METAL:
         return _probe_metal(index=0)
     if family is DeviceFamily.INTEL_GPU:
-        # SpvDriver.__init__ runs ``ensure_device`` and populates a
-        # full DeviceCaps via ``_spv_dispatch.probe`` — reuse it.
-        from quark.drivers import spv as _spv_drivers
+        # OclDriver.__post_init__ binds the device and populates
+        # DeviceCaps from the OpenCL probe — reuse it.
+        from quark.drivers.ocl import OclDriver
 
-        return _spv_drivers.SpvDriver().device
+        return OclDriver(device_index=0).device
     raise NotImplementedError(
         f"current_device(): family {family.value!r} not yet implemented. "
         f"Set {_FORCE_BACKEND_ENV}=cuda or {_FORCE_BACKEND_ENV}=metal."

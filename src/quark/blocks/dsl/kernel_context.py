@@ -27,10 +27,21 @@ class KernelContext:
     directly.
     """
 
-    def __init__(self, name: str, *, mma_shapes: list | None = None, n_warps: int = 4):
+    def __init__(
+        self,
+        name: str,
+        *,
+        mma_shapes: list | None = None,
+        n_warps: int = 4,
+        subgroup_size: int = 32,
+    ):
         self._name = name
         self._mma_shapes = mma_shapes or []
         self._n_warps = n_warps
+        # SIMD width the kernel will be compiled at — 32 on the
+        # historical SIMD32-default path; 16 when the kernel's
+        # ``config.subgroup_size`` opted in (see KernelConfig docs).
+        self._subgroup_size = subgroup_size
         self._bld = Builder(f"{name}_module")
         for shape in self._mma_shapes:
             self._bld.register_shape(shape)
@@ -130,8 +141,10 @@ class KernelContext:
         """Total threads per block. Exposed for kernels that need the
         value before they call :meth:`make_ctx` (e.g. for sizing
         per-thread work quanta in smem allocation math).
+        Width-aware: scales with ``_subgroup_size`` (32 default, 16 on
+        the SIMD16 opt-in).
         """
-        return self._n_warps * 32
+        return self._n_warps * self._subgroup_size
 
     def make_ctx(self, mma_cfg: Any = None) -> BlockContext:
         """Create a BlockContext and publish it as the active ctx.
@@ -143,8 +156,9 @@ class KernelContext:
         """
         bctx = BlockContext(
             self._bld,
-            n_threads=self._n_warps * 32,
+            n_threads=self._n_warps * self._subgroup_size,
             mma_cfg=mma_cfg,
+            subgroup_size=self._subgroup_size,
         )
         self._bctx_token = _ACTIVE_BCTX.set(bctx)
         return bctx

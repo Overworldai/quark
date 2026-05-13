@@ -158,7 +158,8 @@ class OwlAttnKernel(Kernel):
         return (n_q_tiles, s.B * s.n_kv_heads, 1)
 
     def block(self) -> tuple[int, int, int]:
-        return ((self.spec.gqa_ratio * self.config.NCW) * 32, 1, 1)
+        sgs = self.config.subgroup_size or 32
+        return ((self.spec.gqa_ratio * self.config.NCW) * sgs, 1, 1)
 
     def flops(self) -> int:
         s = self.spec
@@ -331,6 +332,9 @@ class OwlAttnKernel(Kernel):
         NCW = c.NCW
         GQA = s.gqa_ratio
         NumWarps = GQA * NCW
+        # Effective SIMD width. ``c.subgroup_size`` is None on the
+        # historical SIMD32 path; ``or 32`` resolves the default.
+        sgs = c.subgroup_size or 32
         mma_cfg = self._mma_cfg()
         m_tile = mma_cfg.shape.m
         n_tile = mma_cfg.shape.n
@@ -353,7 +357,7 @@ class OwlAttnKernel(Kernel):
         # cos/sin tables removed — computed inline via emit_rope_cos_sin.
         g_sg, g_out = g.segments, g.output
 
-        n_threads = NumWarps * 32
+        n_threads = NumWarps * sgs
         tid = bctx.tid
 
         # Grid decomposition.
@@ -466,13 +470,13 @@ class OwlAttnKernel(Kernel):
         # binding. Equivalent to ``q_in_smem.warp_view(rows=warp_rows,
         # warp_id=warp_id)``.
         warp_smem_in = q_in_smem.view(dyn_offset=warp_dyn, shape=(warp_rows, Dh), name="Q_warp_in")
-        lane_id = tid % 32
-        # Q tile: per-warp cooperative cp.async. Warp-local 32-thread
-        # split; one line per lane per iteration.
+        lane_id = tid % bctx.c(sgs)
+        # Q tile: per-warp cooperative cp.async. Warp-local
+        # ``subgroup_size``-thread split; one line per lane per iteration.
         warp_smem_in.copy_from(
             g_q.tile(row=q_row_warp, col=q_col_base, shape=(warp_rows, Dh)),
             tid=lane_id,
-            n_threads=32,
+            n_threads=sgs,
             async_load=True,
         )
         # (cos/sin computed inline — no table load needed)
@@ -557,11 +561,17 @@ class OwlAttnKernel(Kernel):
         qk.barrier("block")
 
         # ── ldmatrix → Q register fragments ──
-        lane_off = bctx.gid * stride_elems + bctx.tig * mma_cfg.lane_col_step
-        warp_lane = q_smem.view(
-            dyn_offset=warp_dyn + lane_off,
-            shape=(warp_rows, Dh),
-            name="Q_warp_lane",
+        # ``warp_lane_view`` sets BOTH ``dyn_offset`` (PTX ldmatrix's
+        # per-lane address) AND ``warp_dyn_offset`` (the SIMD-uniform
+        # base that the OCL cooperative-matrix load and Metal's
+        # ``simdgroup_load`` consume). Plain ``view(dyn_offset=...)``
+        # leaves ``warp_dyn_offset=None``, which on Intel makes every
+        # warp load from row 0 of q_smem — paired Q heads (gqa_idx=0
+        # / gqa_idx=1) produce byte-identical output.
+        warp_lane = q_smem.warp_lane_view(
+            warp_rows,
+            warp_id=warp_id,
+            lane_col_step=mma_cfg.lane_col_step,
         )
         KK_STEPS = Dh // mma_cfg.mma_k
         q_frags: list[list] = []
@@ -640,13 +650,13 @@ class OwlAttnKernel(Kernel):
 
         # Row classes per m-tile:
         #   - PTX m16n8 → 2 (dr ∈ {0, 8}); m8n8k8 → 1 (dr ∈ {0})
-        #   - Intel SPV → ``shape.m`` (full per-row, since cd_offsets is
-        #     ``((0, 0),) * c_regs`` placeholder; the SPV lowerer derives
-        #     row from the smem layout per-slot — see ``online_softmax_
-        #     block`` ``is_intel_spv``).
-        is_intel_spv = "_intel_" in mma_cfg.shape_id
+        #   - Intel → ``shape.m`` (full per-row, since cd_offsets is
+        #     ``((0, 0),) * c_regs`` placeholder; the OCL lowerer
+        #     derives row from the smem layout per-slot — see
+        #     ``online_softmax_block`` ``is_intel``).
+        is_intel = "_intel_" in mma_cfg.shape_id
         n_rc = (
-            mma_cfg.shape.m if is_intel_spv
+            mma_cfg.shape.m if is_intel
             else len({dr for dr, _ in mma_cfg.cd_offsets})
         )
         n_ml = MTiles * n_rc
@@ -695,7 +705,7 @@ class OwlAttnKernel(Kernel):
             KvTile_u=KvTile_u,
             zero_u=zero_u,
             N_TOTAL=N_TOTAL,
-            n_threads_per_cta=NumWarps * 32,
+            n_threads_per_cta=NumWarps * sgs,
         )
 
         def produce(ictx: IterCtx) -> None:

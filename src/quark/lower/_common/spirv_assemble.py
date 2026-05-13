@@ -1,7 +1,7 @@
 """Text → binary SPIR-V via the ``spirv-as`` CLI.
 
-The lowerer emits SPIR-V text (``.spvasm``); the dispatch path
-(``drivers/spv.py: SpvDriver.compile``) wants binary words. This
+The OCL lowerer emits SPIR-V text (``.spvasm``); the driver
+(``drivers/ocl.py: OclDriver.compile``) wants binary words. This
 module bridges them.
 
 External tool: ``spirv-as`` (Khronos SPIR-V Tools). Installed via
@@ -12,7 +12,6 @@ https://github.com/KhronosGroup/SPIRV-Tools .
 Direct binary emission (no external tool) is the eventual cleaner
 shape; this shell-out is the prototype path that lets us iterate on
 the visitor set without first writing a full SPIR-V binary builder.
-See PORTABILITY_PLAN §3.2's "SPIR-V emission shape" decision.
 """
 
 from __future__ import annotations

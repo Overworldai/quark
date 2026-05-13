@@ -105,7 +105,16 @@ class KernelSpec:
 
 @dataclass(frozen=True)
 class KernelConfig:
-    """Tunable parameters. Subclasses add concrete fields."""
+    """Tunable parameters. Subclasses add concrete fields.
+
+    ``subgroup_size`` (Intel iGPU only) opts the kernel into a
+    specific SIMD width at pipeline-create time. ``None`` keeps the
+    driver default (32 on Battlemage). Set to 16 to opt a kernel into
+    SIMD16 — better VE utilisation + 2× per-work-item GRF budget.
+    Ignored on Metal / CUDA paths.
+    """
+
+    subgroup_size: int | None = None
 
     @classmethod
     def default_for(cls, spec) -> KernelConfig:
@@ -368,11 +377,22 @@ class Kernel(ABC):
         # the post-aliasing total from the emitted IR. Replaces the
         # old ``kernel.smem_estimate()`` predict-then-verify dance —
         # the layout pass is the single source of truth.
+        #
+        # Backend-aware aliasing: Metal / CUDA emitters apply the
+        # aliasing plan (overlap disjoint-lifetime regions in the
+        # same byte slot), so the aliased total matches what they
+        # allocate. The OCL emitter today gives every SmemAllocOp
+        # its own ``OpVariable Workgroup`` — no aliasing — so we must
+        # check against the un-aliased total or we accept configs
+        # that fit on Metal / CUDA but bust Intel's 48KB smem cap
+        # at runtime.
         try:
-            from quark.lower.smem_layout import compute_smem_layout
+            from quark.device import DeviceFamily  # noqa: PLC0415
+            from quark.lower.smem_layout import compute_smem_layout  # noqa: PLC0415
 
             fn = module.functions[0]
-            plan = compute_smem_layout(fn, enable_aliasing=True)
+            alias = getattr(caps, "family", None) is not DeviceFamily.INTEL_GPU
+            plan = compute_smem_layout(fn, enable_aliasing=alias)
             if plan.total_bytes > caps.max_smem_per_block:
                 return False
         except Exception:
@@ -709,16 +729,24 @@ class Kernel(ABC):
     # them in the base.
 
     def block(self) -> tuple[int, int, int]:
-        """Default: ``(n_warps * 32, 1, 1)`` — single-row block from
-        ``config.n_warps``. Kernels with a computed warp count
-        (attn/owl_attn use ``gqa_ratio * NCW``) override."""
+        """Default: ``(n_warps * subgroup_size, 1, 1)`` — single-row block
+        from ``config.n_warps``. Kernels with a computed warp count
+        (attn/owl_attn use ``gqa_ratio * NCW``) override.
+
+        ``subgroup_size`` is the *resolved* SIMD width: ``config.subgroup_size``
+        if explicitly set (opt-in on Intel), else 32 (historical default).
+        Sizing block in subgroup-size units guarantees ``num_subgroups_per_WG ==
+        n_warps`` regardless of width, which the per-warp slot-partition math
+        depends on (``warp_id = qk.subgroup_id()`` must range 0..n_warps-1).
+        """
         n_warps = getattr(self.config, "n_warps", None)
         if n_warps is None:
             raise NotImplementedError(
                 f"{type(self).__name__}.block() must be implemented or config "
                 f"must have an n_warps field"
             )
-        return (n_warps * 32, 1, 1)
+        sgs = getattr(self.config, "subgroup_size", None) or 32
+        return (n_warps * sgs, 1, 1)
 
     def entry_name(self) -> str:
         """Symbol name for the compiled kernel. Defaults to the

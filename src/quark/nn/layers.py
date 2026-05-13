@@ -21,8 +21,11 @@ from quark.nn.module import (
 import os as _os
 
 _IS_METAL = sys.platform == "darwin"
-_IS_SPV = _os.environ.get("QUARK_BACKEND", "").lower() in ("spv", "intel")
-_IS_HOST_COHERENT = _IS_METAL or _IS_SPV  # mapped device pointers — memmove works in place
+# Use the runtime's auto-detect (OpenCL availability + env override),
+# not just the env var — scripts that rely on auto-detect won't have
+# ``QUARK_BACKEND`` set but still run on Intel.
+from quark.runtime.sync import _IS_OCL  # noqa: E402
+_IS_HOST_COHERENT = _IS_METAL or _IS_OCL  # mapped device pointers — memmove works in place
 
 
 def _quark_dtype(t) -> str:
@@ -78,15 +81,15 @@ def _tag_carrier(arr, dtype: str):
 
 
 def _set_s32(t, value: int) -> None:
-    """Write a single-element s32 tensor to ``value`` (Metal- + SPV-aware)."""
+    """Write a single-element s32 tensor to ``value`` (Metal- + OCL-aware)."""
     if _IS_HOST_COHERENT:
         # Mapped pointer — write directly via ctypes. Metal pool
-        # buffers and Vulkan ``HOST_VISIBLE | HOST_COHERENT`` memory
-        # both expose the device pointer as a host-writable address.
+        # buffers and OCL USM-shared memory both expose the device
+        # pointer as a host-writable address.
         import ctypes
 
         bits = (int(value) & 0xFFFFFFFF).to_bytes(4, "little")
-        if hasattr(t, "metal_handle") or hasattr(t, "spv_handle") or hasattr(t, "data_ptr"):
+        if hasattr(t, "metal_handle") or hasattr(t, "ocl_handle") or hasattr(t, "data_ptr"):
             ctypes.memmove(t.data_ptr(), bits, 4)
         else:
             # Plain numpy carrier — overwrite in place.
@@ -941,11 +944,12 @@ class KVCacheUpdate(Module):
         from quark.runtime.tensor import QuarkTensor
 
         if isinstance(self.frame_t, QuarkTensor):
-            if _IS_METAL:
-                # Metal pool buffer is host-shared; serialize with any
-                # pending kernel writes, then memmove the s32 pattern.
-                # ``CudaRuntime`` is unavailable on macOS — routing
-                # through it would raise CudaError(LIBRARY_NOT_FOUND).
+            from quark.runtime.sync import _IS_OCL
+
+            if _IS_METAL or _IS_OCL:
+                # Host-coherent (Metal pool / OCL USM-shared) backing —
+                # serialize with any pending kernel writes, then memmove
+                # the s32 pattern. ``CudaRuntime`` is unavailable here.
                 import ctypes
 
                 from quark.runtime.sync import synchronize

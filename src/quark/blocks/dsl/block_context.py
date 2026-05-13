@@ -27,9 +27,19 @@ class BlockContext:
     and cached — no redundant IR ops.
     """
 
-    def __init__(self, bld: Builder, n_threads: int, mma_cfg: MmaConfig | None = None):
+    def __init__(
+        self,
+        bld: Builder,
+        n_threads: int,
+        mma_cfg: MmaConfig | None = None,
+        subgroup_size: int = 32,
+    ):
         self.bld = bld
         self.n_threads = n_threads
+        # SIMD width — historically 32 (Battlemage default); 16 when
+        # kernel's config opted in. Per-warp epilogue and lane-id
+        # arithmetic read this rather than hardcoded 32.
+        self.subgroup_size = subgroup_size
         self.mma_cfg: MmaConfig = cast("MmaConfig", mma_cfg)
         self._tid: Value | None = None
         self._gid: Value | None = None

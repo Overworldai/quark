@@ -210,8 +210,12 @@ def test_global_tensor_subscript_load():
 
 
 def test_copy_from_emits_loads_and_stores():
-    """Unified tile-load wraps ``emit_tile_load`` — emits per-thread
-    scalar loads + stores for the scalar path."""
+    """Unified tile-load wraps ``emit_tile_load`` — emits a single
+    ``ForLoopOp(unroll=True)`` whose body contains one load + one
+    store per iteration. Backends Python-unroll (CUDA/Metal) or emit
+    OpLoopMerge Unroll (SPV/OCL) to recover the original N×(load+store)
+    behavior."""
+    from quark.ir.op import ForLoopOp as _For
     from quark.ir.op import LoadOp as _Load
     from quark.ir.op import StoreOp as _Store
 
@@ -221,11 +225,16 @@ def test_copy_from_emits_loads_and_stores():
     g_tile = g_x.tile(row=0, col=0, shape=(16, 16))
     tid = b.const(DType.U32, 0)
     A.copy_from(g_tile, tid=tid, n_threads=32, async_load=False)
-    # Scalar path emits 256/32 = 8 loads and 8 stores per thread.
-    loads = [op for op in b.current_region.ops if isinstance(op, _Load)]
-    stores = [op for op in b.current_region.ops if isinstance(op, _Store)]
-    assert len(loads) == 8
-    assert len(stores) == 8
+    # Scalar path now emits one for_loop with unroll=True covering
+    # 256/32 = 8 iterations; each iter does 1 load + 1 store.
+    for_loops = [op for op in b.current_region.ops if isinstance(op, _For)]
+    assert len(for_loops) == 1
+    assert for_loops[0].attrs.get("unroll") is True
+    body_ops = for_loops[0].body.ops
+    loads = [op for op in body_ops if isinstance(op, _Load)]
+    stores = [op for op in body_ops if isinstance(op, _Store)]
+    assert len(loads) == 1
+    assert len(stores) == 1
 
 
 def test_copy_from_rejects_3d_region():
@@ -241,6 +250,7 @@ def test_copy_from_rejects_3d_region():
 def test_copy_from_respects_stage_view():
     """``region.stage(i).copy_from(gmem_tile)`` is the pipeline-stage
     tile-load pattern."""
+    from quark.ir.op import ForLoopOp as _For
     from quark.ir.op import StoreOp as _Store
 
     b = _builder()
@@ -249,5 +259,10 @@ def test_copy_from_respects_stage_view():
     g_tile = g_x.tile(row=0, col=0, shape=(16, 16))
     tid = b.const(DType.U32, 0)
     A3.stage(0).copy_from(g_tile, tid=tid, n_threads=32, async_load=False)
-    stores = [op for op in b.current_region.ops if isinstance(op, _Store)]
-    assert len(stores) == 8
+    # Migrated to ForLoopOp(unroll=True): one for_loop with 8 iters
+    # producing 1 store per iter.
+    for_loops = [op for op in b.current_region.ops if isinstance(op, _For)]
+    assert len(for_loops) == 1
+    assert for_loops[0].attrs.get("unroll") is True
+    stores = [op for op in for_loops[0].body.ops if isinstance(op, _Store)]
+    assert len(stores) == 1

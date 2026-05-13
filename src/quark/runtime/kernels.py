@@ -36,15 +36,17 @@ def _dev_memcpy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
     """Backend-neutral device→device byte copy.
 
     On CUDA: routes through ``CudaRuntime.memcpy_dtod`` (async, stream 0).
-    On Metal: the buffer pool is host-shared, so ``ctypes.memmove`` after
-    a queue drain is the equivalent. The drain (``synchronize``) flushes
-    any pending ``queue_launch`` writes into the source buffer before
-    we copy from it; without it a recently-produced buffer would race
-    the host read.
+    On Metal / OCL: the buffer pool is host-coherent, so ``ctypes.memmove``
+    after a queue drain is the equivalent. The drain (``synchronize``)
+    flushes any pending GPU writes into the source buffer before we copy
+    from it; without it a recently-produced buffer would race the host
+    read.
     """
     if nbytes == 0:
         return
-    if _IS_METAL:
+    from quark.runtime.sync import _IS_OCL
+
+    if _IS_METAL or _IS_OCL:
         from quark.runtime.sync import synchronize
 
         synchronize()
@@ -523,7 +525,9 @@ def fill_scalar(t: QuarkTensor, value: float) -> None:
     if value == 0.0 and t.is_contiguous():
         n = t.numel()
         elem = PC_BYTES[t.dtype]
-        if _IS_METAL:
+        from quark.runtime.sync import _IS_OCL
+
+        if _IS_METAL or _IS_OCL:
             from quark.runtime.sync import synchronize
 
             synchronize()
@@ -722,10 +726,12 @@ def _fill_tensor(n: int, value: float, dtype: str) -> QuarkTensor:
     else:
         elem_w, pattern = 1, int(value) & 0xFF
 
-    if _IS_METAL:
-        # Metal pool buffers are host-shared; build the repeated
-        # pattern in a staging array and memmove. Sync first to
-        # serialize with any pending kernel writes that targeted
+    from quark.runtime.sync import _IS_OCL
+
+    if _IS_METAL or _IS_OCL:
+        # Metal / OCL pool buffers are host-coherent; build the
+        # repeated pattern in a staging array and memmove. Sync first
+        # to serialize with any pending kernel writes that targeted
         # this buffer.
         from quark.runtime.sync import synchronize
 

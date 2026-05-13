@@ -20,7 +20,7 @@ See QUARK_IR_PROPOSAL.md §9–§10.
 from quark.lower import legalizations as _legalizations  # noqa: F401
 from quark.lower import msl as _msl  # noqa: F401 — registration side-effect
 from quark.lower import ptx as _ptx  # noqa: F401 — registration side-effect
-from quark.lower import spv as _spv  # noqa: F401 — SPIR-V stub registration
+from quark.lower import ocl as _ocl  # noqa: F401 — registration side-effect (Intel iGPU)
 from quark.lower.base import LOWERERS, Lowerer, get_lowerer, register_lowerer
 
 __all__ = [

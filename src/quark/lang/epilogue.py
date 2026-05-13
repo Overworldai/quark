@@ -466,7 +466,10 @@ def _auto_alloc_staging(
     m_stride = cfg.shape.m
     n_stride = cfg.shape.n
     warp_rows = acc.MT * m_stride
-    n_warps = bctx.n_threads // 32
+    # SIMD-width-aware warp count. ``bctx.subgroup_size`` is 32 by
+    # default and 16 on the SIMD16 opt-in path. n_threads scales with
+    # the same subgroup_size (see KernelContext.make_ctx).
+    n_warps = bctx.n_threads // bctx.subgroup_size
     Dh_or_BN = acc.NT * n_stride
     rows = n_warps * warp_rows if per_warp else warp_rows
     return smem_alloc(
@@ -733,15 +736,17 @@ def _emit_staged_store(
 
     # Step 2: cooperative v4.b32 vectorized store from smem → gmem.
     # Block-wide path uses bctx.tid / n_threads. Per-warp path uses
-    # the warp's 32 lanes — each warp writes its own warp_rows slice
-    # to a per-warp gmem row range supplied via row_base.
+    # the warp's lanes — each warp writes its own warp_rows slice
+    # to a per-warp gmem row range supplied via row_base. SIMD width
+    # comes from ``bctx.subgroup_size`` (32 by default, 16 for kernels
+    # that opted into SIMD16 via ``KernelConfig.subgroup_size``).
     BM = MT * m_stride
     smem_cols = stage_view.shape[1]
     b32_per_row = smem_cols // 2
     total_b32 = BM * b32_per_row
     if per_warp:
-        n_lanes = 32
-        thread_idx = bctx.tid % 32
+        n_lanes = bctx.subgroup_size
+        thread_idx = bctx.tid % bctx.c(bctx.subgroup_size)
     else:
         n_lanes = bctx.n_threads
         thread_idx = bctx.tid

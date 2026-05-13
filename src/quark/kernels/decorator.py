@@ -174,7 +174,9 @@ def kernel(
                 n_warps = self._n_warps()
             else:
                 n_warps = getattr(self.config, "n_warps", 4)
-            ctx = KernelContext(self.NAME, n_warps=n_warps)
+            # SIMD width opt-in (SPV / Intel). ``None`` → 32 (default).
+            sgs = getattr(self.config, "subgroup_size", None) or 32
+            ctx = KernelContext(self.NAME, n_warps=n_warps, subgroup_size=sgs)
             self.ctx = ctx
             self.bld = ctx.bld
             # Walk the manifest once. Every tensor is available as
