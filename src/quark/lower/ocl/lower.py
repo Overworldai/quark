@@ -2392,33 +2392,176 @@ def _visit_frag_reduce(op: FragReduceOp, ctx: _OclCtx) -> None:
 
 
 def _visit_frag_convert(op: FragConvertOp, ctx: _OclCtx) -> None:
-    """``FragConvertOp`` — merge N source ACCs into a single A
-    fragment with optional dtype conversion.
+    """``FragConvertOp`` — convert N source ACC frags to one A frag
+    with dtype change.
 
-    **Architectural mismatch with Intel SG=16 MMA.** The Vulkan KHR
-    coopmat type supports arbitrarily wide A fragments (K_dst =
-    num_src * src_cols can be 32, 64, etc.). Intel's
-    ``OpSubgroupMatrixMultiplyAccumulateINTEL`` at SG=16 has K
-    fixed at 16 per call — there is no v8i16-with-K=64 form. To
-    merge N ACCs into "a wider A", you'd need to issue N separate
-    MMA calls each consuming K=16 of the wider operand. That's
-    an IR-level rewrite (split the FragConvert + downstream MMA
-    chain into per-K-tile MMAs), not a backend visitor change.
+    For Intel ``m8n16k16_intel_bf16_*`` with ``num_src_frags=1`` (the
+    online-softmax P-fragment path on Waypoint DiT), nk_per_kstep =
+    shape_k / shape_n = 16/16 = 1 — no K-widening. Per-lane mapping:
 
-    Until the IR rewrite lands, attention-cohort kernels that use
-    FragConvertOp won't compile through the OCL backend. The
-    elementwise / pointwise / GEMM-cohort kernels don't use it.
+      * Source ACC: ``v8 f32`` — lane L holds column n=L, rows m=0..7.
+      * Dest A frag: ``v8 u16`` (bf16 carrier) — lane L holds column
+        k=L, rows m=0..7. Identical layout (n_of_P == k_of_A; m == m).
+
+    So we extract each of 8 ACC elements, optionally run the body
+    (e.g. ``exp2((x - m_rc) * log2e)``), convert f32→bf16 via
+    ``OpFConvert``, then ``OpCompositeConstruct`` the v8u16 vector.
+
+    The IR registers the result Value as ``B32 width=a_regs`` (CUDA
+    carrier convention), but the MMA visitor passes the SPIR-V ID
+    verbatim — so what matters is the *actual emitted type* of the
+    SSA the MMA consumes. We emit v<a_w>u16 (a_w = layout's per-lane
+    A width), bound to ``ctx.val_to_id[out.id]``; the MMA reads it as
+    the IGC-required ``v8u16`` regardless of the IR type tag.
+
+    ``num_src_frags > 1`` (K-widening) is still unsupported on Intel
+    — Intel m8n16k16 has K fixed at 16. That case needs an IR-level
+    rewrite that splits FragConvert + downstream MMA into N per-K
+    MMA calls. Not used by Waypoint DiT (nk_per_kstep=1 on this shape).
     """
-    raise NotImplementedError(
-        "_visit_frag_convert(ocl): FragConvertOp's K-widening A "
-        "shape (K_dst = num_src*src_cols) has no Intel MMA equivalent "
-        "— SPV_INTEL_subgroup_matrix_multiply_accumulate fixes K at "
-        "the shape's K dim (16 for bf16 m8n16k16). Lowering this "
-        "needs an IR-level rewrite that splits the FragConvert + "
-        "downstream MMA into N per-K-tile MMA calls. Tracked in "
-        "memory/project_openvino_taehv.md. Workaround: kernels that "
-        "use FragConvertOp (attention with online-softmax K-merge) "
-        "currently can't run through the OCL backend."
+    from quark.ir.mma_registry import _BY_SHAPE_ID  # type: ignore
+
+    (out,) = op.results
+    shape_id = op.attrs["shape_id"]
+    src_dtype = op.attrs["src_dtype"]
+    dst_dtype = op.attrs["dst_dtype"]
+    num_src = int(op.attrs["num_src_frags"])
+
+    if num_src != 1:
+        raise NotImplementedError(
+            "_visit_frag_convert(ocl): num_src_frags > 1 (K-widening) "
+            f"not supported — Intel SG=16 m8n16k16 fixes K at 16. Got "
+            f"num_src_frags={num_src}. Needs an IR-level rewrite that "
+            "splits FragConvert + downstream MMA into N per-K-tile MMA "
+            "calls."
+        )
+    if (src_dtype, dst_dtype) != (DType.F32, DType.BF16):
+        raise NotImplementedError(
+            f"_visit_frag_convert(ocl): only F32→BF16 supported "
+            f"(got {src_dtype}→{dst_dtype})"
+        )
+
+    cfg = _BY_SHAPE_ID.get(shape_id)
+    if cfg is None:
+        raise NotImplementedError(
+            f"_visit_frag_convert(ocl): unknown shape_id={shape_id!r}"
+        )
+    shape = cfg.shape
+    layout = _intel_mma_layout(shape)
+    (_sg, a_elem_dt, a_w, _b_dt, _b_w, c_elem_dt, c_width,
+     _k_dim, _operands_flag) = layout
+
+    if c_width != a_w:
+        raise NotImplementedError(
+            f"_visit_frag_convert(ocl): src ACC width {c_width} != dst "
+            f"A width {a_w}; only the same-width single-K-tile case is "
+            "wired."
+        )
+
+    src_elem_type = _emit_dtype(ctx.text, c_elem_dt, ctx)
+    dst_elem_type = _emit_dtype(ctx.text, a_elem_dt, ctx)
+    out_vec_type = _ocl_type_vec(ctx.text, dst_elem_type, a_w)
+
+    src_frag_id = ctx.val_to_id[op.operands[0].id]
+    lane_id = _ensure_lane_id(ctx)
+
+    slot_to_sel_attr = op.attrs.get("slot_to_selector_idx")
+    n_selectors = max(0, len(op.operands) - num_src)
+    dynamic_dispatch = (
+        op.body_selector_var is not None
+        and slot_to_sel_attr is None
+        and n_selectors > 0
+    )
+
+    # bf16 in SPIR-V Kernel land = u16 carrier. OpFConvert from f32 to
+    # bf16 isn't legal (bf16 isn't a SPIR-V Kernel-mode dtype); we have
+    # to bit-pattern down via the same OpUConvert + OpShiftRight pattern
+    # the f32→bf16 _visit_convert uses. _emit_f32_to_bf16 below mirrors
+    # the b16 lane the OCL convert visitor produces.
+    yielded_ids: list[str] = []
+    for s in range(a_w):
+        elem_id = ctx.text.alloc_id(f"fc_in_{s}")
+        ctx.text.emit_function(
+            f"{elem_id} = OpCompositeExtract {src_elem_type} {src_frag_id} {s}"
+        )
+
+        # Optional body: produces a transformed f32 from the per-slot f32.
+        if op.body is not None and len(op.body.ops) > 0:
+            row_const = ctx.text.const_uint(s)
+            ctx.val_to_id[op.body_input_var.id] = elem_id
+
+            if op.body_selector_var is not None and n_selectors > 0:
+                if dynamic_dispatch:
+                    bool_t = ctx.text.type_bool()
+                    sel_chain = ctx.val_to_id[op.operands[num_src + n_selectors - 1].id]
+                    for i in range(n_selectors - 2, -1, -1):
+                        cmp_id = ctx.text.alloc_id(f"fc_cmp_{s}_{i}")
+                        i_const = ctx.text.const_uint(i)
+                        ctx.text.emit_function(
+                            f"{cmp_id} = OpIEqual {bool_t} {row_const} {i_const}"
+                        )
+                        sel_lhs = ctx.val_to_id[op.operands[num_src + i].id]
+                        sel_dt = _emit_dtype(
+                            ctx.text, op.operands[num_src + i].dtype, ctx
+                        )
+                        sel_new = ctx.text.alloc_id(f"fc_sel_{s}_{i}")
+                        ctx.text.emit_function(
+                            f"{sel_new} = OpSelect {sel_dt} {cmp_id} "
+                            f"{sel_lhs} {sel_chain}"
+                        )
+                        sel_chain = sel_new
+                    ctx.val_to_id[op.body_selector_var.id] = sel_chain
+                else:
+                    slot_to_sel = slot_to_sel_attr or ()
+                    sel_idx = slot_to_sel[s] if s < len(slot_to_sel) else 0
+                    sel_v = op.operands[num_src + sel_idx]
+                    ctx.val_to_id[op.body_selector_var.id] = ctx.val_to_id[sel_v.id]
+
+            saved_stack = ctx.loop_yield_stack
+            ctx.loop_yield_stack = []
+            try:
+                for body_op in op.body.ops:
+                    if isinstance(body_op, YieldOp):
+                        continue
+                    _walk_op(body_op, ctx)
+            finally:
+                ctx.loop_yield_stack = saved_stack
+
+            term = op.body.terminator
+            if term is None or not term.operands:
+                raise RuntimeError(
+                    "_visit_frag_convert(ocl): body must yield 1 f32 value"
+                )
+            elem_id = ctx.val_to_id[term.operands[0].id]
+
+        # Convert f32 → bf16 (u16 carrier). Reuse the same pattern as
+        # the scalar f32→bf16 path: bitcast to u32, shift right 16, then
+        # truncate to u16. Round-to-nearest-even semantics — bf16 has the
+        # same exponent as f32, so chopping is "round toward zero" on the
+        # mantissa; for the online-softmax exp output the difference vs
+        # RN is ≤ 1 ulp.
+        u32_t = ctx.text.type_int(32, signed=False)
+        u32_id = ctx.text.alloc_id(f"fc_u32_{s}")
+        ctx.text.emit_function(
+            f"{u32_id} = OpBitcast {u32_t} {elem_id}"
+        )
+        sixteen = ctx.text.const_uint(16)
+        shifted_id = ctx.text.alloc_id(f"fc_shr_{s}")
+        ctx.text.emit_function(
+            f"{shifted_id} = OpShiftRightLogical {u32_t} {u32_id} {sixteen}"
+        )
+        u16_id = ctx.text.alloc_id(f"fc_u16_{s}")
+        ctx.text.emit_function(
+            f"{u16_id} = OpUConvert {dst_elem_type} {shifted_id}"
+        )
+        yielded_ids.append(u16_id)
+
+    _ = lane_id
+
+    res_id = ctx.text.alloc_id("frag_convert_result")
+    ctx.val_to_id[out.id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpCompositeConstruct {out_vec_type} {' '.join(yielded_ids)}"
     )
 
 
