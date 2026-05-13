@@ -252,6 +252,10 @@ _ARITH_KIND_TO_OP: dict[tuple[str, DType], str] = {
     ("or",  DType.S32): "OpBitwiseOr",
     ("xor", DType.U32): "OpBitwiseXor",
     ("xor", DType.S32): "OpBitwiseXor",
+    # Boolean (PRED) ops — separate opcodes for logical AND/OR/XOR.
+    ("and", DType.PRED): "OpLogicalAnd",
+    ("or",  DType.PRED): "OpLogicalOr",
+    ("xor", DType.PRED): "OpLogicalNotEqual",  # XOR == ≠ for booleans
 }
 
 
