@@ -112,10 +112,10 @@ forward emits, and which ones the OCL lowerer handles today.
   emission tests come next.
   notes: `scripts/check_ocl_coverage.py` does real coverage analysis (walks the IR each kernel emits, cross-references against `_DISPATCH`) instead of grep — more accurate. Runs legalization first because the launcher does (AsyncCopy ops get rewritten to VecLoad/VecStore on `supports_async_copy=False`). **Headline: every inventoried kernel is `full` post-legalize.** No missing visitors — Phase 2 work is verification + perf, not net-new lowerer code. OwlAttn covered via a fallback that fills `config.main_shape="m8n16k16_intel_bf16_f32"` when Mac autotune left it empty.
 
-- [ ] **1.3** [DEVKIT] For each kernel marked `full`, run the
+- [x] **1.3** [DEVKIT] For each kernel marked `full`, run the
   matching `tests/lower/ocl/` shape (or stand one up). Record
-  pass/fail in the status table. → moved to Pending-devkit queue.
-  notes:
+  pass/fail in the status table.
+  notes: ran `tests/lower/ocl/` + `tests/drivers/test_ocl_probe.py` + `tests/drivers/test_ocl_compile_launch.py` on the Battlemage devkit (xe3-devbox via ssh): **44 passed in 0.16s, 0 failed**. The visitor coverage 1.2 proved statically actually compiles + dispatches end-to-end through IGC at runtime. No 1-to-1 production-kernel tests yet (each `tests/lower/ocl/` test covers a feature surface, not a whole kernel); per-kernel integration tests get stood up in Phase 2.
 
 ---
 
@@ -276,21 +276,26 @@ Diverges:
 ## Pending-devkit queue
 
 Tasks deferred from Mac iterations because they need Intel
-hardware. Run as one ssh batch when convenient.
+hardware. Run via the sshfs mount at
+``/Users/clyde/Documents/intel-devkit/quark`` (devkit's ``/root/quark``).
 
-- **1.3** Run `tests/lower/ocl/` per kernel; record pass/fail. The
-  static coverage in 1.2 shows no missing visitors — devkit confirms
-  the emitted SPIR-V actually compiles and runs.
 - **All of Phase 2** (smoke + bench per kernel) — owl_attn, rmsnorm,
   gemm_int, kv_update, RoPE. Visitor work is done (no gaps from 1.2);
   these are numerics gates + microbenchmarks.
 - **All of Phase 3** (end-to-end gen_frame).
 - **All of Phase 4** (batched submit + perf).
 
+Devkit-state prerequisite: the SPV-removal work currently
+uncommitted in the Mac worktree needs to land on devkit too — the
+devkit's ``launcher.py`` still has both ``_launch_spv`` and
+``_launch_ocl`` and the dispatch maps INTEL_GPU → SPV, so OCL
+launches via Waypoint forward fail at the launcher's family-dispatch
+step. Phase 2 work should start with applying that removal on devkit.
+
 ---
 
 ## Status snapshot
 
-Last loop iteration: 1.2 done. All Mac-runnable tasks complete.
-Active phase: pending devkit.
-Next: ssh into the Battlemage devkit and run the Pending-devkit queue below — every remaining task needs Intel hardware. The Mac side proved out engine wiring + static OCL coverage; the OCL lowerer has the visitor set to handle every inventoried kernel post-legalize.
+Last loop iteration: Phase 1 fully closed — 1.3 verified via 44 OCL tests passing on Battlemage devkit (xe3-devbox).
+Active phase: 2 (devkit).
+Next: apply the SPV-removal worktree state to devkit so the launcher routes INTEL_GPU → OCL, then Phase 2A.2 (owl_attn numerics smoke).
