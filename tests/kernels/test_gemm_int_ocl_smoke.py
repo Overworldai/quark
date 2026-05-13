@@ -49,6 +49,52 @@ def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+def test_gemm_int_all_ones_yields_K():
+    """Diagnostic: A = all-1 s8, B = all-1 s8, scales = 1. Each
+    C[m,n] = sum over k of 1*1 = K. Final output (bf16) = K
+    everywhere. Reveals data-layout bugs as off-K values without
+    the noise of random matrices.
+
+    For M=32 N=32 K=64: every C value should be 64 (or close in
+    bf16). Mismatches point directly at lane→element mapping
+    bugs in load_matrix."""
+    from quark.ir import DType
+
+    M, N, K = 32, 32, 64
+    A_s8 = np.ones((M, K), dtype=np.int8)
+    B_s8 = np.ones((K, N), dtype=np.int8)
+    A_scales = np.ones(M, dtype=np.float32)
+    B_scales = np.ones(N, dtype=np.float32)
+
+    A_qt = QuarkTensor.from_numpy(A_s8, dtype="s8")
+    B_qt = QuarkTensor.from_numpy(B_s8, dtype="s8")
+    A_scales_qt = QuarkTensor.from_numpy(A_scales, dtype="f32")
+    B_scales_qt = QuarkTensor.from_numpy(B_scales, dtype="f32")
+
+    spec = GemmIntSpec(M=M, N=N, K=K, out_dtype=DType.BF16)
+    result = call_with_bindings(
+        GemmIntKernel, spec,
+        provided={"A": A_qt, "B": B_qt,
+                  "A_scales": A_scales_qt, "B_scales": B_scales_qt},
+        auto_alloc=("Out",), like=A_qt,
+    )
+    from quark.runtime.sync import synchronize as _sync
+    _sync()
+    out_f32 = _bf16_to_f32(result["Out"].to_numpy())
+    expected = float(K)
+    n_correct = int(np.sum(np.isclose(out_f32, expected, rtol=0.05)))
+    n_total = out_f32.size
+    n_zero = int(np.sum(out_f32 == 0.0))
+    unique = np.unique(out_f32)[:10]
+    print(f"\n  M={M} N={N} K={K}: expected {expected}, got "
+          f"{n_correct}/{n_total} correct, {n_zero} zeros, "
+          f"first unique: {unique}")
+    assert n_correct == n_total, (
+        f"all-ones GemmInt: only {n_correct}/{n_total} match K={K}; "
+        f"unique values seen: {unique}"
+    )
+
+
 @pytest.mark.parametrize("M,N,K", [
     (32, 32, 64),   # tiny: one block per dim
     (64, 64, 128),  # multi-block
