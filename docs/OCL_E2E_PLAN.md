@@ -106,11 +106,11 @@ forward emits, and which ones the OCL lowerer handles today.
   Done: file exists with full kernel list.
   notes: script wraps BOTH `Launcher.compile` and `AutotuneCache.lookup_or_search` (the latter is where Mac dies on `OwlAttnKernel` autotune — no valid MMA without NAX). Mac run captures 8 unique kernels (AdaRMSNorm / GemmKernel ×3 specs / HeadRMSNorm / KVCacheUpdate / OwlAttn / Patchify); 3 kernels emitted later in the forward (AdaGateResidual / Unpatchify / ValueResidualPacked) are missed — Phase 1.3 [DEVKIT] completes the inventory.
 
-- [ ] **1.2** Fill the `OCL status` column. For each kernel, grep
+- [x] **1.2** Fill the `OCL status` column. For each kernel, grep
   for visitor coverage in `quark/lower/ocl/lower.py`; classify as
   `full / partial / missing`. Only static analysis — actual
   emission tests come next.
-  notes:
+  notes: `scripts/check_ocl_coverage.py` does real coverage analysis (walks the IR each kernel emits, cross-references against `_DISPATCH`) instead of grep — more accurate. Runs legalization first because the launcher does (AsyncCopy ops get rewritten to VecLoad/VecStore on `supports_async_copy=False`). **Headline: every inventoried kernel is `full` post-legalize.** No missing visitors — Phase 2 work is verification + perf, not net-new lowerer code. OwlAttn covered via a fallback that fills `config.main_shape="m8n16k16_intel_bf16_f32"` when Mac autotune left it empty.
 
 - [ ] **1.3** [DEVKIT] For each kernel marked `full`, run the
   matching `tests/lower/ocl/` shape (or stand one up). Record
@@ -284,6 +284,6 @@ hardware. Run as one ssh batch when convenient.
 
 ## Status snapshot
 
-Last loop iteration: 1.1 done — kernel inventory captured to `docs/ocl_kernel_status.md`. 8 unique kernels on Mac (partial; 3 more deferred to 1.3 [DEVKIT]).
+Last loop iteration: 1.2 done — every inventoried kernel is `full` on OCL post-legalization. No missing visitors found.
 Active phase: 1.
-Next task: 1.2.
+Next task: 1.3 (devkit; defer to Pending-devkit queue → skip to Phase 2).

@@ -26,11 +26,11 @@ with ``tests/lower/ocl/test_lower.py`` for the OCL-side coverage.
 
 | kernel | spec_summary | config_summary | OCL status | notes |
 |---|---|---|---|---|
-| `AdaRMSNormKernel` | `AdaRMSNormSpec(M=512, D=2048)` | `AdaRMSNormConfig(n_warps=4)` | | |
-| `GemmKernel` | `GemmSpec(M=16, N=2048, K=8192, out_dtype=DType.BF16)` | `(autotune)` | | |
-| `GemmKernel` | `GemmSpec(M=16, N=8192, K=512, out_dtype=DType.BF16)` | `(autotune)` | | |
-| `GemmKernel` | `GemmSpec(M=512, N=4096, K=2048, out_dtype=DType.BF16)` | `(autotune)` | | |
-| `HeadRMSNormKernel` | `HeadRMSNormSpec(M=512, Dh=64, n_kv_heads=16)` | `(autotune)` | | |
-| `KVCacheUpdateKernel` | `KVCacheUpdateSpec(Dh=64, n_kv_heads=16, in_dtype=DType.BF16)` | `(autotune)` | | |
-| `OwlAttnKernel` | `OwlAttnSpec(Dh=64, n_kv_heads=16, seq_len=512, out_dtype=DType.BF16)` | `(autotune)` | | |
-| `PatchifyKernel` | `PatchifySpec(M=512, N=2048, K=128)` | `(autotune)` | | |
+| `AdaRMSNormKernel` | `AdaRMSNormSpec(M=512, D=2048)` | `AdaRMSNormConfig(n_warps=4)` | `full` | 17 op types, all visitors present (post-legalize) |
+| `GemmKernel` | `GemmSpec(M=16, N=2048, K=8192, out_dtype=DType.BF16)` | `(autotune)` | `full` | 21 op types, all visitors present (post-legalize) |
+| `GemmKernel` | `GemmSpec(M=16, N=8192, K=512, out_dtype=DType.BF16)` | `(autotune)` | `full` | 22 op types, all visitors present (post-legalize) |
+| `GemmKernel` | `GemmSpec(M=512, N=4096, K=2048, out_dtype=DType.BF16)` | `(autotune)` | `full` | 21 op types, all visitors present (post-legalize) |
+| `HeadRMSNormKernel` | `HeadRMSNormSpec(M=512, Dh=64, n_kv_heads=16)` | `(autotune)` | `full` | 17 op types, all visitors present (post-legalize) |
+| `KVCacheUpdateKernel` | `KVCacheUpdateSpec(Dh=64, n_kv_heads=16, in_dtype=DType.BF16)` | `(autotune)` | `full` | 18 op types, all visitors present (post-legalize) |
+| `OwlAttnKernel` | `OwlAttnSpec(Dh=64, n_kv_heads=16, seq_len=512, out_dtype=DType.BF16)` | `(autotune)` | `full` | 28 op types, all visitors present (post-legalize) |
+| `PatchifyKernel` | `PatchifySpec(M=512, N=2048, K=128)` | `(autotune)` | `full` | 22 op types, all visitors present (post-legalize) |
