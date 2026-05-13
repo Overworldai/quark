@@ -165,7 +165,7 @@ and subgroup-block-read patterns, not the source.
   `mma_cfg` (m8n16k16 bf16/bf16/f32 and bf16/bf16/bf16). Run
   end-to-end through `OclDriver`, compare against PTX reference.
   Gate: cos_sim ≥ 0.9999.
-  notes:
+  notes: **BLOCKED.** Smoke at `tests/kernels/owl_attn/test_ocl_smoke.py` runs through `pcf.owl_attn` → fails at `_visit_frag_convert(ocl)`. OwlAttn emits `FragConvertOp` to K-widen the GEMM2 A-frag for the online-softmax K-merge, but `cl_intel_subgroup_matrix_multiply_accumulate` fixes K at the shape's K-dim (16 for bf16 m8n16k16). The OCL visitor explicitly raises NotImplementedError on this path. Unblocking needs an IR-level rewrite that splits FragConvert + downstream MMA into N per-K-tile MMA calls (see new "Known OCL blockers" section). Two unrelated visitor gaps fixed en route: `_visit_convert` sint↔uint (commit 91f1498) and `_visit_arith` shifts/bitwise (commit 0dd96e1).
 
 - [ ] **2A.3** [DEVKIT] μs/call bench at one production shape
   (S=4096, Dh=128, gqa_ratio=2). Land number in status table.
@@ -290,6 +290,26 @@ Diverges:
 | `gen` (CUDA graph) | None | None |
 
 ---
+
+## Known OCL blockers
+
+Static visitor coverage (Phase 1.2) found no missing _DISPATCH
+entries, but a few visitors raise NotImplementedError on specific
+op shapes that production kernels emit. These need targeted work
+beyond the smoke + bench cycle.
+
+- **`FragConvertOp` K-widening** — `_visit_frag_convert(ocl)` at
+  `lower/ocl/lower.py:1936` raises on `K_dst = num_src * src_cols`
+  shape. `cl_intel_subgroup_matrix_multiply_accumulate` fixes K at
+  the shape's K-dim, no equivalent of PTX `mma.sync`'s K-wide A
+  fragment. **Unblock via IR-level rewrite**: split FragConvert +
+  downstream MMA chain into N per-K-tile MMA calls (one MMA per
+  source K-tile, accumulator chain merges results). Affects every
+  attention-cohort kernel that uses online-softmax K-merge — today
+  that's `OwlAttnKernel` and `OwlAttnIntKernel`. **Workaround**:
+  none yet. Compute-cohort kernels (GEMM / RMSNorm / KVCache /
+  Patchify / Unpatchify / AdaGate / ValueResidual) don't use
+  FragConvert and lower fine.
 
 ## Pending-devkit queue
 
