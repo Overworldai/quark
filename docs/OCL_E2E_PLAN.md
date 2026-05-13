@@ -271,11 +271,25 @@ lfps** un-batched on Battlemage. Every `launch()` synchronously
 `clFinish`es today — Phase 4.1 below is what closes the 12×
 gap to the Vulkan baseline.
 
-- [ ] **4.1** [DEVKIT] Batched submit in `OclDriver`. Today
+**Post-4.1 measurement (2026-05-14):** `test_steady_state_lfps`
+reports **2.51 lfps (398.5 ms/frame)** over 16 measured frames
+after a 1-frame warmup, on Battlemage with the production
+Waypoint-1.5-1B-360P shape, VAE on the OpenVINO GPU plugin.
+That's 67% of the 3.76-lfps Vulkan baseline from a single
+``quark.lazy()`` plumbing fix — no kernel-level work yet. Phase
+4.2 (per-kernel profiling) + 4.3 (port wins from OpenVINO
+equivalents) are what close the remaining gap.
+
+- [x] **4.1** [DEVKIT] Batched submit in `OclDriver`. Today
   `launch()` blocks per call; collect into one `clFinish` at
   frame boundary under `quark.lazy()`. Mirror the Metal
   accumulating-command-buffer shape.
-  notes:
+  notes: Launcher now consults the `_LAZY` ContextVar on OCL —
+  inside `quark.lazy()` it passes `sync=False` to the driver,
+  letting dispatches accumulate in the OCL command queue. Block
+  exit calls `runtime.sync.synchronize()` which drains via
+  `clFinish`. The C++ side already supported `sync=False` — only
+  the Python plumbing was missing. Net: 0.30 → 2.51 lfps.
 
 - [ ] **4.2** [DEVKIT] Per-kernel `cl_event` profiling. Dump
   μs/call table to `docs/ocl_perf_baseline.md`.
