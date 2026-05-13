@@ -1051,13 +1051,26 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                 f"narrower than smem elem ({smem_elem_type}) — not wired"
             )
         pack_ratio = lane_bytes // smem_bytes
-        # Stride between successive packed K-cols per lane. For the
-        # packed-K case the cl_intel DPAS layout interleaves K-cols
-        # across lanes at the subgroup-width stride: lane L holds
-        # K-cols [L, L+SG, L+2*SG, ..., L+(pack_ratio-1)*SG]. NOT
-        # sequential [L*pack_ratio, ...] — empirically tested on
-        # Battlemage 2026-05-13.
-        pack_k_stride = ctx.subgroup_width if pack_ratio > 1 else 1
+        # Per Khronos SPV_INTEL_subgroup_matrix_multiply_accumulate
+        # spec: "The K columns of data are passed by the N invocations
+        # in the subgroup, with the lower-numbered invocations passing
+        # the lower-numbered columns." For SG=16, K=32, pack_ratio=2:
+        # lane L holds K-cols (2L, 2L+1). For pack_ratio==1: lane L =
+        # K-col L (the bf16 path).
+        pack_k_stride = 1
+        if which == "a" and pack_ratio > 1:
+            # Adjust col_lane base: lane L → K-col base = L * pack_ratio
+            # (not just L). The k_off loop then walks within the lane.
+            col_lane_packed = ctx.text.alloc_id("lm_a_col_lane_pack")
+            pack_const = ctx.text.const_uint(pack_ratio)
+            lane_off = ctx.text.alloc_id("lm_a_lane_off")
+            ctx.text.emit_function(
+                f"{lane_off} = OpIMul {u32} {lane_id} {pack_const}"
+            )
+            ctx.text.emit_function(
+                f"{col_lane_packed} = OpIAdd {u32} {col_base} {lane_off}"
+            )
+            col_lane = col_lane_packed
 
         for s in range(width):
             row_s = ctx.text.alloc_id(f"lm_{which}_row_{s}")
