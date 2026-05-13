@@ -501,9 +501,11 @@ owl_attn SPV OpPhi count: 60 → 28 → 12 → 4 (just iv phis). IGC accepts.
 
 **Wider regression check:** 49 OCL tests pass; 5 known-fail (gemm_int s8 DPAS + 2 owl_attn smokes) unchanged.
 
-**Open issue — owl_attn standalone numeric smoke:** `tests/kernels/owl_attn/test_ocl_smoke.py` now runs (was blocked at IGC ICE before) but reports cos_sim=0.706922 vs numpy reference. Likely bug in the smem refactor:
-- Maybe `bctx.lane_id` differs from the MMA's per-lane meaning when subgroup_size > 16.
-- Maybe init loop for `o_smem` only initialises some slots (only lanes 0..c_regs−1 of each subgroup write?).
-- Maybe `ml_smem` store race when more than one subgroup-worth of lanes hits each slot.
+**Open issue — owl_attn standalone numeric smoke:** `tests/kernels/owl_attn/test_ocl_smoke.py` now runs (was blocked at IGC ICE before) but reports cos_sim=0.706922 vs numpy reference. The cos_sim is stable across multiple smem-refactor revisions, so this is a pre-existing bug — the test was added (commit 3ca3f7d) as a WIP before the kernel actually compiled on Intel. With the smem refactor + frag_convert visitor + RoPE select now in place, the kernel runs end-to-end for the first time and exposes this earlier bug.
 
-Phase 3.1 stub-VAE smoke passes the sanity gate (no NaN/Inf, max|x| < 1e3) so numeric correctness was not directly verified there — the standalone owl_attn smoke does that and shows the deviation. Next loop step: bisect the numeric error.
+Plausible roots (in suspicion order):
+1. `bctx.lane_id` (SubgroupLocalInvocationId, 0..15 on Intel) vs the kernel's `lane_id = tid % sgs` (0..31 when sgs=32 from config default) confusion in some intermediate computation that lands in K/V address math.
+2. OCL frag_apply / frag_reduce on Intel dispatching slot_to_selector_idx with the wrong slot↔row mapping (the Intel placeholder cd_offsets `((0,0),)*8` mean each backend infers per-slot row differently).
+3. The Q-RoPE pass writing to smem with the wrong lane convention (the `lane_id = tid % sgs` path).
+
+Phase 3.1 stub-VAE smoke passes the sanity gate (no NaN/Inf, max|x| < 1e3) but doesn't compare against a reference. Phase 3.2 (DiT correctness vs CUDA) is the natural next correctness check but needs CUDA hardware. Next loop step: bisect with the owl_attn smoke as the test fixture — instrument intermediate values via a debug buffer and compare against the numpy reference's intermediate.
