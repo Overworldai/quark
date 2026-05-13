@@ -408,15 +408,18 @@ _INTEL_MMA_LAYOUTS: dict[tuple, tuple] = {
     # hold 8-bit packed components, not raw 32-bit ints.
     (DType.S8, DType.S8, DType.S32, 8, 16, 32): (
         16,             # SG=16 per spec
-        # IGC requires A's per-lane vector size to match M (8) for
-        # the s8 form — the int8 layout broadcasts A across lanes
-        # so every lane holds the M=8 rows × packed-K data, not just
-        # one column k=L like the bf16 path. ``OpSubgroupMatrix
-        # MultiplyAccumulateINTEL`` fails build with
-        # "Matrix A argument must have size 8 to match M" when A is
-        # v4 u32 instead of v8.
-        DType.U32, 8,   # A: v8 of u32 (M=8 rows × K-packed quartets)
-        DType.U32, 8,   # B: v8 of u32 (column n=L, K-packed quartets)
+        # Empirical IGC requirements for the s8 form (K=32, M=8,
+        # Result=S32):
+        #   - A per-lane width must match M (=8); ``size 8 to match
+        #     M defined by Result type`` else IGC rejects.
+        #   - A element type must be int16 (not int32) per the
+        #     ``expected A element type to be int16_t for K Dim = 32``
+        #     check. Packing: 2 s8 along K per u16; per lane = 16 s8
+        #     = 8 u16; 16 lanes × 16 s8 = M*K = 256 ✓.
+        #   - B element type stays int32 (each i32 packs 4 s8 along
+        #     K, per the bf16-form analogy).
+        DType.U16, 8,   # A: v8 of u16 (2 packed s8 along K per u16)
+        DType.U32, 8,   # B: v8 of u32 (4 packed s8 along K per u32)
         DType.S32, 8,   # C: v8 of s32 (column n=L, rows m=0..7)
         32,             # K-Dim operand
         "MatrixASignedComponentsINTEL|MatrixBSignedComponentsINTEL"
