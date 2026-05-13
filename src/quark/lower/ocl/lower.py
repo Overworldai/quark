@@ -1859,27 +1859,75 @@ def _visit_bitcast(op: BitcastOp, ctx: _OclCtx) -> None:
 
 
 def _visit_vec_build(op: VecBuildOp, ctx: _OclCtx) -> None:
-    """Build a vector from scalar operands via ``OpCompositeConstruct``."""
+    """Build a vector from scalar operands via ``OpCompositeConstruct``.
+
+    With ``packed_b32=True`` the operands are B32 scalars each carrying
+    two BF16/F16 elements (low half = lane 2k, high half = lane 2k+1).
+    The result is a width=2N vector of the element dtype. Lower as a
+    v<N> packed vector then ``OpBitcast`` to the bf16 vector type —
+    same total bit-width so the cast is well-formed.
+    """
     (out,) = op.results
-    width = int(op.attrs.get("width", len(op.operands)))
+    width = int(op.attrs.get("width", out.width or len(op.operands)))
     elem_type = _emit_dtype(ctx.text, out.dtype, ctx)
     vec_type = _ocl_type_vec(ctx.text, elem_type, width)
     operands = [ctx.val_to_id[v.id] for v in op.operands]
     res_id = ctx.text.alloc_id("vec_build")
     ctx.val_to_id[out.id] = res_id
+
+    if op.attrs.get("packed_b32"):
+        # Pack B32 operands into a uint32 vector, then bitcast to the
+        # bf16/f16 vec type (twice the lane count, same bits).
+        u32_t = ctx.text.type_int(32, signed=False)
+        u32_vec_t = _ocl_type_vec(ctx.text, u32_t, len(operands))
+        u32_vec_id = ctx.text.alloc_id("vec_b32_pack")
+        ctx.text.emit_function(
+            f"{u32_vec_id} = OpCompositeConstruct {u32_vec_t} {' '.join(operands)}"
+        )
+        ctx.text.emit_function(
+            f"{res_id} = OpBitcast {vec_type} {u32_vec_id}"
+        )
+        return
+
     ctx.text.emit_function(
         f"{res_id} = OpCompositeConstruct {vec_type} {' '.join(operands)}"
     )
 
 
 def _visit_vec_extract(op: VecExtractOp, ctx: _OclCtx) -> None:
-    """Extract one element from a vector via ``OpCompositeExtract``."""
+    """Extract one element from a vector via ``OpCompositeExtract``.
+
+    With ``packed_b32=True`` the source is a BF16/F16 vector and the
+    desired result is a B32 holding the (2*idx, 2*idx+1) lane pair.
+    Lower as ``OpBitcast`` of the source to a uint32 vector, then
+    ``OpCompositeExtract`` at index ``pair_idx``.
+    """
     (out,) = op.results
     src_id = ctx.val_to_id[op.operands[0].id]
     idx = int(op.attrs["index"])
     dst_t = _emit_dtype(ctx.text, out.dtype, ctx)
     res_id = ctx.text.alloc_id("vec_ext")
     ctx.val_to_id[out.id] = res_id
+
+    if op.attrs.get("packed_b32"):
+        src_vec = op.operands[0]
+        src_width = src_vec.width or 0
+        if src_width == 0 or src_width % 2 != 0:
+            raise NotImplementedError(
+                "_visit_vec_extract(ocl): packed_b32 requires even "
+                f"source width, got {src_width!r}"
+            )
+        u32_t = ctx.text.type_int(32, signed=False)
+        u32_vec_t = _ocl_type_vec(ctx.text, u32_t, src_width // 2)
+        u32_vec_id = ctx.text.alloc_id("vec_b32_view")
+        ctx.text.emit_function(
+            f"{u32_vec_id} = OpBitcast {u32_vec_t} {src_id}"
+        )
+        ctx.text.emit_function(
+            f"{res_id} = OpCompositeExtract {dst_t} {u32_vec_id} {idx}"
+        )
+        return
+
     ctx.text.emit_function(
         f"{res_id} = OpCompositeExtract {dst_t} {src_id} {idx}"
     )
