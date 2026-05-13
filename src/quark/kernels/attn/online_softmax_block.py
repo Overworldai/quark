@@ -339,6 +339,22 @@ class OnlineSoftmax(Block):
             #    ``load_matrix`` into the fp8 A-frag layout — those reads
             #    match the PTX ISA fp8 m16n8k16/k32 fragment map.
             a_dtype = cfg.shape.a_dtype
+            # Intel + 16-bit A: route through smem (fp8-style) regardless
+            # of in-register frag_convert lane alignment. IGC's DPAS
+            # pattern matcher segfaults when the A operand for OpSubgroup
+            # MatrixMultiplyAccumulateINTEL is built via OpCompositeConstruct
+            # of OpFConvert+OpBitcast on f32 values produced in-register
+            # (verified on Battlemage / libigc.so 24.x against a 4-MMA-chain
+            # owl_attn kernel — IGC ICE at +0x1afa409). Reusing
+            # ``load_matrix`` for the A operand (same path GEMM1 uses)
+            # routes around the crash. Requires the caller to allocate
+            # ``p_smem`` and run a block barrier before reloading.
+            intel_smem_path = (
+                is_intel
+                and a_dtype not in _FP8_DTYPES
+                and self.p_smem is not None
+            )
+
             if a_dtype in _FP8_DTYPES:
                 assert self.p_smem is not None, (
                     f"OnlineSoftmax: fp8 compute ({a_dtype}) requires p_smem "
@@ -385,6 +401,28 @@ class OnlineSoftmax(Block):
                         b.store(self.p_smem, p01, row_top, col)
                         b.store(self.p_smem, p23, row_bot, col)
                 p_frags: list[list[Value]] | None = None
+            elif intel_smem_path:
+                # Intel SG=16 m8n16k16: lane L holds column n=L, rows
+                # m=0..7 of P (8 f32 per lane). Mirror layout for A is
+                # column k=L, rows m=0..7 (8 bf16 per lane). Write
+                # bf16(p_acc[mt][nk][s]) to p_smem[p_base + mt*m + s,
+                # nk*n + L] for each slot s ∈ 0..c_regs.
+                shape_m = cfg.shape.m
+                shape_n = cfg.shape.n
+                c_regs = cfg.shape.c_regs
+                lane = ctx.lane_id
+                p_base = self.p_row_base
+                p_base_v = p_base if isinstance(p_base, Value) else ctx.c(p_base)
+                for mt in range(MT):
+                    for nk in range(NK):
+                        col = b.add(ctx.c(nk * shape_n), lane)
+                        p_vec = p_acc[mt][nk]
+                        for s in range(c_regs):
+                            row = b.add(p_base_v, ctx.c(mt * shape_m + s))
+                            elem_f32 = b.vec_extract(p_vec, s)
+                            elem_bf16 = b.convert(elem_f32, DType.BF16)
+                            b.store(self.p_smem, elem_bf16, row, col)
+                p_frags = None
             else:
                 # m16n8k16: packs 2 nk-tiles per k-step; m8n8k8: 1 nk-tile.
                 p_frags = [

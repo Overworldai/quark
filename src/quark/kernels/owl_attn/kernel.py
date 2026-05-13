@@ -601,7 +601,16 @@ class OwlAttnKernel(Kernel):
         # f32→fp8 packed stores into P_smem; the kernel reloads via
         # load_matrix into the fp8 A-frag layout for GEMM2. One block
         # barrier per KV iter between the stores and the ldmatrix reads.
-        if compute_is_fp8:
+        #
+        # Intel + 16-bit A also uses smem round-trip — not for layout
+        # reasons but to route around an IGC ICE in the DPAS pattern
+        # matcher when the A operand for OpSubgroupMatrixMultiplyAccumulate
+        # INTEL comes from in-register OpFConvert+OpBitcast on f32 values
+        # (the in-register frag_convert path). Going through smem +
+        # load_matrix matches the GEMM1 pattern IGC accepts.
+        is_intel = "_intel_" in mma_cfg.shape_id
+        use_p_smem = compute_is_fp8 or is_intel
+        if use_p_smem:
             p_stride_elems = KvTile + c.KvPad
             p_warp_rows = MTiles * m_tile
             p_warp_dyn = warp_id * (p_warp_rows * p_stride_elems)
@@ -654,7 +663,7 @@ class OwlAttnKernel(Kernel):
         #     ``((0, 0),) * c_regs`` placeholder; the OCL lowerer
         #     derives row from the smem layout per-slot — see
         #     ``online_softmax_block`` ``is_intel``).
-        is_intel = "_intel_" in mma_cfg.shape_id
+        # ``is_intel`` set above for the smem-round-trip path; reused here.
         n_rc = (
             mma_cfg.shape.m if is_intel
             else len({dr for dr, _ in mma_cfg.cd_offsets})
@@ -723,8 +732,14 @@ class OwlAttnKernel(Kernel):
 
         n_o = MTiles * N_DH
 
-        def _reload_p_frags_fp8():
-            """fp8 GEMM2 path — reload P from smem into the fp8 A-frag."""
+        def _reload_p_frags_from_smem():
+            """Reload P from smem into the A-frag for GEMM2.
+
+            Used by both the fp8 path (layout reasons — fp8 A-frag
+            doesn't line up same-lane with the f32 ACC layout) and the
+            Intel bf16 path (workaround for an IGC DPAS ICE on
+            in-register frag_convert-built A).
+            """
             qk.barrier("block")
             return [
                 [
@@ -759,8 +774,8 @@ class OwlAttnKernel(Kernel):
                     o_vals, m_vals, l_vals, p_frags = softmax(
                         s_acc_vals=s_vals, o_vals=inner_o, m_vals=inner_m, l_vals=inner_l
                     )
-                    if compute_is_fp8:
-                        p_frags = _reload_p_frags_fp8()
+                    if use_p_smem:
+                        p_frags = _reload_p_frags_from_smem()
                     new_o = mma2(a=p_frags, b=ictx.stage.vt, acc=o_vals)
                     qk.yield_(*new_o, *m_vals, *l_vals)
                 with arms.else_():
