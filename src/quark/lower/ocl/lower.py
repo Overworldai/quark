@@ -1469,6 +1469,25 @@ def _visit_convert(op: ConvertOp, ctx: _OclCtx) -> None:
         opcode = "OpSConvert"
     elif src_kind == "uint" and dst_kind == "uint":
         opcode = "OpUConvert"
+    elif (src_kind, dst_kind) in (("sint", "uint"), ("uint", "sint")):
+        # Same-width signedness flip → OpBitcast; different-width
+        # needs an intermediate convert in the source signedness
+        # before the bitcast. SPIR-V's spec disallows
+        # bitcast across widths.
+        if src.dtype.bytes == out.dtype.bytes:
+            opcode = "OpBitcast"
+        else:
+            # Convert width first in source signedness, then bitcast
+            # signedness. Emit two ops.
+            intermediate_dtype = _matching_width_dtype(
+                src_kind, out.dtype.bytes,
+            )
+            tmp_t = _emit_dtype(ctx.text, intermediate_dtype, ctx)
+            tmp_id = ctx.text.alloc_id("cvt_w")
+            width_op = "OpSConvert" if src_kind == "sint" else "OpUConvert"
+            ctx.text.emit_function(f"{tmp_id} = {width_op} {tmp_t} {src_id}")
+            src_id = tmp_id
+            opcode = "OpBitcast"
     else:
         raise NotImplementedError(
             f"_visit_convert(ocl): {src.dtype!r} → {out.dtype!r} not wired"
@@ -1476,6 +1495,21 @@ def _visit_convert(op: ConvertOp, ctx: _OclCtx) -> None:
     res_id = ctx.text.alloc_id("cvt")
     ctx.val_to_id[out.id] = res_id
     ctx.text.emit_function(f"{res_id} = {opcode} {dst_t} {src_id}")
+
+
+def _matching_width_dtype(kind: str, bytes_: int) -> DType:
+    """Find the DType of the given kind ('sint'/'uint') with the
+    requested byte width. Used by _visit_convert when an sint↔uint
+    flip also needs a width change."""
+    table = {
+        ("sint", 1): DType.S8, ("sint", 2): DType.S16, ("sint", 4): DType.S32,
+        ("uint", 1): DType.U8, ("uint", 2): DType.U16, ("uint", 4): DType.U32,
+    }
+    if (kind, bytes_) not in table:
+        raise NotImplementedError(
+            f"_matching_width_dtype(ocl): no {kind} dtype with {bytes_} bytes"
+        )
+    return table[(kind, bytes_)]
 
 
 def _dtype_kind(dt: DType) -> str:
