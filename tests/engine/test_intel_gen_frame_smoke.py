@@ -117,3 +117,34 @@ def test_gen_frame_one_frame(gen_frame_env):
     # uint8 can't be NaN/Inf — sanity range gate.
     pix_np = pixels.numpy() if hasattr(pixels, "numpy") else np.asarray(pixels)
     assert pix_np.min() >= 0 and pix_np.max() <= 255
+
+
+def test_gen_frame_stability_short_loop(gen_frame_env):
+    """Phase 3.4 — short stability loop (8 frames).
+
+    Verifies the gen_frame path is reusable across frames — KV-cache
+    commit + rollover, ``frame_counter`` advance, OpenVINO encoder
+    state reset semantics, and the PipelinedDecoder's depth-1
+    submit/drain. RSS isn't asserted (would need an external probe),
+    but a hard crash / hang / NaN propagation across iters is caught.
+
+    8 frames is a fast-running proxy for the full 100-frame stability
+    target in ``OCL_E2E_PLAN.md`` Phase 3.4 — keeps CI under a minute
+    while still exercising commit-write rollover at every frame.
+    """
+    from quark.engine import Engine
+
+    with pytest.warns(RuntimeWarning, match="forcing QuantConfig"):
+        engine = Engine("Overworld/Waypoint-1.5-1B-360P", load_weights=False)
+
+    for i in range(8):
+        pixels = engine.gen_frame(ctrl=None)
+        assert pixels is not None, f"gen_frame returned None at frame {i}"
+        assert pixels.shape[0] == 4 and pixels.shape[-1] == 3
+        pix_np = pixels.numpy() if hasattr(pixels, "numpy") else np.asarray(pixels)
+        # Catch silent NaN propagation through the DiT → TAEHV chain:
+        # an inf/NaN latent decodes to all-zero (or all-255) saturated
+        # pixels rather than the gradient noise random weights produce.
+        # Random DiT → noise pixels covering most of [0, 255]; flag if
+        # the entire frame collapses to a single value.
+        assert pix_np.std() > 0, f"frame {i} collapsed to constant pixel value"
