@@ -681,11 +681,17 @@ class OwlAttnKernel(Kernel):
         # neither has IGC's limit and OpPhi maps to physical registers on
         # both backends.
         if is_intel:
+            from quark.ir.lifetime import Lifetime
+            # Pin ml_smem and o_smem to kernel-wide lifetime so the layout
+            # pass can't alias them with q_in_smem (which the epilogue
+            # reuses as staging_smem). Lifetime.auto can mis-infer when a
+            # region's live range spans the loop body + epilogue.
             ml_smem = qk.smem_alloc(
                 "ML_state",
                 DType.F32,
                 (NumWarps, 2 * n_ml),
                 pad=0,
+                lifetime=Lifetime.kernel(),
             )
             # Init: lane i < n_ml → M[i] = -inf; n_ml ≤ i < 2*n_ml → L[i-n_ml] = 0.
             # Lanes ≥ 2*n_ml are masked off via pred.
@@ -714,6 +720,7 @@ class OwlAttnKernel(Kernel):
                 DType.F32,
                 (NumWarps, n_o_intel, mma_sg, c_regs_intel),
                 pad=0,
+                lifetime=Lifetime.kernel(),
             )
             zero_vec_init = qk.vec_build([zero_f] * c_regs_intel)
             zero_u_init = qk.const(DType.U32, 0)
