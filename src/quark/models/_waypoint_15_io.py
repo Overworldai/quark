@@ -14,6 +14,19 @@ import sys
 _IS_METAL = sys.platform == "darwin"
 
 
+def _is_host_coherent() -> bool:
+    """True when the active backend exposes host-coherent device
+    pointers (Metal pool or OCL USM-shared). Falls through to False
+    on CUDA, which needs ``memcpy_htod``."""
+    if _IS_METAL:
+        return True
+    try:
+        from quark.runtime.sync import _IS_OCL
+        return _IS_OCL
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------
 # Tensor helpers (QuarkTensor only — MLX dropped with the rest of
 # the world_engine integration; both backends share the unified
@@ -252,26 +265,28 @@ def build_ctrl_buffer(model):
 
     # CUDA path: pin a CudaRuntime handle once and use ``memcpy_htod``
     # so the per-frame fill is graph-safe (no fresh alloc per call).
-    # Metal path: fall back to ``QuarkTensor.from_bytes`` rebinding,
-    # which round-trips host bytes through ``_md.pin_buffer`` — the
-    # control input is one tiny tensor per frame, so the extra alloc
-    # is negligible.
-    if not _IS_METAL:
+    # Host-coherent (Metal/OCL) path: ctypes.memmove into the stable
+    # pool buffer — the control input is one tiny tensor per frame,
+    # so the extra alloc is negligible.
+    _host_coherent = _is_host_coherent()
+    if not _host_coherent:
         from quark.runtime.cuda import CudaRuntime
 
         rt = CudaRuntime.instance()
     else:
         rt = None
 
-    # Metal path: write into a STABLE pool buffer via ctypes.memmove,
-    # not a fresh ``from_numpy`` per call. Earlier code re-pinned a
-    # new pool slot every frame ("rebinding" through ``QuarkTensor.from_numpy``).
-    # Even though the old slot's refcount drops, ``g_lazy_buffers``
-    # never shrinks — and on long-running consumers (Biome's hot loop,
-    # 2000+ frames per session) the pool fragments + the Metal driver
-    # eventually wedges silently. ``ctypes.memmove`` into the stable
-    # ``dev.data_ptr()`` keeps the buffer count bounded.
-    if _IS_METAL:
+    # Host-coherent path: write into a STABLE pool buffer via
+    # ctypes.memmove, not a fresh ``from_numpy`` per call. Earlier
+    # code re-pinned a new pool slot every frame ("rebinding" through
+    # ``QuarkTensor.from_numpy``). Even though the old slot's
+    # refcount drops, the dispatcher's handle table never shrinks —
+    # and on long-running consumers (Biome's hot loop, 2000+ frames
+    # per session) the pool fragments + the driver eventually wedges
+    # silently. ``ctypes.memmove`` into the stable ``dev.data_ptr()``
+    # keeps the buffer count bounded. Same shape on Metal pool and
+    # OCL USM-shared.
+    if _host_coherent:
         import ctypes as _ctypes
 
         from quark.runtime.sync import synchronize
