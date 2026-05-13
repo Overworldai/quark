@@ -449,3 +449,31 @@ The crash is at `libigc.so.2 +0x1afa409` — same offset regardless of whether t
 Hypothesis: IGC chokes on long MMA chains inside structured control flow (for_loop + if_region) combined with the smem round-trip. The fp8 path uses the exact same pattern but never actually compiled on Intel before (fp8 DPAS isn't exposed by IGC).
 
 Next loop step: bisect spv_012.txt against the working spv_007.txt (the largest passing MMA kernel) to find the minimum SPIR-V that triggers the crash, then file with IGC or find a structural workaround.
+
+### Phase 3.1 bisect (2026-05-14)
+
+Subprocess-per-test bisect of spv_012's function body (4320 lines) by line count (each test in a fresh Python — IGC's ICE corrupts OCL state so successive `clBuildProgram` calls in the same process segfault):
+- Empty body → BUILD OK.
+- 100, 500 lines → AS_FAIL / IGC FAIL from mid-block truncation (malformed structured CF).
+- 1000, 1100, 1200, 1300, 1320, 1340 → BUILD OK.
+- 1345 → BUILD FAIL.
+- 1350, 1400, 2000, 4320 → BUILD FAIL.
+
+Body lines 1340–1345 add:
+- `OpPhi` carries (last few of the KV iv-loop)
+- `%loop_cond` = `OpULessThan %iv %u_272`
+- `OpLoopMerge`
+- `OpBranchConditional`
+- `%loop_body = OpLabel`
+- `%smem_chain = OpAccessChain %smem_kv_off_table %iv` + `OpLoad`
+
+The crash sits at the **kv-offset-table read in the main KV iv-loop body**. Eliminating MMAs (`OpCopyObject` substitution for all 8), subgroup reductions (`OpGroupNonUniformF{Add,Max}`), `OpExtInst` (math.h), or barriers (`OpControlBarrier`) does NOT make IGC accept the kernel. So the trigger is structural — the loop + smem indirect read pattern itself, not any specific instruction type.
+
+Hypothesis: IGC's loop optimizer or memory-access pass crashes on the combination of {OpLoopMerge with many OpPhi carries + smem-indirected memory access inside the loop body}. spv_012 has 19 OpPhi carries (S/M/L scalars + O fragment vectors) — far more than the GEMM kernels (which carry just the C accumulator). The carries threading the per-warp softmax state through the loop may exceed an IGC pass limit.
+
+Workaround options:
+1. Materialise the per-warp softmax state in smem instead of OpPhi carries — fewer Phi nodes, kernel size penalty.
+2. Split owl_attn into sub-kernels with smaller carry sets (multiple kernel launches per layer — dispatch overhead penalty).
+3. Skip owl_attn entirely on OCL until IGC patch lands; fall back to a per-token CPU softmax wrapper for Phase 3.
+
+Pragmatic call: option (3) is the fastest unblocker for Phase 3 — the rest of DiT (HeadRMSNorm, AdaRMSNorm, KV cache update, gemm, etc.) all build through IGC. owl_attn was always going to need separate verification anyway (the SPV_INTEL_2d_block_io path documented as the future direction). For now: add an env-var-gated OCL backend opt-out for owl_attn that routes those layers through a numpy reference.
