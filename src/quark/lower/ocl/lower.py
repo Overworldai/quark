@@ -31,7 +31,9 @@ from typing import Any
 from quark.ir import DType
 from quark.ir.types import _DTYPE_BYTES
 from quark.ir.module import Function, Module
-from quark.ir.op import (
+from quark.ir.op import (  # noqa: F401  (some used only for isinstance checks)
+    MergeB32Op,
+    SplitB32Op,
     ArithOp,
     AtomicRmwOp,
     BarrierOp,
@@ -2894,8 +2896,60 @@ def _visit_store(op: StoreOp, ctx: _OclCtx) -> None:
         ctx.text.emit_function(f"OpStore {chain_id} {value_id}")
 
 
+def _visit_split_b32(op: SplitB32Op, ctx: _OclCtx) -> None:
+    """``SplitB32Op`` — split one B32 into (lo_b16, hi_b16).
+
+    Emits OpUConvert (truncate to u16 for low half) and
+    OpShiftRightLogical + OpUConvert (extract high half).
+    Both results are u16 carriers (DType.B16 = unsigned int 16).
+    """
+    src = ctx.val_to_id[op.operands[0].id]
+    u32 = ctx.text.type_int(32, signed=False)
+    u16 = ctx.text.type_int(16, signed=False)
+    # Low half
+    lo_id = ctx.text.alloc_id("split_lo")
+    ctx.val_to_id[op.results[0].id] = lo_id
+    ctx.text.emit_function(f"{lo_id} = OpUConvert {u16} {src}")
+    # High half
+    sixteen = ctx.text.const_uint(16)
+    shifted = ctx.text.alloc_id("split_shift")
+    ctx.text.emit_function(
+        f"{shifted} = OpShiftRightLogical {u32} {src} {sixteen}"
+    )
+    hi_id = ctx.text.alloc_id("split_hi")
+    ctx.val_to_id[op.results[1].id] = hi_id
+    ctx.text.emit_function(f"{hi_id} = OpUConvert {u16} {shifted}")
+
+
+def _visit_merge_b32(op: MergeB32Op, ctx: _OclCtx) -> None:
+    """``MergeB32Op`` — pack (lo_b16, hi_b16) into one B32.
+
+    Inverse of SplitB32Op. OpUConvert each u16 to u32, shift hi by
+    16, OR. Mirror of the packed-K load pattern.
+    """
+    lo = ctx.val_to_id[op.operands[0].id]
+    hi = ctx.val_to_id[op.operands[1].id]
+    u32 = ctx.text.type_int(32, signed=False)
+    sixteen = ctx.text.const_uint(16)
+    lo_ext = ctx.text.alloc_id("merge_lo_ext")
+    ctx.text.emit_function(f"{lo_ext} = OpUConvert {u32} {lo}")
+    hi_ext = ctx.text.alloc_id("merge_hi_ext")
+    ctx.text.emit_function(f"{hi_ext} = OpUConvert {u32} {hi}")
+    hi_shifted = ctx.text.alloc_id("merge_hi_shifted")
+    ctx.text.emit_function(
+        f"{hi_shifted} = OpShiftLeftLogical {u32} {hi_ext} {sixteen}"
+    )
+    res_id = ctx.text.alloc_id("merge_b32")
+    ctx.val_to_id[op.results[0].id] = res_id
+    ctx.text.emit_function(
+        f"{res_id} = OpBitwiseOr {u32} {lo_ext} {hi_shifted}"
+    )
+
+
 _DISPATCH: dict[type, Any] = {
     ConstOp: _visit_const,
+    SplitB32Op: _visit_split_b32,
+    MergeB32Op: _visit_merge_b32,
     ArithOp: _visit_arith,
     CmpOp: _visit_cmp,
     ThreadIdxOp: _visit_thread_idx,
