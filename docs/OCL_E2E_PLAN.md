@@ -298,17 +298,23 @@ entries, but a few visitors raise NotImplementedError on specific
 op shapes that production kernels emit. These need targeted work
 beyond the smoke + bench cycle.
 
-- **s8/s32 MMA layout missing** — `_INTEL_MMA_LAYOUTS` in
-  `lower/ocl/lower.py:343` only has the `(BF16, BF16, F32, 8, 16, 16)`
-  entry. The Intel device probe filters `caps.matmul_shapes` against
-  this dict, so `m8n16k32_intel_s8_s32` doesn't reach the kernel's
-  `is_valid_for` check — every `GemmIntKernel` / `OwlAttnIntKernel`
-  config gets rejected at autotune. **Unblock**: add the s8/s32
-  layout tuple (subgroup_size, A/B/C/D per-lane types + element
-  counts) per the Khronos
-  `cl_intel_subgroup_matrix_multiply_accumulate` spec; matching MMA
-  emit code in `_visit_mma`. Affects every int8 quant kernel (Phase
-  2C). **Workaround**: bf16 path works (Phase 2B passed).
+- **s8/s32 lane-data mapping** — `_INTEL_MMA_LAYOUTS` now has the
+  s8/s32 entry (commits 6a1d719..29695e8); `_visit_mma` and the
+  packed-K path in `_visit_load_matrix` both emit. **Kernel
+  compiles, dispatches, and produces output on Battlemage**, but
+  cos_sim ≈ -0.008 vs the numpy reference — the per-lane
+  data-layout convention I assumed (lane L holds K-cols [2L, 2L+1]
+  for M-rows in u16 components) doesn't match what IGC actually
+  expects. Resolving needs an authoritative per-lane (lane, slot)
+  → (m, k) mapping from the cl_intel_subgroup_matrix_multiply_
+  accumulate spec or oneDNN's GEMM micro-JIT. Tracked as a
+  layout-debug task, not an architectural blocker. **Affects**:
+  every int8 quant kernel (Phase 2C). **Workaround**: bf16 path
+  works (Phase 2B passed). Three landing-ready lowerer fixes
+  surfaced en route: signedness operand mask name (was using
+  the wrong "Components" suffix on Packed flags), A per-lane
+  vector size (IGC binds to M-dim), C splat-construct emit
+  (need N components for v<N>).
 
 - **`FragConvertOp` K-widening** — `_visit_frag_convert(ocl)` at
   `lower/ocl/lower.py:1936` raises on `K_dst = num_src * src_cols`
