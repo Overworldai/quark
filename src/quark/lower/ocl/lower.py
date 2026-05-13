@@ -1051,18 +1051,32 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                 f"narrower than smem elem ({smem_elem_type}) — not wired"
             )
         pack_ratio = lane_bytes // smem_bytes
-        # For Intel int8 DPAS with M=8 K=32 N=16 SG=16, the A-fragment
-        # per-lane layout (i16 × 8) packs each i16 as an M-row pair:
-        #   - Lane L holds K-cols (L, L+SG) = (L, L+16)
-        #   - Component s in [0..7]: K-col = L if (s%2)==0 else L+SG
-        #     Low byte  = A[m = 2*(s//2),     K]   (even-M)
-        #     High byte = A[m = 2*(s//2) + 1, K]   (odd-M)
-        # This M-pair-per-i16 convention is empirically what DPAS
-        # reads (probed via all-ones diagnostic on Battlemage). The
-        # bf16 path (pack_ratio==1) keeps the simple "lane L = K-col
-        # L, component s = M-row s" convention unchanged.
+        # Per Khronos SPV_INTEL_subgroup_matrix_multiply_accumulate
+        # spec: lower-numbered invocations carry lower-numbered K
+        # columns (sequential). For SG=16, K=32, pack_ratio=2: lane
+        # L holds K-cols (2L, 2L+1).
+        #
+        # NOTE: this packing gives "even M-row correct, odd M-row
+        # zero" output on Battlemage with all-ones probe — see
+        # `Known OCL blockers` for the unresolved per-lane convention
+        # gap. Same result with M-pair packing or byte-order swap;
+        # the pattern is structural. Needs Intel GPU ISA spec or
+        # oneDNN dpas micro-JIT reference to fix.
         pack_k_stride = 1
-        a_pack_mpair = (which == "a" and pack_ratio > 1)
+        a_pack_mpair = False  # disabled — see comment above
+        if which == "a" and pack_ratio > 1 and not a_pack_mpair:
+            # lane L → K-col base = L*pack_ratio, k_off ∈ [0..pack_ratio)
+            # gives lane L K-cols (2L, 2L+1) for s8 form.
+            col_lane_packed = ctx.text.alloc_id("lm_a_col_lane_pack")
+            pack_const = ctx.text.const_uint(pack_ratio)
+            lane_off = ctx.text.alloc_id("lm_a_lane_off")
+            ctx.text.emit_function(
+                f"{lane_off} = OpIMul {u32} {lane_id} {pack_const}"
+            )
+            ctx.text.emit_function(
+                f"{col_lane_packed} = OpIAdd {u32} {col_base} {lane_off}"
+            )
+            col_lane = col_lane_packed
 
         for s in range(width):
             if a_pack_mpair:
