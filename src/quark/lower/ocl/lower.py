@@ -2534,25 +2534,19 @@ def _visit_frag_convert(op: FragConvertOp, ctx: _OclCtx) -> None:
                 )
             elem_id = ctx.val_to_id[term.operands[0].id]
 
-        # Convert f32 → bf16 (u16 carrier). Reuse the same pattern as
-        # the scalar f32→bf16 path: bitcast to u32, shift right 16, then
-        # truncate to u16. Round-to-nearest-even semantics — bf16 has the
-        # same exponent as f32, so chopping is "round toward zero" on the
-        # mantissa; for the online-softmax exp output the difference vs
-        # RN is ≤ 1 ulp.
-        u32_t = ctx.text.type_int(32, signed=False)
-        u32_id = ctx.text.alloc_id(f"fc_u32_{s}")
+        # Convert f32 → bf16 → u16. The OpFConvert + OpBitcast pair
+        # mirrors the load_matrix A path (which loads as bfloat16_2
+        # then bitcasts to u16). IGC's DPAS pattern matcher segfaults
+        # if A is built from any other op chain (bitcast-and-shift
+        # produces semantically-equivalent u16 but trips the matcher).
+        bf16_type = _emit_dtype(ctx.text, DType.BF16, ctx)
+        bf16_id = ctx.text.alloc_id(f"fc_bf_{s}")
         ctx.text.emit_function(
-            f"{u32_id} = OpBitcast {u32_t} {elem_id}"
-        )
-        sixteen = ctx.text.const_uint(16)
-        shifted_id = ctx.text.alloc_id(f"fc_shr_{s}")
-        ctx.text.emit_function(
-            f"{shifted_id} = OpShiftRightLogical {u32_t} {u32_id} {sixteen}"
+            f"{bf16_id} = OpFConvert {bf16_type} {elem_id}"
         )
         u16_id = ctx.text.alloc_id(f"fc_u16_{s}")
         ctx.text.emit_function(
-            f"{u16_id} = OpUConvert {dst_elem_type} {shifted_id}"
+            f"{u16_id} = OpBitcast {dst_elem_type} {bf16_id}"
         )
         yielded_ids.append(u16_id)
 
@@ -2718,24 +2712,6 @@ def _visit_mma(op: MmaOp, ctx: _OclCtx) -> None:
     b_id = ctx.val_to_id[op.operands[1].id]
     c_v = op.operands[2]
     c_id = ctx.val_to_id[c_v.id]
-
-    # IGC's DPAS pattern matcher segfaults when several MMAs share the
-    # same A SSA (observed on Battlemage when the online-softmax P
-    # fragment from FragConvertOp feeds 4 chained MMAs — each MMA gets
-    # %frag_convert_result_N as its A). load_matrix-fed MMAs each
-    # produce their own A via fresh OpCompositeConstruct, which IGC
-    # accepts. Mirror that pattern here with OpCopyObject on A: it
-    # gives this MMA a fresh SSA ID without re-emitting the underlying
-    # values, and the crash goes away.
-    a_v = op.operands[0]
-    a_elem_type = _emit_dtype(ctx.text, _a_elem_dt, ctx)
-    a_vec_type = _ocl_type_vec(ctx.text, a_elem_type, _a_width)
-    a_copy_id = ctx.text.alloc_id("mma_a_copy")
-    ctx.text.emit_function(
-        f"{a_copy_id} = OpCopyObject {a_vec_type} {a_id}"
-    )
-    a_id = a_copy_id
-    _ = a_v
 
     # If C is a vec_build of zeros (the common "init acc to 0"
     # idiom for non-loop-carried MMAs), splat-construct it as the
