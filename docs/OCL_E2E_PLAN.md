@@ -385,6 +385,16 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last iter: SplitB32/MergeB32 visitor isolation test (`tests/lower/ocl/test_b32_roundtrip.py`) PASSES — every uint32 pattern survives Split → Merge unchanged on Battlemage. So the visitors themselves are correct; the ValueResidualPacked / AdaGateResidual numerics bug is downstream — in the Convert/Bitcast chain the legalizer inserts around Split/Merge (the `fma_bf16x2` expansion in `legalizations.py` is a long chain: Split B32 → Bitcast B16→BF16 → Convert BF16→F32 → FMA → Convert F32→BF16 → Bitcast BF16→B16 → Merge).
-Active phase: 2 (devkit).
-Next: instrument one of the intermediate ops (most suspect: `_visit_bitcast` for B16↔BF16, since those are different DType enums with same width carrier). Could also be a `_visit_convert` BF16↔F32 issue specific to packed paths.
+Last iter: VRP + AdaGateResidual GREEN on Battlemage.
+
+- VRP was a **test bug**: `lamb` is `DType.F32` in the kernel's TENSORS, but the smoke passed it as bf16 (`_f32_to_bf16(lamb_f32)`). Both kernel and numpy ref were reading corrupted data in different ways (4-byte F32 read from a 2-byte bf16 buffer; `to_f32_numpy(uint16, dtype_hint="f32")` astype → 16128.0 for 0x3F00). cos_sim=-0.35 was the symptom. Fix: pass `lamb_f32` directly. Cleared the misdiagnosis as a SplitB32/MergeB32 bug — the visitor chain was always correct (verified by `tests/lower/ocl/test_b32_roundtrip.py`, `test_bitcast_roundtrip.py`, `test_convert_bf16_f32_roundtrip.py`, `test_full_chain_no_fma_roundtrip.py`, `test_fma_bf16x2_identity.py` — all PASS).
+- AdaGateResidual was a real visitor gap: `packed_extract_b32(bf16_vec, k)` reuses `VecExtractOp` with `attrs={"packed_b32": True}` and returns `DType.B32`; `vec_build_packed_b32` reuses `VecBuildOp` the same way. OCL `_visit_vec_extract`/`_visit_vec_build` didn't check the attr → emitted type-broken SPIR-V → IGC raised `CL_OUT_OF_RESOURCES` at clFinish. Fixed via `OpBitcast` to/from a v<N>uint32 view of the bf16 vec (same total bits). cos_sim=0.999996 post-fix.
+- Bonus visitor: `_visit_const` now handles B16/B32/B64 carrier types (needed for the fma_bf16x2 identity reproducer; same idea — these map to uint16/uint32/uint64 in OCL).
+
+Patchify still xfail (rows {2,3,6,7} mod 8 zero per m=8 tile; same MMA shape + frag_for_each path as Gemm which passes). Strongly localised to Patchify's scalar A-fill path vs Gemm's vectorised `load_from`. Deferred (input embedding, not in hot loop).
+
+Compute-cohort smoke status: 4 pass (HeadRMSNorm, AdaRMSNorm, VRP, AdaGateResidual), 1 xfail (Patchify).
+Wider OCL test status: 49 pass, 5 known-fail (owl_attn bf16 ×2 — FragConvert K-widening; gemm_int ×3 — s8 DPAS layout entry pending SPV_INTEL_2d_block_io), 2 skip, 1 xfail.
+
+Active phase: 2 (devkit) → ready to enter Phase 3 (end-to-end gen_frame). Two Phase 2 items still open: 2A.2 (owl_attn bf16) and 2C.2 (gemm_int). Both blocked on documented multi-day work in "Known OCL blockers"; Phase 3 stub-VAE (3.1) can run without them since DiT uses owl_attn but only at shapes where K-widening doesn't kick in (TBD on devkit) — and stub-VAE doesn't exercise gemm_int.
+Next: 3.1 — attempt `gen_frame()` with stub VAE on devkit. Expect crashes on shapes that hit owl_attn FragConvert. If so, fall back to the legalizer-style split (slice the K-widening into multiple m8n16k16 MMAs before the FragConvert).
