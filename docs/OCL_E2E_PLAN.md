@@ -385,6 +385,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: **Phase 2D.2 PASSED** on Battlemage (cos_sim ≥ 0.9999). Four lowerer fixes landed: PRED→OpTypeBool, boolean arith ops, vec_load packing (BF16→B32), vec_store unpacking (B32→BF16), B*/Bxx dtypes in _emit_dtype. Two of three documented blockers now resolved (vec_load packing + s8 architectural scaffolding); only FragConvert and s8 lane-mapping remain.
+Last iter: broad compute-cohort coverage. **GREEN on Battlemage** (cos_sim ≥ 0.9999): RMSNorm, KV cache update, GemmKernel bf16, HeadRMSNorm, AdaRMSNorm. **xfail**: AdaGateResidual + ValueResidualPacked (CL_OUT_OF_RESOURCES at launch — both use SplitB32/MergeB32 chains; likely register-pressure or codegen issue), Patchify (cos_sim=0.71 — axis/layout mismatch vs reference). SplitB32Op + MergeB32Op visitors landed in `_DISPATCH`.
 Active phase: 2 (devkit).
-Next: smoke the remaining compute-cohort kernels (GemmKernel bf16, HeadRMSNormKernel, PatchifyKernel, UnpatchifyKernel, AdaRMSNormKernel, AdaGateResidualKernel, ValueResidualPackedKernel) — should mostly land like RMSNorm + KV cache did, with any new visitor gaps surfacing as the same actionable pattern.
+Next: investigate the OUT_OF_RESOURCES path (start by inspecting SplitB32/MergeB32 emit + the IGC -build-log to see resource usage) — small-kernel fixes that probably unblock 2 kernels.
