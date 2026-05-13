@@ -2021,11 +2021,20 @@ def _visit_vec_store(op: VecStoreOp, ctx: _OclCtx) -> None:
     else:
         index_ops = raw_ops[1:]
     value_v = raw_ops[0]
+    # Packed-store path: source is wider (e.g. B32) than tensor
+    # element (e.g. BF16). Each input element unpacks into pack_ratio
+    # output elements at consecutive offsets (low bits = idx 2i,
+    # high bits = idx 2i+1). Mirror of the packed-load path above.
+    pack_ratio = 1
     if value_v.dtype is not tensor.dtype:
-        raise NotImplementedError(
-            f"_visit_vec_store(ocl): dtype mix ({value_v.dtype!r} → "
-            f"{tensor.dtype!r}) not yet wired"
-        )
+        src_bytes = _DTYPE_BYTES.get(value_v.dtype, 0)
+        dst_bytes = _DTYPE_BYTES.get(tensor.dtype, 0)
+        if src_bytes == 0 or dst_bytes == 0 or src_bytes % dst_bytes != 0:
+            raise NotImplementedError(
+                f"_visit_vec_store(ocl): dtype mix ({value_v.dtype!r} → "
+                f"{tensor.dtype!r}) not yet wired"
+            )
+        pack_ratio = src_bytes // dst_bytes
 
     if isinstance(tensor, GlobalTensor):
         arg_id = ctx.param_to_arg[id(tensor.param)]
@@ -2056,22 +2065,71 @@ def _visit_vec_store(op: VecStoreOp, ctx: _OclCtx) -> None:
     value_id = ctx.val_to_id[value_v.id]
     u32 = ctx.text.type_int(32, signed=False)
 
+    src_elem_type = _emit_dtype(ctx.text, value_v.dtype, ctx)
+
     def _emit_one_store(i: int) -> None:
-        if i == 0:
-            idx_id = base_id
-        else:
-            inc = ctx.text.const_uint(i)
-            idx_id = ctx.text.alloc_id(f"vs_idx_{i}")
-            ctx.text.emit_function(f"{idx_id} = OpIAdd {u32} {base_id} {inc}")
-        chain_id = ctx.text.alloc_id(f"vs_chain_{i}")
+        if pack_ratio == 1:
+            if i == 0:
+                idx_id = base_id
+            else:
+                inc = ctx.text.const_uint(i)
+                idx_id = ctx.text.alloc_id(f"vs_idx_{i}")
+                ctx.text.emit_function(
+                    f"{idx_id} = OpIAdd {u32} {base_id} {inc}"
+                )
+            chain_id = ctx.text.alloc_id(f"vs_chain_{i}")
+            ctx.text.emit_function(
+                f"{chain_id} = {chain_op} {elem_ptr} {chain_base} {idx_id}"
+            )
+            elem_id = ctx.text.alloc_id(f"vs_elem_{i}")
+            ctx.text.emit_function(
+                f"{elem_id} = OpCompositeExtract {elem_type} {value_id} {i}"
+            )
+            ctx.text.emit_function(f"OpStore {chain_id} {elem_id}")
+            return
+
+        # Packed: extract one wide src elem, unpack pack_ratio narrow
+        # elems via shift + truncate, store each at the right offset.
+        wide_id = ctx.text.alloc_id(f"vs_wide_{i}")
         ctx.text.emit_function(
-            f"{chain_id} = {chain_op} {elem_ptr} {chain_base} {idx_id}"
+            f"{wide_id} = OpCompositeExtract {src_elem_type} {value_id} {i}"
         )
-        elem_id = ctx.text.alloc_id(f"vs_elem_{i}")
-        ctx.text.emit_function(
-            f"{elem_id} = OpCompositeExtract {elem_type} {value_id} {i}"
-        )
-        ctx.text.emit_function(f"OpStore {chain_id} {elem_id}")
+        dst_bits = _DTYPE_BYTES[tensor.dtype] * 8
+        # Unsigned narrow-int carrier for the truncate step (we go
+        # tensor.dtype → narrow-uint → bitcast tensor.dtype to keep
+        # bf16/f16 etc happy).
+        narrow_uint_t = ctx.text.type_int(dst_bits, signed=False)
+        for k in range(pack_ratio):
+            inc = ctx.text.const_uint(i * pack_ratio + k)
+            idx_id = ctx.text.alloc_id(f"vs_idx_{i}_{k}")
+            ctx.text.emit_function(
+                f"{idx_id} = OpIAdd {u32} {base_id} {inc}"
+            )
+            chain_id = ctx.text.alloc_id(f"vs_chain_{i}_{k}")
+            ctx.text.emit_function(
+                f"{chain_id} = {chain_op} {elem_ptr} {chain_base} {idx_id}"
+            )
+            shifted = wide_id
+            if k > 0:
+                shift_amt = ctx.text.const_uint(k * dst_bits)
+                sh_id = ctx.text.alloc_id(f"vs_shift_{i}_{k}")
+                ctx.text.emit_function(
+                    f"{sh_id} = OpShiftRightLogical {src_elem_type} "
+                    f"{wide_id} {shift_amt}"
+                )
+                shifted = sh_id
+            trunc = ctx.text.alloc_id(f"vs_trunc_{i}_{k}")
+            ctx.text.emit_function(
+                f"{trunc} = OpUConvert {narrow_uint_t} {shifted}"
+            )
+            store_val = trunc
+            if elem_type != narrow_uint_t:
+                cast = ctx.text.alloc_id(f"vs_cast_{i}_{k}")
+                ctx.text.emit_function(
+                    f"{cast} = OpBitcast {elem_type} {trunc}"
+                )
+                store_val = cast
+            ctx.text.emit_function(f"OpStore {chain_id} {store_val}")
 
     if pred_val is not None:
         pred_id = ctx.val_to_id[pred_val.id]
