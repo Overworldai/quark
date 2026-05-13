@@ -333,6 +333,15 @@ class CompiledKernel:
         # overhead the lazy-mode decomposition exposed.
         kind = self._dispatch_kind
         if kind == "ocl":
+            # Honour ``quark.lazy()`` on OCL: when active, skip the
+            # per-launch ``clFinish`` and let the block-exit drain
+            # everything in one go. The Metal path handles this
+            # internally via the metal_dispatch lazy queue; OCL needs
+            # the bool plumbed through because the per-call C++ launch
+            # is the only sync point. ``sync=False`` callers (e.g. the
+            # engine's commit phase) keep their explicit opt-out.
+            if sync and _LAZY.get():
+                sync = False
             return self._launch_ocl(buffers, scalars, sync=sync)
         if kind == "metal":
             return self._launch_metal(buffers, scalars,
