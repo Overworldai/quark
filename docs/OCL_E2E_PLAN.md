@@ -301,20 +301,34 @@ beyond the smoke + bench cycle.
 - **s8/s32 lane-data mapping** — `_INTEL_MMA_LAYOUTS` now has the
   s8/s32 entry (commits 6a1d719..29695e8); `_visit_mma` and the
   packed-K path in `_visit_load_matrix` both emit. **Kernel
-  compiles, dispatches, and produces output on Battlemage**, but
-  cos_sim ≈ -0.008 vs the numpy reference — the per-lane
-  data-layout convention I assumed (lane L holds K-cols [2L, 2L+1]
-  for M-rows in u16 components) doesn't match what IGC actually
-  expects. Resolving needs an authoritative per-lane (lane, slot)
-  → (m, k) mapping from the cl_intel_subgroup_matrix_multiply_
-  accumulate spec or oneDNN's GEMM micro-JIT. Tracked as a
-  layout-debug task, not an architectural blocker. **Affects**:
-  every int8 quant kernel (Phase 2C). **Workaround**: bf16 path
-  works (Phase 2B passed). Three landing-ready lowerer fixes
-  surfaced en route: signedness operand mask name (was using
-  the wrong "Components" suffix on Packed flags), A per-lane
-  vector size (IGC binds to M-dim), C splat-construct emit
-  (need N components for v<N>).
+  compiles, dispatches, and produces output on Battlemage**.
+  All-ones diagnostic (`test_gemm_int_all_ones_yields_K`) reveals
+  the precise layout error: 512/1024 outputs correct, exactly the
+  even M-rows. Output tile:
+  ```
+  m=0,2,4,6: 64 64 64 64 ... 64   (correct)
+  m=1,3,5,7:  0  0  0  0 ...  0   (zero)
+  ```
+  Signature: the spec packs each u16 A-component as 2 M-rows for
+  the same K-col (low byte = m=2j, high byte = m=2j+1), NOT 2 K-cols
+  for the same M-row like my code emits. Hypothesized correct map
+  for the cl_intel s8 form (SG=16, M=8, K=32):
+  ```
+  Per lane L, slot s ∈ [0..7]:
+    K = L if s%2==0 else L+16
+    low byte  = A[m=2*(s//2),   K]
+    high byte = A[m=2*(s//2)+1, K]
+  ```
+  Fixing `_visit_load_matrix` to emit this convention closes the
+  numerics. Needs verification against the Khronos
+  cl_intel_subgroup_matrix_multiply_accumulate spec PDF (per-lane
+  layout table) or oneDNN's GEMM micro-JIT source before
+  committing. **Affects**: every int8 quant kernel. **Workaround**:
+  bf16 path works (Phase 2B passed). Five landing-ready lowerer
+  fixes surfaced en route: signedness operand mask names, A
+  per-lane vector size, C splat-construct emit, packed-K load
+  path in `_visit_load_matrix`, `_visit_arith` shifts + bitwise,
+  `_visit_convert` sint↔uint.
 
 - **`FragConvertOp` K-widening** — `_visit_frag_convert(ocl)` at
   `lower/ocl/lower.py:1936` raises on `K_dst = num_src * src_cols`
@@ -352,6 +366,6 @@ step. Phase 2 work should start with applying that removal on devkit.
 
 ## Status snapshot
 
-Last loop iteration: 2B.2 RMSNorm green. 2A.2 (owl_attn) + 2C.2 (gemm_int) BLOCKED on different OCL visitor gaps — see Known OCL blockers. En route: OCL `_visit_convert` got sint↔uint; `_visit_arith` got shr/shl/and/or/xor.
+Last loop iteration: deep dive on the s8/s32 blocker. Architectural part RESOLVED (kernel compiles + runs end-to-end on Battlemage); precise data-layout bug isolated via all-ones diagnostic — needs spec-doc verification before final fix. FragConvert blocker not attempted (multi-day IR rewrite). 5 OCL lowerer fixes landed en route (convert/arith/operand-name/A-vec-size/C-splat).
 Active phase: 2 (devkit).
-Next task: 2D.2 — KV cache update smoke (no MMA, no FragConvert; pure index + RoPE + ring write).
+Next: either resolve the s8 layout with spec-doc reference, or pivot to 2D.2 (KV cache + utility kernels, pure compute-cohort).
