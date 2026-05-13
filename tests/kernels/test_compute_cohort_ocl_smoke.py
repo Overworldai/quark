@@ -145,7 +145,6 @@ def test_patchify_ocl_smoke():
     _check("Patchify", out_f32, ref)
 
 
-@pytest.mark.xfail(reason="Small shape runs but cos_sim=-0.35 — likely SplitB32/MergeB32 visitor or packed-bf16-arith ordering bug; large shape hits OUT_OF_RESOURCES")
 def test_value_residual_packed_ocl_smoke():
     from quark.ir import DType
     from quark.kernels.value_residual_packed.reference import (
@@ -165,12 +164,12 @@ def test_value_residual_packed_ocl_smoke():
 
     QKV_curr_bf16 = _f32_to_bf16(QKV_curr_f32)
     QKV_first_bf16 = _f32_to_bf16(QKV_first_f32)
-    lamb_bf16 = _f32_to_bf16(lamb_f32)
 
+    # lamb is declared as DType.F32 in the kernel's TENSORS — pass f32.
     out_qt = pcf.value_residual_packed(
         QuarkTensor.from_numpy(QKV_curr_bf16, dtype="bf16"),
         QuarkTensor.from_numpy(QKV_first_bf16, dtype="bf16"),
-        QuarkTensor.from_numpy(lamb_bf16, dtype="bf16"),
+        QuarkTensor.from_numpy(lamb_f32, dtype="f32"),
         v_col_offset=v_col_offset, v_width=v_width,
     )
     from quark.runtime.sync import synchronize as _sync
@@ -182,7 +181,7 @@ def test_value_residual_packed_ocl_smoke():
         dtype=DType.BF16,
     )
     ref = _bf16_to_f32(value_residual_packed_reference_numpy(
-        spec, QKV_curr=QKV_curr_bf16, QKV_first=QKV_first_bf16, lamb=lamb_bf16,
+        spec, QKV_curr=QKV_curr_bf16, QKV_first=QKV_first_bf16, lamb=lamb_f32,
     ))
     _check("ValueResidualPacked", out_f32, ref)
 
