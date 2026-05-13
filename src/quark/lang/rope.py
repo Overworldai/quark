@@ -72,46 +72,44 @@ def emit_rope_cos_sin(
     c_xy_dim = bctx.c(x_dim + y_dim, dtype=DType.U32)
 
     is_x = qk.cmp("lt", c_idx, c_x_dim)
+    is_y = qk.cmp("lt", c_idx, c_xy_dim)
 
     # Shared constants for x/y band base computation.
     pi_c = bctx.c(math.pi, dtype=DType.F32)
     xy_scale = bctx.c(math.pi * (max_freq / 2 - 1.0) / max(x_dim // 2 - 1, 1), dtype=DType.F32)
+    one_u = bctx.c(1, dtype=DType.U32)
+    zero_u = bctx.c(0, dtype=DType.U32)
 
-    # Use a zero placeholder for the carried freq value.
-    zero_f = bctx.c(0.0, dtype=DType.F32)
+    # Compute all three band frequencies unconditionally and select. The
+    # earlier version used nested ``qk.if_`` to avoid u32 underflow on
+    # ``c_idx - c_x_dim`` when c_idx < x_dim — Intel IGC ICEs on too many
+    # OpPhi (verified 2026-05-14 against Battlemage), and each ``qk.if_``
+    # with a carry adds an OpPhi at the merge. ``qk.select`` is a single
+    # OpSelect (no merge, no phi). To avoid underflow, mask the diff with
+    # qk.select before subtracting.
+    c_idx_x = qk.select(is_x, c_idx, c_x_dim)   # max(0, ...) for x branch
+    c_idx_y = qk.select(is_y, c_idx, c_xy_dim)  # max(c_x_dim, ...) for y branch
+    # X band: local_i = c_idx / 2, base = pi * (1 + local_i * scale)
+    half_c_x = qk.convert(c_idx_x >> one_u, DType.F32)
+    x_base = pi_c + half_c_x * xy_scale
+    x_freq = x_pos * x_base
+    # Y band: local_i = (c_idx - x_dim) / 2. Operand was clamped so the
+    # u32 subtract can't underflow when this branch is the live one.
+    y_local = qk.convert(qk.select(is_x, zero_u, c_idx_y - c_x_dim) >> one_u, DType.F32)
+    y_base = pi_c + y_local * xy_scale
+    y_freq = y_pos * y_base
+    # T band: base = 1 / theta^(local_pair_idx * 2 / t_dim)
+    t_diff = qk.select(is_y, zero_u, c_idx - c_xy_dim)
+    t_local = qk.convert(t_diff >> one_u, DType.F32)
+    t_exp = t_local * bctx.c(2.0 / t_dim, dtype=DType.F32)
+    log2_theta = bctx.c(math.log2(theta), dtype=DType.F32)
+    t_base = qk.ex2_approx(qk.neg(t_exp * log2_theta))
+    t_freq = t_f * t_base
 
-    # Structured if: only compute the band that c_idx actually falls in.
-    # This avoids u32 underflow from (c_idx - x_dim) when c_idx < x_dim.
-    with qk.if_(is_x, carried=[zero_f]) as (then_in, else_in, arms):
-        with arms.then_():
-            # X band: local_i = c_idx / 2, base = pi * (1 + local_i * scale)
-            half_c = qk.convert(c_idx >> bctx.c(1, dtype=DType.U32), DType.F32)
-            x_base = pi_c + half_c * xy_scale
-            x_freq = x_pos * x_base
-            qk.yield_(x_freq)
-        with arms.else_():
-            # Not x-band: determine if y or t.
-            is_y = qk.cmp("lt", c_idx, c_xy_dim)
-            with qk.if_(is_y, carried=[zero_f]) as (y_then, y_else, y_arms):
-                with y_arms.then_():
-                    # Y band: local_i = (c_idx - x_dim) / 2
-                    y_local = qk.convert((c_idx - c_x_dim) >> bctx.c(1, dtype=DType.U32), DType.F32)
-                    y_base = pi_c + y_local * xy_scale
-                    y_freq = y_pos * y_base
-                    qk.yield_(y_freq)
-                with y_arms.else_():
-                    # T band: base = 1 / theta^(local_pair_idx * 2 / t_dim)
-                    t_local = qk.convert(
-                        (c_idx - c_xy_dim) >> bctx.c(1, dtype=DType.U32), DType.F32
-                    )
-                    t_exp = t_local * bctx.c(2.0 / t_dim, dtype=DType.F32)
-                    log2_theta = bctx.c(math.log2(theta), dtype=DType.F32)
-                    t_base = qk.ex2_approx(qk.neg(t_exp * log2_theta))
-                    t_freq = t_f * t_base
-                    qk.yield_(t_freq)
-            (inner_freq,) = qk.last_results()
-            qk.yield_(inner_freq)
-    (freq,) = qk.last_results()
+    # 3-way select: c_idx ∈ [0,x_dim) → x_freq; [x_dim, xy_dim) → y_freq;
+    # else → t_freq.
+    yt_freq = qk.select(is_y, y_freq, t_freq)
+    freq = qk.select(is_x, x_freq, yt_freq)
 
     # cos/sin via SFU.
     cos_val = qk.cos(freq)
