@@ -377,6 +377,40 @@ _INTEL_MMA_LAYOUTS: dict[tuple, tuple] = {
         16,             # K-Dim operand
         "MatrixAPackedBFloat16INTEL|MatrixBPackedBFloat16INTEL",
     ),
+    # s8×s8→s32, M=8 N=16 K=32 on SG=16. Per the Khronos
+    # ``SPV_INTEL_subgroup_matrix_multiply_accumulate`` extension's
+    # 8-bit form: 4 s8 components pack into one i32 along the K
+    # direction. Per-lane element counts:
+    #
+    #   A: M=8 × K=32 of s8 = 256 bytes total. At SG=16, each lane
+    #      holds K/SG = 2 K-cols × M=8 rows = 16 s8 = 4 i32. Lane L
+    #      covers K-cols (L, L+16); within each i32, components pack
+    #      4 K-rows for one M.
+    #   B: K=32 × N=16 of s8 = 512 bytes total. At SG=16, each lane
+    #      holds full K for one N-col = 32 s8 = 8 i32. Lane L holds
+    #      column N=L; each i32 packs 4 K-rows.
+    #   C/D: M=8 × N=16 of s32 = 128 elements total. At SG=16, each
+    #      lane holds full M for one N-col = 8 s32. Same shape as
+    #      the bf16/f32 form's C (just signed-int element type).
+    #
+    # MatrixOperands flag: 0x10 | 0x20 | 0x100 | 0x200 = 0x330.
+    #   ASignedComponentsINTEL  (0x10) — A values are signed s8
+    #   BSignedComponentsINTEL  (0x20) — B values are signed s8
+    #   APackedInt8ComponentsINTEL (0x100) — A is i32-packed 4-quartets
+    #   BPackedInt8ComponentsINTEL (0x200) — B is i32-packed 4-quartets
+    #
+    # Mirrors the bf16 entry's ``MatrixA/BPackedBFloat16INTEL`` shape
+    # — the operands flag tells IGC the integer-carrier register lanes
+    # hold 8-bit packed components, not raw 32-bit ints.
+    (DType.S8, DType.S8, DType.S32, 8, 16, 32): (
+        16,             # SG=16 per spec
+        DType.U32, 4,   # A: v4 of u32 (4 packed s8 along K per i32)
+        DType.U32, 8,   # B: v8 of u32 (same packing)
+        DType.S32, 8,   # C: v8 of s32 (column n=L, rows m=0..7)
+        32,             # K-Dim operand
+        "MatrixASignedComponentsINTEL|MatrixBSignedComponentsINTEL"
+        "|MatrixAPackedInt8ComponentsINTEL|MatrixBPackedInt8ComponentsINTEL",
+    ),
 }
 
 
