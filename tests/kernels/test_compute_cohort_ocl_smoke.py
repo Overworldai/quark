@@ -114,7 +114,18 @@ def test_ada_rmsnorm_ocl_smoke():
     _check("AdaRMSNorm", out_f32, ref)
 
 
-@pytest.mark.xfail(reason="cos_sim=0.71 — axis/layout mismatch vs reference, investigation pending")
+@pytest.mark.xfail(
+    reason="cos_sim=0.71 — only rows {0,1,4,5} mod 8 written per m=8 tile. "
+    "Per-row diagnostic confirms rows {2,3,6,7} are exactly zero in every "
+    "BM=16 block (config: BM=16,BN=32,BK=16,n_warps=2,n_stages=1, "
+    "shape=m8n16k16_intel_bf16_f32). Gemm uses the same shape + same "
+    "_visit_frag_for_each path and passes — Patchify differs in the A-tile "
+    "loader (scalar smem stores via plan.a.smem[...] = val, vs Gemm's "
+    "vectorised load_from). Suspect IGC's DPAS pattern selection or the "
+    "frag_for_each slot↔row mapping interacts with the scalar A-fill in a "
+    "way the vectorised path masks. Patchify is the input-embedding kernel, "
+    "not in the hot loop — defer."
+)
 def test_patchify_ocl_smoke():
     from quark.ir import DType
     from quark.kernels.patchify.reference import patchify_reference_numpy
@@ -186,7 +197,6 @@ def test_value_residual_packed_ocl_smoke():
     _check("ValueResidualPacked", out_f32, ref)
 
 
-@pytest.mark.xfail(reason="CL_OUT_OF_RESOURCES at launch — investigation pending")
 def test_ada_gate_residual_ocl_smoke():
     from quark.ir import DType
     from quark.kernels.ada_gate_residual.reference import (
