@@ -237,6 +237,19 @@ _ARITH_KIND_TO_OP: dict[tuple[str, DType], str] = {
     ("mul", DType.S32): "OpIMul",
     ("div", DType.S32): "OpSDiv",
     ("rem", DType.S32): "OpSMod",
+    # Bitwise + shifts. ``shr`` on unsigned is logical (zero-fill);
+    # on signed is arithmetic (sign-fill) per the standard semantics
+    # the IR ArithOp inherits.
+    ("shl", DType.U32): "OpShiftLeftLogical",
+    ("shl", DType.S32): "OpShiftLeftLogical",
+    ("shr", DType.U32): "OpShiftRightLogical",
+    ("shr", DType.S32): "OpShiftRightArithmetic",
+    ("and", DType.U32): "OpBitwiseAnd",
+    ("and", DType.S32): "OpBitwiseAnd",
+    ("or",  DType.U32): "OpBitwiseOr",
+    ("or",  DType.S32): "OpBitwiseOr",
+    ("xor", DType.U32): "OpBitwiseXor",
+    ("xor", DType.S32): "OpBitwiseXor",
 }
 
 
