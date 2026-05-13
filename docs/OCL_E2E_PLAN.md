@@ -414,4 +414,19 @@ Options:
 2. OCL-only IR pass that rewrites `frag_convert → vec_extract + convert + vec_build` (an explicit f32→bf16 per slot, then construct the u16 vec). Localised to OCL, no IR-builder change. Pre-condition: each lane's f32x8 source maps 1:1 to bf16x8 dest (true for Intel m8n16k16 with nk_per_kstep=1).
 3. Take the `online_softmax_block.py` legacy PTX fallback (the `else:` branch at line 408) and route Intel through it. Already produces a single `b.vec_build(...)` Value of the right shape — but the layout assumes CUDA m16n8k16 cd_offsets `((0,0),(0,1),(8,0),(8,1))`, not Intel m8n16k16 single-column-per-lane.
 
-Picking (2): least-invasive, doesn't touch other backends, mirrors the rewrite approach used for fma_bf16x2. Next loop step: implement an OCL-side rewriter that consumes `FragConvertOp(num_src=1, src=acc f32x8, dst=a_frag bf16, shape=m8n16k16_intel*)` and emits an explicit per-slot scalar chain producing a v8u16 result the MMA can consume.
+Took (2): implemented `_visit_frag_convert(ocl)` for num_src=1, shape=m8n16k16_intel_bf16_f32, src=ACC f32, dst=A_FRAG bf16. Emits per-slot `OpCompositeExtract` + optional body + `OpFConvert` F32→BF16 + `OpBitcast` to u16 + `OpCompositeConstruct` v8u16. The IR result Value is registered with the v8u16 SPIR-V ID directly (MMA passes the ID verbatim, so the type tag on the IR side doesn't matter).
+
+**Second blocker found 2026-05-14:** SPIR-V passes spirv-as cleanly, 12/13 generated kernels build through IGC (`clBuildProgram` OK). The 13th — `owl_attn` with frag_convert — segfaults inside IGC's compiler at `OpenCL` translation:
+```
+IGC: Internal Compiler Error: Segmentation violation
+  libigc.so.2 +0x1afa409 in DPAS-pass region
+```
+Tried two workarounds, neither helps:
+- `OpCopyObject` on the A operand to give each chained MMA a fresh SSA (load_matrix-fed MMAs each get a fresh `mma_load_a_NN`; our frag_convert path shares one `%frag_convert_result_N` across 4 MMAs).
+- Match load_matrix's exact source-op chain (`OpFConvert` F32→BF16 + `OpBitcast` to u16 instead of bitcast+shift+u-convert).
+
+Both produce semantically-equivalent SPIR-V, IGC still crashes. The crash is in IGC's DPAS pattern matcher — input is well-formed but trips a code path the matcher doesn't handle. Likely needs either:
+- Bisect spv_012.txt (290K) down to a minimal repro to file as an IGC issue, or
+- Side-step entirely by writing the bf16 P-fragment to local memory and using `load_matrix` to materialise the A operand — same shape as the fp8 smem round-trip path. Costs one block-barrier per softmax block but routes around the IGC bug.
+
+Next loop step: option (b) — implement the smem-round-trip P-fragment path on OCL. Most localised fix; doesn't depend on IGC patch landing.
