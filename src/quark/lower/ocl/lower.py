@@ -1051,28 +1051,88 @@ def _visit_load_matrix(op: LoadMatrixOp, ctx: _OclCtx) -> None:
                 f"narrower than smem elem ({smem_elem_type}) — not wired"
             )
         pack_ratio = lane_bytes // smem_bytes
-        # Per Khronos SPV_INTEL_subgroup_matrix_multiply_accumulate
-        # spec: "The K columns of data are passed by the N invocations
-        # in the subgroup, with the lower-numbered invocations passing
-        # the lower-numbered columns." For SG=16, K=32, pack_ratio=2:
-        # lane L holds K-cols (2L, 2L+1). For pack_ratio==1: lane L =
-        # K-col L (the bf16 path).
+        # For Intel int8 DPAS with M=8 K=32 N=16 SG=16, the A-fragment
+        # per-lane layout (i16 × 8) packs each i16 as an M-row pair:
+        #   - Lane L holds K-cols (L, L+SG) = (L, L+16)
+        #   - Component s in [0..7]: K-col = L if (s%2)==0 else L+SG
+        #     Low byte  = A[m = 2*(s//2),     K]   (even-M)
+        #     High byte = A[m = 2*(s//2) + 1, K]   (odd-M)
+        # This M-pair-per-i16 convention is empirically what DPAS
+        # reads (probed via all-ones diagnostic on Battlemage). The
+        # bf16 path (pack_ratio==1) keeps the simple "lane L = K-col
+        # L, component s = M-row s" convention unchanged.
         pack_k_stride = 1
-        if which == "a" and pack_ratio > 1:
-            # Adjust col_lane base: lane L → K-col base = L * pack_ratio
-            # (not just L). The k_off loop then walks within the lane.
-            col_lane_packed = ctx.text.alloc_id("lm_a_col_lane_pack")
-            pack_const = ctx.text.const_uint(pack_ratio)
-            lane_off = ctx.text.alloc_id("lm_a_lane_off")
-            ctx.text.emit_function(
-                f"{lane_off} = OpIMul {u32} {lane_id} {pack_const}"
-            )
-            ctx.text.emit_function(
-                f"{col_lane_packed} = OpIAdd {u32} {col_base} {lane_off}"
-            )
-            col_lane = col_lane_packed
+        a_pack_mpair = (which == "a" and pack_ratio > 1)
 
         for s in range(width):
+            if a_pack_mpair:
+                # M-pair packing for Intel s8 DPAS: slot s → K-col =
+                # (col_lane + (s%2)*SG), M-pair = (2*(s//2), 2*(s//2)+1)
+                # Low byte = even-M, high byte = odd-M.
+                pair_m_low = 2 * (s // 2)
+                pair_m_high = pair_m_low + 1
+                k_off_in_lane = (s % 2) * ctx.subgroup_width
+                k_pos = ctx.text.alloc_id(f"lm_a_kpos_{s}")
+                k_off_const = ctx.text.const_uint(k_off_in_lane)
+                ctx.text.emit_function(
+                    f"{k_pos} = OpIAdd {u32} {col_lane} {k_off_const}"
+                )
+
+                def _read_byte_at(m_idx, k_pos, tag):
+                    m_const = ctx.text.const_uint(m_idx)
+                    rb = ctx.text.alloc_id(f"lm_a_mrow_{tag}")
+                    ctx.text.emit_function(
+                        f"{rb} = OpIAdd {u32} {row_base} {m_const}"
+                    )
+                    rm = ctx.text.alloc_id(f"lm_a_mrmul_{tag}")
+                    ctx.text.emit_function(
+                        f"{rm} = OpIMul {u32} {rb} {row_stride}"
+                    )
+                    fl = ctx.text.alloc_id(f"lm_a_mflat_{tag}")
+                    ctx.text.emit_function(
+                        f"{fl} = OpIAdd {u32} {rm} {k_pos}"
+                    )
+                    if warp_off_id is not None:
+                        flw = ctx.text.alloc_id(f"lm_a_mflatw_{tag}")
+                        ctx.text.emit_function(
+                            f"{flw} = OpIAdd {u32} {fl} {warp_off_id}"
+                        )
+                        fl = flw
+                    ch = ctx.text.alloc_id(f"lm_a_mchain_{tag}")
+                    ctx.text.emit_function(
+                        f"{ch} = OpAccessChain {smem_scalar_ptr} {smem_var_id} {fl}"
+                    )
+                    vs = ctx.text.alloc_id(f"lm_a_mval_{tag}")
+                    ctx.text.emit_function(
+                        f"{vs} = OpLoad {smem_elem_type} {ch}"
+                    )
+                    su = ctx.text.alloc_id(f"lm_a_msmu_{tag}")
+                    smem_unsigned_t = ctx.text.type_int(
+                        smem_bytes * 8, signed=False,
+                    )
+                    ctx.text.emit_function(
+                        f"{su} = OpBitcast {smem_unsigned_t} {vs}"
+                    )
+                    wid = ctx.text.alloc_id(f"lm_a_mwid_{tag}")
+                    ctx.text.emit_function(
+                        f"{wid} = OpUConvert {lane_elem_type} {su}"
+                    )
+                    return wid
+
+                lo = _read_byte_at(pair_m_low, k_pos, f"{s}_lo")
+                hi = _read_byte_at(pair_m_high, k_pos, f"{s}_hi")
+                shift_amt = ctx.text.const_uint(smem_bytes * 8)
+                hi_shifted = ctx.text.alloc_id(f"lm_a_hishift_{s}")
+                ctx.text.emit_function(
+                    f"{hi_shifted} = OpShiftLeftLogical {lane_elem_type} {hi} {shift_amt}"
+                )
+                packed = ctx.text.alloc_id(f"lm_a_mpacked_{s}")
+                ctx.text.emit_function(
+                    f"{packed} = OpBitwiseOr {lane_elem_type} {lo} {hi_shifted}"
+                )
+                elem_loads.append(packed)
+                continue
+
             row_s = ctx.text.alloc_id(f"lm_{which}_row_{s}")
             s_const = ctx.text.const_uint(s)
             ctx.text.emit_function(
