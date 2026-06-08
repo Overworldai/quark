@@ -23,9 +23,10 @@ dev = [
 # ``.mlpackage`` artifacts and ``predict()`` runs on the Apple
 # Neural Engine; Pillow handles the bilinear resizes that the
 # torch path used to do via ``F.interpolate``. NO torch, NO MLX.
-# Use ``python -m quark.taehv.export`` (with the ``[export]``
+# Use ``python -m quark.taehv.coreml.export`` (with the ``[export]``
 # extras below) once per resolution to generate the ``.mlpackage``
-# artifacts the runtime reads.
+# artifacts the runtime reads, or ``scripts/publish_taehv_coreml.py``
+# to export every resolution and upload them to HF in one pass.
 taehv = [
     "coremltools>=8.0",
     "Pillow",

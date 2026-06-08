@@ -111,8 +111,10 @@ def _export_one(latent_height: int, latent_width: int, *, staging: pathlib.Path,
 
     # Delegate to the existing export module — same code that's been
     # producing artifacts locally for months. We just point its
-    # ``--cache-dir`` at our staging area.
-    from quark.taehv import export as _exp
+    # ``--cache-dir`` at our staging area. (The taehv module was split
+    # into per-backend subpackages, so the export entry point now lives
+    # at ``quark.taehv.coreml.export`` rather than ``quark.taehv.export``.)
+    from quark.taehv.coreml import export as _exp
 
     print(f"  exporting {res_dir.name}/ …")
     enc_path, dec_path = _exp.export(
